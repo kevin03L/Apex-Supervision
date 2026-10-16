@@ -157,6 +157,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/symbols/:id", delete(api_delete_symbol))
         // --- CONTRÔLE SYSTÈME ---
         .route("/api/system/status", get(api_system_status))
+        .route(
+            "/api/system/settings",
+            get(api_get_settings).put(api_update_settings),
+        )
         .route("/api/system/pause", post(api_system_pause))
         .route("/api/system/standby", post(api_system_standby))
         .route("/api/system/shutdown", post(api_system_shutdown))
@@ -356,6 +360,11 @@ async fn init_sqlite_db(path: Option<&str>) -> Result<sqlx::SqlitePool, sqlx::Er
         "CREATE TABLE IF NOT EXISTS users_accounts (
             username TEXT PRIMARY KEY,
             user_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
+        "CREATE TABLE IF NOT EXISTS alarms_state (
+            id TEXT PRIMARY KEY,
+            alarm_json TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );",
         "CREATE TABLE IF NOT EXISTS symbol_libraries (
@@ -581,6 +590,19 @@ async fn api_delete_symbol(
 // ============================================================================
 // HANDLERS REST : SYSTÈME (RÉSERVÉS AU GROUPE ADMINISTRATEUR)
 // ============================================================================
+
+async fn api_get_settings(State(state): State<AppState>) -> Json<crate::models::SystemSettings> {
+    Json(state.core.get_settings())
+}
+
+async fn api_update_settings(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(req): Json<crate::models::SystemSettings>,
+) -> Result<Json<crate::models::SystemSettings>, ScadaError> {
+    require_admin(&user)?;
+    Ok(Json(state.core.update_settings(&user.0.username, req).await?))
+}
 
 async fn api_system_status(State(state): State<AppState>) -> Json<SystemStatus> {
     Json(state.core.get_system_status())
@@ -1180,6 +1202,7 @@ async fn handle_realtime_socket(
     let mut alarm_rx = state.core.subscribe_alarms();
     let mut drv_rx = state.core.subscribe_drivers();
     let mut trace_rx = state.core.subscribe_flow_traces();
+    let mut settings_rx = state.core.subscribe_settings();
     // Vérifie périodiquement que la session est toujours valide (déconnexion, compte désactivé)
     let mut session_check = tokio::time::interval(Duration::from_secs(30));
     session_check.tick().await;
@@ -1250,6 +1273,17 @@ async fn handle_realtime_socket(
                         }
                     }
                     Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            settings_res = settings_rx.recv() => {
+                match settings_res {
+                    Ok(settings) => {
+                        if !send_ws(&mut socket, &WsServerMessage::SettingsUpdate(settings)).await {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {}
                     Err(RecvError::Closed) => break,
                 }
             }

@@ -212,6 +212,9 @@ pub struct TagAlarmConfig {
     /// valeur revenue au-delà du seuil de cette marge. Par défaut : max(2 × deadband COV, 1 % du seuil).
     #[serde(default)]
     pub deadband: Option<f64>,
+    /// Interdit la mise en sommeil de cette alarme (ex. alarmes de sécurité, ISA-18.2).
+    #[serde(default)]
+    pub shelving_disabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -662,6 +665,31 @@ pub struct AuditLogEntry {
     pub details: String,
 }
 
+/// Réglages système persistés (table `meta`, clé `settings`), modifiables par l'administrateur.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemSettings {
+    /// Autorise la mise en sommeil (« shelving ») des alarmes. Désactivée, toutes les alarmes en
+    /// sommeil sont réveillées et plus aucune ne peut être mise en sommeil.
+    #[serde(default = "default_true")]
+    pub alarm_shelving_enabled: bool,
+    /// Durée maximale d'une mise en sommeil, en minutes (1 à 480).
+    #[serde(default = "default_shelve_max")]
+    pub alarm_shelve_max_minutes: u32,
+}
+
+fn default_shelve_max() -> u32 {
+    480
+}
+
+impl Default for SystemSettings {
+    fn default() -> Self {
+        Self {
+            alarm_shelving_enabled: true,
+            alarm_shelve_max_minutes: default_shelve_max(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemStatus {
     pub app_name: String,
@@ -682,6 +710,9 @@ pub struct SystemStatus {
     pub history_dropped: u64,
     #[serde(default)]
     pub history_retention_days: u32,
+    /// Réglages système modifiables par l'administrateur.
+    #[serde(default)]
+    pub settings: SystemSettings,
 }
 
 /// Archive complète exportable/importable d'un projet RustScadaFlow.
@@ -730,6 +761,8 @@ pub enum WsServerMessage {
     AlarmUpdate(Vec<AlarmInstance>),
     DriverListUpdate(Vec<DriverConfig>),
     FlowTrace(FlowExecutionTrace),
+    /// Réglages système modifiés par un administrateur.
+    SettingsUpdate(SystemSettings),
     SystemStateEvent {
         state: String,
         message: String,
@@ -1010,5 +1043,27 @@ mod tests {
         assert!(!is_valid_hhmm("+7:00"));
         assert!(!is_valid_hhmm("07h00"));
         assert!(!is_valid_hhmm("é7:00"));
+    }
+    #[test]
+    fn settings_defaults_and_compat() {
+        let d = SystemSettings::default();
+        assert!(d.alarm_shelving_enabled);
+        assert_eq!(d.alarm_shelve_max_minutes, 480);
+        let partial: SystemSettings = serde_json::from_str(r#"{"alarm_shelving_enabled":false}"#).unwrap();
+        assert!(!partial.alarm_shelving_enabled);
+        assert_eq!(partial.alarm_shelve_max_minutes, 480);
+    }
+
+    #[test]
+    fn legacy_alarm_and_tag_json_still_load() {
+        // Alarme persistée avant la v1.2 (sans champs de mise en sommeil)
+        let js = r#"{"id":"T","tag_id":"T","tag_label":"t","severity":"High","state":"ActiveAck","message":"m","trigger_value":1.5,"raised_at":"2026-10-16T10:00:00Z","cleared_at":null,"acked_at":null,"acked_by":"admin","ack_comment":null}"#;
+        let a: AlarmInstance = serde_json::from_str(js).unwrap();
+        assert!(a.shelved_until.is_none());
+        assert_eq!(a.state, AlarmLifecycleState::ActiveAck);
+        // Configuration d'alarme sans les champs deadband / shelving_disabled
+        let cfg: TagAlarmConfig = serde_json::from_str(r#"{"enabled":true,"high":27.0}"#).unwrap();
+        assert!(!cfg.shelving_disabled);
+        assert!(cfg.deadband.is_none());
     }
 }

@@ -7,7 +7,7 @@ Plateforme de supervision industrielle **SCADA / GTB** (dans l'esprit de PcVue) 
 - **Automate Modbus TCP embarqué** (groupe froid simulé) sur `127.0.0.1:5502`, pour tester sans matériel.
 - **Synoptiques** : studio glisser-déposer, 28 types de widgets, import de symboles SVG / Draw.io / JSON.
 - **Flux logiques** : seuil, hystérésis, PID, portes logiques, temporisation TON, formule, script Rhai.
-- **Alarmes ISA-18.2** à 4 états, avec journal, bande morte anti-bagotement, mise en sommeil temporisée et une seule alarme de communication par équipement.
+- **Alarmes ISA-18.2** à 4 états, avec journal, état conservé au redémarrage, bande morte anti-bagotement, mise en sommeil temporisée (désactivable globalement ou par variable) et une seule alarme de communication par équipement.
 - **Planificateur horaire hebdomadaire**, historique SQLite avec export CSV, journal d'audit.
 - **Contrôle d'accès** par rôles : Administrateur, Superviseur, Visualisation.
 
@@ -72,6 +72,8 @@ Exemple (PowerShell) : `$env:SCADA_BIND="127.0.0.1"; $env:SCADA_PORT="8080"; .\t
 
 ## Persistance
 
+L'état des alarmes (acquittements, commentaires, mises en sommeil) est enregistré et restauré au redémarrage.
+
 La base SQLite (mode WAL) est la source de vérité. La démonstration (synoptiques, flux, plannings, drivers par défaut) n'y est écrite **qu'au premier lancement** ; un élément supprimé ne réapparaît donc pas. Les sessions sont gardées en mémoire : il faut se reconnecter après un redémarrage du processus.
 
 Sauvegarde et restauration du projet (drivers, tags, synoptiques, flux, plannings) : onglet **Historian & Système**, boutons Exporter et Importer (`.json`).
@@ -114,4 +116,4 @@ cargo run             # serveur en mode debug
 | `src/drivers/` | Drivers industriels et automate Modbus embarqué |
 | `static/` | IHM (HTML / CSS / JavaScript sans framework) |
 
-L'audit, le plan de correction (1.1) et la revue de contrôle (1.2) sont dans [docs/AUDIT_ET_PLAN.md](docs/AUDIT_ET_PLAN.md).
+L'audit et le plan de correction (1.1), la revue de contrôle (1.2) et les évolutions de la 1.3 sont dans [docs/AUDIT_ET_PLAN.md](docs/AUDIT_ET_PLAN.md).

@@ -311,3 +311,42 @@ Après la mise en service de la 1.1, une seconde revue complète du code a été
 - **HTTPS natif** (aujourd'hui via proxy inverse), **vrais drivers OPC-UA, BACnet et S7**.
 - **CSP stricte** sans `unsafe-inline` : il faut retirer les gestionnaires `onclick` en ligne de l'IHM.
 - **Temporisation d'apparition des alarmes** (on-delay) pour filtrer les dépassements très brefs.
+
+---
+
+## 7. Version 1.3.0 (16/10/2026)
+
+### 7.1 Mise en sommeil des alarmes désactivable
+
+| Niveau | Réglage | Effet |
+|---|---|---|
+| **Système** (administrateur, carte « Paramètres Système ») | `alarm_shelving_enabled` | Désactivée, la fonction réveille **immédiatement** toutes les alarmes en sommeil (événement `FIN_SOMMEIL` au journal), toute nouvelle demande est refusée (403) et les boutons « 💤 Sommeil » disparaissent en direct sur tous les postes ouverts (message WebSocket `SettingsUpdate`). |
+| **Système** | `alarm_shelve_max_minutes` (1 à 480) | Durée maximale d'une mise en sommeil ; une valeur réduite raccourcit aussi les mises en sommeil en cours. |
+| **Variable** (formulaire des tags, « Sommeil alarme : Interdit ») | `alarm_config.shelving_disabled` | Interdit la mise en sommeil de l'alarme de ce tag, par exemple pour les alarmes de sécurité (ISA-18.2). Si l'alarme dort au moment de l'interdiction, elle est réveillée. |
+
+Les réglages sont persistés (table `meta`, clé `settings`) et tracés dans l'audit. API : `GET /api/system/settings` (tout utilisateur connecté) et `PUT /api/system/settings` (administrateur).
+
+### 7.2 Persistance de l'état des alarmes (piste §6.5)
+
+Les alarmes sont maintenant enregistrées dans la table `alarms_state` à chaque changement : apparition, aggravation, disparition, acquittement, mise en sommeil, réveil, effacement. Un **écrivain unique** garantit l'ordre des écritures. Au redémarrage :
+
+- les acquittements, commentaires et mises en sommeil en cours sont conservés, sans « nouvelle apparition » parasite ;
+- les conditions sont réévaluées dès les premières valeurs valides (une alarme dont la condition a disparu passe en « disparue » ou « normale ») ;
+- les alarmes devenues sans objet (tag supprimé, driver supprimé ou arrêté) sont écartées.
+
+### 7.3 Correction
+
+| ID | Sévérité | Constat | Correction |
+|---|---|---|---|
+| REV-14 | Moyenne | « Acquitter tout » n'écrivait **aucune** ligne dans le journal d'alarmes (seul l'audit global était tracé). | Un événement `ACQUITTEMENT` par alarme, avec l'opérateur. |
+
+### 7.4 Vérifications
+
+- `cargo test` : **37 tests**, tous réussis (dont les valeurs par défaut des réglages et la compatibilité avec les alarmes et tags déjà enregistrés) ; `cargo clippy` sans avertissement.
+- Intégration sur une copie de la base de production :
+  - désactivation, avec réveil immédiat puis refus 403 ;
+  - refus 403 pour un superviseur qui tente de modifier les réglages ;
+  - durée maximale de 30 min : 60 min refusé, 30 min accepté ;
+  - interdiction par tag, avec réveil puis refus, l'alarme de communication restant autorisée ;
+  - trois redémarrages successifs : réglages, acquittement et commentaire, mise en sommeil conservés, et aucune réapparition.
+- IHM (Chrome headless, deux postes simultanés) : propagation en direct du réglage chez le superviseur, carte des réglages masquée pour lui, et non-régression complète sans erreur.

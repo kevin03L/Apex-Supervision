@@ -35,7 +35,7 @@ use crate::{
         DriverRuntimeStats, FlowEdge, FlowExecutionTrace, FlowGraph, FlowNode, FlowNodeKind,
         HistoryPoint, HistoryResponse, ImportSymbolLibraryRequest, LoginRequest, LoginResponse,
         ProjectBackupBundle, Quality, RegisteredTag, ScadaError, ScheduleRule, SymbolLibraryItem,
-        SystemStatus, TagFullView, TagState, TagValue, UpsertUserRequest, UserAccount,
+        SystemStatus, TagFullView, SystemSettings, TagState, TagValue, UpsertUserRequest, UserAccount,
         UserPublicView, UserRole, WidgetType, WriteCommand,
     },
     security,
@@ -65,6 +65,12 @@ pub struct Session {
     pub username: String,
     pub created_at: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
+}
+
+/// Opération d'écriture de l'état d'une alarme (traitée par un écrivain unique, dans l'ordre).
+enum AlarmPersistOp {
+    Upsert(Box<AlarmInstance>),
+    Delete(String),
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +111,11 @@ pub struct ScadaCore {
     flow_trace_tx: broadcast::Sender<FlowExecutionTrace>,
     ingest_tx: mpsc::Sender<TagState>,
     history_tx: mpsc::Sender<TagState>,
+    /// Écrivain unique de l'état des alarmes (ordre des écritures garanti).
+    alarm_persist_tx: mpsc::UnboundedSender<AlarmPersistOp>,
+    /// Réglages système (mise en sommeil des alarmes...).
+    settings: std::sync::RwLock<SystemSettings>,
+    settings_tx: broadcast::Sender<SystemSettings>,
     pub shutdown_notify: Arc<Notify>,
     pub restart_requested: AtomicBool,
     db_pool: Option<SqlitePool>,
@@ -118,6 +129,8 @@ impl ScadaCore {
         let (flow_trace_tx, _) = broadcast::channel::<FlowExecutionTrace>(1024);
         let (ingest_tx, ingest_rx) = mpsc::channel::<TagState>(4096);
         let (history_tx, history_rx) = mpsc::channel::<TagState>(HISTORY_QUEUE_CAPACITY);
+        let (alarm_persist_tx, alarm_persist_rx) = mpsc::unbounded_channel::<AlarmPersistOp>();
+        let (settings_tx, _) = broadcast::channel::<SystemSettings>(16);
 
         let core = Arc::new(Self {
             started_at: Utc::now(),
@@ -149,6 +162,9 @@ impl ScadaCore {
             flow_trace_tx,
             ingest_tx,
             history_tx,
+            alarm_persist_tx,
+            settings: std::sync::RwLock::new(SystemSettings::default()),
+            settings_tx,
             shutdown_notify: Arc::new(Notify::new()),
             restart_requested: AtomicBool::new(false),
             db_pool,
@@ -162,6 +178,7 @@ impl ScadaCore {
         Self::spawn_session_cleanup_worker(Arc::clone(&core));
         Self::spawn_driver_stats_broadcaster(Arc::clone(&core));
         Self::spawn_shelve_expiry_worker(Arc::clone(&core));
+        Self::spawn_alarm_persist_writer(Arc::clone(&core), alarm_persist_rx);
 
         core
     }
@@ -259,6 +276,7 @@ impl ScadaCore {
             modbus_slave_port: self.modbus_slave_port,
             history_dropped: self.history_dropped.load(Ordering::Relaxed),
             history_retention_days: self.history_retention_days,
+            settings: self.get_settings(),
         }
     }
 
@@ -532,6 +550,7 @@ impl ScadaCore {
             self.forget_tag(tag_id);
         }
         self.alarms.remove(&comm_alarm_id(driver_id));
+        self.persist_alarm(&comm_alarm_id(driver_id));
 
         if let Some(pool) = &self.db_pool {
             log_db_error(
@@ -745,6 +764,16 @@ impl ScadaCore {
 
         let view = self.register_tag(tag.clone(), None);
 
+        // Interdire la mise en sommeil d'une variable réveille son alarme si elle dort
+        if tag.alarm_config.shelving_disabled {
+            let id = tag.id.clone();
+            self.unshelve_where(
+                |a| a.tag_id == id,
+                Some(actor),
+                "Réveil : mise en sommeil interdite pour cette variable",
+            );
+        }
+
         if let Some(pool) = &self.db_pool {
             let json_str = serde_json::to_string(&tag)
                 .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
@@ -782,6 +811,7 @@ impl ScadaCore {
         self.tags_state.remove(tag_id);
         self.last_good_values.remove(tag_id);
         self.alarms.remove(tag_id);
+        self.persist_alarm(tag_id);
         removed
     }
 
@@ -990,6 +1020,7 @@ impl ScadaCore {
         }
 
         if changed {
+            self.persist_alarm(alarm_id);
             let _ = self.alarm_tx.send(self.get_all_alarms());
         }
     }
@@ -1054,6 +1085,7 @@ impl ScadaCore {
 
         let updated = alarm.clone();
         drop(alarm);
+        self.persist_alarm(alarm_id);
 
         self.record_alarm_journal(
             &updated.tag_id,
@@ -1083,10 +1115,32 @@ impl ScadaCore {
         minutes: u32,
         comment: Option<String>,
     ) -> Result<AlarmInstance, ScadaError> {
-        if !(1..=480).contains(&minutes) {
-            return Err(ScadaError::BadRequest(
-                "La durée de mise en sommeil doit être comprise entre 1 et 480 minutes".to_string(),
+        let settings = self.get_settings();
+        if !settings.alarm_shelving_enabled {
+            return Err(ScadaError::Forbidden(
+                "La mise en sommeil des alarmes est désactivée par l'administrateur".to_string(),
             ));
+        }
+        if !(1..=settings.alarm_shelve_max_minutes).contains(&minutes) {
+            return Err(ScadaError::BadRequest(format!(
+                "La durée de mise en sommeil doit être comprise entre 1 et {} minutes",
+                settings.alarm_shelve_max_minutes
+            )));
+        }
+        let tag_id = self
+            .alarms
+            .get(alarm_id)
+            .map(|a| a.tag_id.clone())
+            .ok_or_else(|| ScadaError::AlarmNotFound(alarm_id.to_string()))?;
+        if self
+            .tags_registry
+            .get(&tag_id)
+            .is_some_and(|t| t.alarm_config.shelving_disabled)
+        {
+            return Err(ScadaError::Forbidden(format!(
+                "La mise en sommeil est interdite pour l'alarme de '{}'",
+                tag_id
+            )));
         }
         let until = Utc::now() + chrono::Duration::minutes(minutes as i64);
         let updated = {
@@ -1098,6 +1152,7 @@ impl ScadaCore {
             alarm.shelved_by = Some(operator.to_string());
             alarm.clone()
         };
+        self.persist_alarm(alarm_id);
         let detail = format!(
             "Mise en sommeil {} min{}",
             minutes,
@@ -1129,6 +1184,7 @@ impl ScadaCore {
             alarm.shelved_by = None;
             alarm.clone()
         };
+        self.persist_alarm(alarm_id);
         self.record_alarm_journal(
             &updated.tag_id,
             &format!("{:?}", updated.severity),
@@ -1148,30 +1204,194 @@ impl ScadaCore {
             loop {
                 ticker.tick().await;
                 let now = Utc::now();
-                let mut expired: Vec<(String, String)> = Vec::new();
-                for mut a in core.alarms.iter_mut() {
-                    if a.shelved_until.is_some_and(|u| u <= now) {
-                        a.shelved_until = None;
-                        a.shelved_by = None;
-                        expired.push((a.tag_id.clone(), format!("{:?}", a.severity)));
-                    }
+                core.unshelve_where(
+                    |a| a.shelved_until.is_some_and(|u| u <= now),
+                    None,
+                    "Fin de la mise en sommeil (expiration)",
+                );
+            }
+        });
+    }
+
+    // ========================================================================
+    // RÉGLAGES SYSTÈME (MISE EN SOMMEIL DES ALARMES...)
+    // ========================================================================
+
+    pub fn get_settings(&self) -> SystemSettings {
+        self.settings
+            .read()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn subscribe_settings(&self) -> broadcast::Receiver<SystemSettings> {
+        self.settings_tx.subscribe()
+    }
+
+    /// Modifie les réglages système. Désactiver la mise en sommeil réveille immédiatement
+    /// toutes les alarmes en sommeil.
+    pub async fn update_settings(
+        &self,
+        actor: &str,
+        new: SystemSettings,
+    ) -> Result<SystemSettings, ScadaError> {
+        if !(1..=480).contains(&new.alarm_shelve_max_minutes) {
+            return Err(ScadaError::BadRequest(
+                "La durée maximale de mise en sommeil doit être comprise entre 1 et 480 minutes"
+                    .to_string(),
+            ));
+        }
+        let previous = self.get_settings();
+        if let Ok(mut s) = self.settings.write() {
+            *s = new.clone();
+        }
+
+        if let Some(pool) = &self.db_pool {
+            let js = serde_json::to_string(&new)
+                .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+            sqlx::query("INSERT OR REPLACE INTO meta (key, value) VALUES ('settings', ?)")
+                .bind(js)
+                .execute(pool)
+                .await
+                .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+        }
+
+        let mut changes = Vec::new();
+        if previous.alarm_shelving_enabled != new.alarm_shelving_enabled {
+            changes.push(format!(
+                "mise en sommeil des alarmes {}",
+                if new.alarm_shelving_enabled { "activée" } else { "désactivée" }
+            ));
+        }
+        if previous.alarm_shelve_max_minutes != new.alarm_shelve_max_minutes {
+            changes.push(format!(
+                "durée maximale de sommeil {} → {} min",
+                previous.alarm_shelve_max_minutes, new.alarm_shelve_max_minutes
+            ));
+        }
+
+        if !new.alarm_shelving_enabled {
+            let woken = self.unshelve_where(
+                |_| true,
+                Some(actor),
+                "Réveil : mise en sommeil désactivée par l'administrateur",
+            );
+            if woken > 0 {
+                changes.push(format!("{} alarme(s) réveillée(s)", woken));
+            }
+        } else {
+            // Une durée maximale réduite s'applique aussi aux mises en sommeil en cours
+            let max_until = Utc::now() + chrono::Duration::minutes(new.alarm_shelve_max_minutes as i64);
+            let mut shortened = Vec::new();
+            for mut a in self.alarms.iter_mut() {
+                if a.shelved_until.is_some_and(|u| u > max_until) {
+                    a.shelved_until = Some(max_until);
+                    shortened.push(a.id.clone());
                 }
-                for (tag_id, sev) in &expired {
-                    core.record_alarm_journal(tag_id, sev, "FIN_SOMMEIL", "Fin de la mise en sommeil (expiration)", None);
-                }
-                if !expired.is_empty() {
-                    let _ = core.alarm_tx.send(core.get_all_alarms());
+            }
+            for id in &shortened {
+                self.persist_alarm(id);
+            }
+            if !shortened.is_empty() {
+                let _ = self.alarm_tx.send(self.get_all_alarms());
+            }
+        }
+
+        if !changes.is_empty() {
+            self.record_audit(actor, "SYSTÈME", "UPDATE_SETTINGS", "Réglages", &changes.join(", "));
+        }
+        let _ = self.settings_tx.send(new.clone());
+        Ok(new)
+    }
+
+    /// Réveille les alarmes en sommeil qui satisfont `filter`, avec journalisation.
+    /// Renvoie le nombre d'alarmes réveillées.
+    fn unshelve_where(
+        &self,
+        filter: impl Fn(&AlarmInstance) -> bool,
+        operator: Option<&str>,
+        reason: &str,
+    ) -> usize {
+        let mut woken: Vec<(String, String, String)> = Vec::new();
+        for mut a in self.alarms.iter_mut() {
+            if a.shelved_until.is_some() && filter(&a) {
+                a.shelved_until = None;
+                a.shelved_by = None;
+                woken.push((a.id.clone(), a.tag_id.clone(), format!("{:?}", a.severity)));
+            }
+        }
+        for (id, tag_id, sev) in &woken {
+            self.record_alarm_journal(tag_id, sev, "FIN_SOMMEIL", reason, operator.map(str::to_string));
+            self.persist_alarm(id);
+        }
+        if !woken.is_empty() {
+            let _ = self.alarm_tx.send(self.get_all_alarms());
+        }
+        woken.len()
+    }
+
+    // ========================================================================
+    // PERSISTANCE DE L'ÉTAT DES ALARMES (SURVIT AU REDÉMARRAGE)
+    // ========================================================================
+
+    /// Enregistre l'état courant d'une alarme (ou sa suppression si elle n'existe plus).
+    /// Ne doit pas être appelé pendant qu'un verrou sur `self.alarms` est tenu.
+    fn persist_alarm(&self, alarm_id: &str) {
+        if self.db_pool.is_none() {
+            return;
+        }
+        let op = match self.alarms.get(alarm_id) {
+            Some(a) => AlarmPersistOp::Upsert(Box::new(a.clone())),
+            None => AlarmPersistOp::Delete(alarm_id.to_string()),
+        };
+        let _ = self.alarm_persist_tx.send(op);
+    }
+
+    fn spawn_alarm_persist_writer(
+        core: Arc<Self>,
+        mut rx: mpsc::UnboundedReceiver<AlarmPersistOp>,
+    ) {
+        let Some(pool) = core.db_pool.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            while let Some(op) = rx.recv().await {
+                match op {
+                    AlarmPersistOp::Upsert(alarm) => match serde_json::to_string(&alarm) {
+                        Ok(js) => log_db_error(
+                            "persistance alarme",
+                            sqlx::query(
+                                "INSERT INTO alarms_state (id, alarm_json, updated_at) VALUES (?, ?, ?)
+                                 ON CONFLICT(id) DO UPDATE SET alarm_json = excluded.alarm_json, updated_at = excluded.updated_at",
+                            )
+                            .bind(&alarm.id)
+                            .bind(js)
+                            .bind(Utc::now().to_rfc3339())
+                            .execute(&pool)
+                            .await,
+                        ),
+                        Err(e) => warn!("Sérialisation de l'alarme '{}' impossible : {}", alarm.id, e),
+                    },
+                    AlarmPersistOp::Delete(id) => log_db_error(
+                        "suppression alarme",
+                        sqlx::query("DELETE FROM alarms_state WHERE id = ?")
+                            .bind(&id)
+                            .execute(&pool)
+                            .await,
+                    ),
                 }
             }
         });
     }
 
     pub fn acknowledge_all_alarms(&self, operator: &str) -> Vec<AlarmInstance> {
+        let mut acked: Vec<(String, String, String, String)> = Vec::new();
         for mut entry in self.alarms.iter_mut() {
             let al = entry.value_mut();
             if al.state == AlarmLifecycleState::ActiveUnack
                 || al.state == AlarmLifecycleState::ClearedUnack
             {
+                acked.push((al.id.clone(), al.tag_id.clone(), format!("{:?}", al.severity), al.message.clone()));
                 al.acked_at = Some(Utc::now());
                 al.acked_by = Some(operator.to_string());
                 al.state = if al.state == AlarmLifecycleState::ActiveUnack {
@@ -1181,12 +1401,17 @@ impl ScadaCore {
                 };
             }
         }
+        // Chaque acquittement est tracé individuellement dans le journal (ISA-18.2)
+        for (id, tag_id, sev, msg) in &acked {
+            self.record_alarm_journal(tag_id, sev, "ACQUITTEMENT", msg, Some(operator.to_string()));
+            self.persist_alarm(id);
+        }
         self.record_audit(
             operator,
             "ALARME",
             "ACK_ALL",
             "Toutes",
-            "Acquittement global des alarmes",
+            &format!("Acquittement global de {} alarme(s)", acked.len()),
         );
         let all = self.get_all_alarms();
         let _ = self.alarm_tx.send(all.clone());
@@ -1194,10 +1419,17 @@ impl ScadaCore {
     }
 
     pub fn clear_normal_alarms(&self, actor: &str) -> Vec<AlarmInstance> {
-        let before = self.alarms.len();
-        self.alarms
-            .retain(|_, al| al.state != AlarmLifecycleState::Normal);
-        let removed = before.saturating_sub(self.alarms.len());
+        let removed_ids: Vec<String> = self
+            .alarms
+            .iter()
+            .filter(|a| a.state == AlarmLifecycleState::Normal)
+            .map(|a| a.id.clone())
+            .collect();
+        for id in &removed_ids {
+            self.alarms.remove(id);
+            self.persist_alarm(id);
+        }
+        let removed = removed_ids.len();
         self.record_audit(
             actor,
             "ALARME",
@@ -2086,6 +2318,50 @@ impl ScadaCore {
                 }
                 Err(e) => warn!("Symbole illisible ignoré : {}", e),
             }
+        }
+
+        // Réglages système
+        let settings_js: Option<String> =
+            sqlx::query_scalar("SELECT value FROM meta WHERE key = 'settings'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap_or(None);
+        if let Some(js) = settings_js {
+            match serde_json::from_str::<SystemSettings>(&js) {
+                Ok(s) => {
+                    if let Ok(mut cur) = self.settings.write() {
+                        *cur = s;
+                    }
+                }
+                Err(e) => warn!("Réglages système illisibles, valeurs par défaut utilisées : {}", e),
+            }
+        }
+
+        // État des alarmes au moment de l'arrêt : acquittements et mises en sommeil sont conservés.
+        // Les conditions sont réévaluées dès les premières valeurs reçues.
+        let mut obsolete: Vec<String> = Vec::new();
+        for js in load_json_column(&pool, "SELECT alarm_json AS js FROM alarms_state").await {
+            match serde_json::from_str::<AlarmInstance>(&js) {
+                Ok(a) => {
+                    let source_exists = match a.id.strip_prefix("COMM.") {
+                        // Alarme de communication d'un driver supprimé ou arrêté : sans objet
+                        Some(drv) => self.drivers_config.get(drv).is_some_and(|d| d.enabled),
+                        None => self.tags_registry.contains_key(&a.tag_id),
+                    };
+                    if source_exists {
+                        self.alarms.insert(a.id.clone(), a);
+                    } else {
+                        obsolete.push(a.id);
+                    }
+                }
+                Err(e) => warn!("Alarme persistée illisible ignorée : {}", e),
+            }
+        }
+        for id in &obsolete {
+            self.persist_alarm(id);
+        }
+        if !self.alarms.is_empty() {
+            info!("{} alarme(s) restaurée(s) depuis la base", self.alarms.len());
         }
 
         // Garde-fou : sans aucun administrateur actif, on recrée le compte admin d'usine

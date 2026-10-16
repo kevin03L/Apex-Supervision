@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>RustScadaFlow v1.2 — Supervision SCADA/GTB, RBAC &amp; Studio Node-RED</title>
+  <title>RustScadaFlow v1.3 — Supervision SCADA/GTB, RBAC &amp; Studio Node-RED</title>
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="/styles.css" />
 </head>
@@ -414,7 +414,7 @@
 
         <div class="card-box">
           <h3 style="margin-bottom:10px;color:var(--accent);">2. Éditeur CRUD de la Base de Données Temps Réel (Tag Database)</h3>
-          <div style="display:grid;grid-template-columns:1.2fr 1.2fr 0.8fr 1fr 0.6fr 0.5fr 0.6fr 0.6fr 0.6fr 0.6fr auto;gap:6px;align-items:end;margin-bottom:14px;">
+          <div style="display:grid;grid-template-columns:1.2fr 1.2fr 0.8fr 1fr 0.6fr 0.5fr 0.6fr 0.6fr 0.6fr 0.6fr 0.7fr auto;gap:6px;align-items:end;margin-bottom:14px;">
             <div class="form-group"><label>Tag ID</label><input id="tagFormId" value="GTB.CTA02.Temp_Soufflage" /></div>
             <div class="form-group"><label>Libellé</label><input id="tagFormLabel" value="Température Soufflage CTA 02" /></div>
             <div class="form-group"><label>Driver</label><input id="tagFormSource" value="SIM_GTB_01" /></div>
@@ -439,6 +439,13 @@
             <div class="form-group"><label>Scale (×)</label><input type="number" step="0.1" id="tagFormScale" value="1.0" /></div>
             <div class="form-group"><label>Seuil Bas</label><input type="number" step="0.5" id="tagFormLow" placeholder="Opt." /></div>
             <div class="form-group"><label>Seuil Haut</label><input type="number" step="0.5" id="tagFormHigh" value="28.0" /></div>
+            <div class="form-group">
+              <label title="Interdire la mise en sommeil des alarmes de sécurité (ISA-18.2)">Sommeil alarme</label>
+              <select id="tagFormShelve">
+                <option value="false">Autorisé</option>
+                <option value="true">Interdit</option>
+              </select>
+            </div>
             <button class="btn btn-primary" style="height:32px;" onclick="saveTagFromForm()">💾 Enregistrer</button>
           </div>
 
@@ -539,6 +546,19 @@
               <div class="kpi-label">Flux Node-RED Actifs</div>
               <div class="kpi-val" id="sysKpiFlows">--</div>
             </div>
+          </div>
+
+          <div class="settings-row">
+            <span style="font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;">Alarmes :</span>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;">
+              <input type="checkbox" id="setShelvingEnabled" /> Autoriser la mise en sommeil des alarmes
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:#94a3b8;">
+              Durée maximale
+              <input type="number" id="setShelveMax" min="1" max="480" class="scada-select" style="width:80px;" /> min
+            </label>
+            <button class="btn btn-primary" onclick="saveSystemSettings()">💾 Appliquer</button>
+            <span style="font-size:11px;color:#64748b;">Désactiver réveille immédiatement toutes les alarmes en sommeil.</span>
           </div>
         </div>
 

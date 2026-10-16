@@ -641,3 +641,16 @@ body.viewer-only-mode .right-panel {
 body.viewer-only-mode .widget-body button,
 body.viewer-only-mode .widget-body input,
 body.viewer-only-mode .setpoint-controls { display: none !important; }
+
+/* ===== v1.3 : réglages système ===== */
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  padding: 10px 12px;
+  background: #080f1e;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}

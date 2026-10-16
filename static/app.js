@@ -1,5 +1,5 @@
 // ============================================================================
-// RustScadaFlow v1.2 — Moteur Applicatif Frontend (RBAC, Sécurité & Performance)
+// RustScadaFlow v1.3 — Moteur Applicatif Frontend (RBAC, Sécurité & Performance)
 // ============================================================================
 //
 // Règles de sécurité de ce fichier :
@@ -236,6 +236,7 @@ async function bootstrapData() {
   updatePauseButtonUi();
   updateSysInfoPill();
   populateDashboardSelect();
+  renderSettingsForm();
   populateFlowSelect();
   populateHistorianSelect();
   populateScheduleTagSelect();
@@ -439,6 +440,11 @@ function connectRealtimeSocket() {
     } else if (msg.event === 'DriverListUpdate') {
       state.drivers = msg.data;
       if (state.activeTab === 'tagdb') renderDriversCardsOnly();
+    } else if (msg.event === 'SettingsUpdate') {
+      state.systemStatus = Object.assign({}, state.systemStatus || {}, { settings: msg.data });
+      renderSettingsForm();
+      renderAlarmsTable();
+      renderAlarmBanner();
     } else if (msg.event === 'FlowTrace') {
       const tr = msg.data;
       state.nodeLiveValues[tr.from_node_id] = tr.value;
@@ -1903,6 +1909,54 @@ async function saveCurrentFlow(silent) {
 // ATELIER 3 : CONSOLE D'ALARMES ISA-18.2 & JOURNAL SQLITE
 // ============================================================================
 
+/** Réglages de mise en sommeil (diffusés par le serveur dans le statut système). */
+function shelveSettings() {
+  const s = state.systemStatus && state.systemStatus.settings;
+  return {
+    alarm_shelving_enabled: s ? s.alarm_shelving_enabled !== false : true,
+    alarm_shelve_max_minutes: s && s.alarm_shelve_max_minutes ? s.alarm_shelve_max_minutes : 480
+  };
+}
+
+/** Mise en sommeil possible : fonction activée et non interdite pour la variable de l'alarme. */
+function canShelve(a) {
+  if (!shelveSettings().alarm_shelving_enabled) return false;
+  const tag = state.tags[a.tag_id];
+  return !(tag && tag.alarm_config && tag.alarm_config.shelving_disabled);
+}
+
+/** Formulaire des réglages système (carte Administrateur). */
+function renderSettingsForm() {
+  const chk = document.getElementById('setShelvingEnabled');
+  const max = document.getElementById('setShelveMax');
+  if (!chk || !max) return;
+  const s = shelveSettings();
+  chk.checked = s.alarm_shelving_enabled;
+  if (document.activeElement !== max) max.value = s.alarm_shelve_max_minutes;
+}
+
+async function saveSystemSettings() {
+  const enabled = document.getElementById('setShelvingEnabled').checked;
+  const max = parseInt(document.getElementById('setShelveMax').value, 10);
+  if (!enabled && !confirm('Désactiver la mise en sommeil ? Toutes les alarmes en sommeil seront réveillées immédiatement.')) {
+    renderSettingsForm();
+    return;
+  }
+  const res = await fetch('/api/system/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ alarm_shelving_enabled: enabled, alarm_shelve_max_minutes: max })
+  });
+  if (!res.ok) {
+    alert(`Réglages refusés : ${await apiError(res)}`);
+    renderSettingsForm();
+    return;
+  }
+  state.systemStatus = Object.assign({}, state.systemStatus || {}, { settings: await res.json() });
+  renderSettingsForm();
+  renderAlarmsTable();
+}
+
 /** Une alarme en sommeil reste suivie mais est exclue du bandeau et des compteurs. */
 function isShelved(a) {
   return !!(a.shelved_until && new Date(a.shelved_until) > new Date());
@@ -1948,7 +2002,7 @@ function renderAlarmsTable() {
       : '<span style="color:#10b981;">✔ Acquittée</span>';
     const shelveCell = !allowAck ? '' : shelved
       ? `<button class="btn" onclick="unshelveAlarm(${jsArg(a.id)})">⏰ Réveiller</button>`
-      : (a.state !== 'Normal' ? `<button class="btn" onclick="shelveAlarm(${jsArg(a.id)})" title="Masquer temporairement une alarme connue (8 h maximum)">💤 Sommeil</button>` : '');
+      : (a.state !== 'Normal' && canShelve(a) ? `<button class="btn" onclick="shelveAlarm(${jsArg(a.id)})" title="Masquer temporairement une alarme connue (8 h maximum)">💤 Sommeil</button>` : '');
     return `
     <tr class="alarm-row-${esc(a.state)}" style="${shelved ? 'opacity:0.55;' : ''}">
       <td style="font-family:Consolas;">${esc(new Date(a.raised_at).toLocaleTimeString('fr-FR'))}</td>
@@ -1968,11 +2022,12 @@ function renderAlarmsTable() {
 }
 
 async function shelveAlarm(alarmId) {
-  const raw = prompt('Durée de mise en sommeil (minutes, 1 à 480) :', '60');
+  const max = shelveSettings().alarm_shelve_max_minutes;
+  const raw = prompt(`Durée de mise en sommeil (minutes, 1 à ${max}) :`, String(Math.min(60, max)));
   if (raw === null) return;
   const minutes = parseInt(raw, 10);
-  if (!(minutes >= 1 && minutes <= 480)) {
-    alert('Durée invalide : saisissez un nombre de minutes entre 1 et 480.');
+  if (!(minutes >= 1 && minutes <= max)) {
+    alert(`Durée invalide : saisissez un nombre de minutes entre 1 et ${max}.`);
     return;
   }
   const res = await fetch(`/api/alarms/${encodeURIComponent(alarmId)}/shelve`, {
@@ -2291,7 +2346,8 @@ async function saveTagFromForm() {
       enabled: (low !== null || high !== null || prevAlarm.low_low != null || prevAlarm.high_high != null || prevAlarm.trigger_on_bool != null),
       low,
       high,
-      severity: prevAlarm.severity || 'High'
+      severity: prevAlarm.severity || 'High',
+      shelving_disabled: document.getElementById('tagFormShelve').value === 'true'
     })
   };
 
@@ -2326,6 +2382,7 @@ function editTagInForm(tagId) {
   document.getElementById('tagFormScale').value = t.scale_factor || 1.0;
   document.getElementById('tagFormLow').value = (t.alarm_config && t.alarm_config.low) ?? '';
   document.getElementById('tagFormHigh').value = (t.alarm_config && t.alarm_config.high) ?? '';
+  document.getElementById('tagFormShelve').value = String(!!(t.alarm_config && t.alarm_config.shelving_disabled));
 }
 
 async function deleteTagById(tagId) {
@@ -2457,6 +2514,7 @@ async function loadSystemAndHistorianTab() {
   const st = await getJson('/api/system/status', null);
   if (st) {
     state.systemStatus = st;
+    renderSettingsForm();
     document.getElementById('sysKpiUptime').textContent = `PID ${st.pid} (${st.uptime_seconds}s)`;
     document.getElementById('sysKpiDrivers').textContent = `${st.running_drivers} / ${st.total_drivers}`;
     document.getElementById('sysKpiCov').textContent = st.cov_events_total;
