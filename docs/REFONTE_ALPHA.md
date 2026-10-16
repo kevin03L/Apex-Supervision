@@ -310,7 +310,7 @@ La version est définie **une seule fois** (`[workspace.package] version`) et pr
 | `cargo test --workspace` (Windows, windows-gnu) | ✅ 76 tests réussis |
 | `cargo clippy --workspace --all-targets` (Windows) | ✅ aucun avertissement |
 | `clippy -D warnings` de `apex-admin` et `apex-config` pour `x86_64-unknown-linux-gnu` | ✅ compilation croisée sans avertissement |
-| Compilation Linux du moteur (`apex-core`, `apex-server`) | ⚠️ **non exécutée** : compilateur C Linux absent. Elle sera faite par la CI au premier push. |
+| Compilation Linux complète, sous Docker (`ubuntu:22.04`, glibc 2.35, Rust 1.99.1, paquets de `LINUX_GUI_DEPS`) : `cargo build --release --locked -p apex-server -p apex-admin`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo fmt --all --check` | ✅ exécutée : aucune erreur, aucun avertissement, **76 tests réussis**. Le code `cfg(unix)` / `cfg(not(windows))` n'a demandé aucune correction. Le symbole le plus récent requis est `GLIBC_2.35` : il faut glibc 2.35 ou plus récente. |
 | `cargo fmt --check` | ✅ appliqué à tout le workspace (commit dédié) |
 | Moteur en mode portable (Windows) : démarrage, `/api/health`, 2ᵉ instance (code 4, PID affiché), port occupé (code 5), configuration invalide (code 3), arrêt propre par jeton, `config migrate` v0 → v1, `migrate-legacy` sur une copie de la base 1.x (source inchangée, empreinte SHA-256 identique) | ✅ exécuté |
 | Utilitaire desktop piloté par UI Automation : assistant complet, enregistrement, démarrage du moteur, tableau de bord, configuration, diagnostics, arrêt avec confirmation, erreur de port | ✅ exécuté |
@@ -319,10 +319,23 @@ La version est définie **une seule fois** (`[workspace.package] version`) et pr
 | `service install` sans droits administrateur : refus explicite, aucun répertoire créé | ✅ exécuté |
 | Service Windows installé et piloté (SCM) | ⚠️ **à valider manuellement** : il faut les droits administrateur |
 | Installateur Windows | ⚠️ **compilé** par Inno Setup (`apex-supervision-0.4.0-alpha.1-windows-x64-setup.exe`), **non exécuté**. Installation, mise à jour et désinstallation restent à valider sur Windows 10 et 11. |
-| Paquet DEB | ⚠️ **non construit ici** (ni Linux ni Docker actif). Construit et testé (installation, démarrage, arrêt, `remove`, `purge`) par la CI sur un tag ou à la demande. |
-| Utilitaire sous Linux (X11 et Wayland) | ⚠️ non exécuté |
+| Paquet DEB : `cargo install cargo-deb --locked` (3.8.0) puis `cargo deb -p apex-server --no-build` | ✅ construit (`apex-supervision_0.4.0~alpha.1-1_amd64.deb`, 10,5 Mo, deux constructions successives identiques octet pour octet). Une seule correction : le résumé du paquet dépassait 79 caractères et cargo-deb le coupait sur deux lignes ; la `description` d'`apex-server` a été raccourcie. |
+| Paquet DEB testé sous Docker avec **systemd réel** (PID 1, `--privileged --cgroupns=host`) sur **Ubuntu 22.04** (systemd 249), **Debian 12** (systemd 252) et **Ubuntu 24.04** (systemd 255) | ✅ 35 vérifications réussies sur chaque distribution : `apt install` ; utilisateur et groupe `apex-scada` ; `/etc/apex-supervision/apex-scada.toml` en `0660 root:apex-scada` (dossier `2775`, `backups/` en `2770`) ; écoute par défaut sur `127.0.0.1:3000` ; service actif et activé ; `/api/health` (`"status":"ok"`, `run_mode` `service`) ; IHM web servie depuis `/usr/share/apex-supervision/web` ; `config check` ; `systemctl stop` puis « arrêté proprement » dans `journalctl` (`Result=success`, code 0) ; deux `restart` ; mise à jour par réinstallation (service relancé, nouveau PID, droits rétablis) ; `apt remove` (service arrêté, configuration, données et compte conservés) ; `apt purge` (configuration, données, journaux, compte, groupe et lien d'activation supprimés) ; réinstallation après purge. |
+| Mise à jour avec conversion de la configuration (fichier v0 sans `config_version`), Ubuntu 22.04 | ✅ `postinst` convertit le fichier en v1, avec une sauvegarde dans `backups/` ; les valeurs sont conservées et les droits rétablis. Les commentaires ajoutés à la main sont perdus, comme prévu (documenté). |
+| Mise à jour d'un service arrêté ou désactivé (Debian 12) | ✅ Un service activé mais arrêté est **redémarré** par la mise à jour (comportement standard de debhelper) ; un service désactivé reste arrêté. Comportement documenté dans INSTALLATION.md §2.4. |
+| Durcissement systemd (`ProtectSystem=strict`, `MemoryDenyWriteExecute`, `RestrictAddressFamilies`, `PrivateDevices`, aucune capacité…) | ✅ Aucun refus dans le journal. Base SQLite (WAL), journaux fichiers, PID et verrou fonctionnent dans `StateDirectory`, `LogsDirectory` et `RuntimeDirectory`. Avec simulation et mode sûr, l'automate Modbus embarqué écoute bien sur `127.0.0.1:5502`. `systemd-analyze security` : exposition 3.0 « OK ». |
+| Règle polkit (membre du groupe `apex-scada`, sans mot de passe) | ✅ Debian 12 (polkit 122) et Ubuntu 24.04 (polkit 124) : `systemctl restart` accepté ; `disable` refusé (authentification demandée) ; un utilisateur hors du groupe ne peut pas arrêter le service. Ubuntu 22.04 (polkit 0.105) : règle ignorée, authentification demandée, comme documenté. |
+| Étape « Test d'installation » de la CI, rejouée à l'identique (Ubuntu 22.04 avec systemd, utilisateur non root avec `sudo`, `bash -e`, journal vidé) | ✅ L'étape d'origine passait. Elle a été complétée, puis rejouée avec succès : droits de la configuration, attente de journald avant la recherche de « arrêté proprement », redémarrage, mise à jour par réinstallation, contrôles après `remove` et `purge`. Le workflow n'a pas encore tourné sur GitHub (aucun push). |
+| Utilitaire sous Linux : X11 (Xvfb, rendu logiciel Mesa), Ubuntu 24.04, compte du groupe `apex-scada` | ✅ Démarre et affiche l'état du service (PID, mode service, démarrage automatique) et les derniers avertissements du journal. « Redémarrer… » puis la confirmation redémarrent le service via polkit, sans mot de passe (nouveau PID). |
+| Utilitaire sous Wayland, ou avec un GPU réel | ⚠️ non exécuté |
+| Paquet sur machines réelles ou VM (hors conteneur), mise à jour depuis une version antérieure du paquet | ⚠️ non exécuté : une seule version du paquet existe |
 
-Plateformes compilées : Windows x86_64 (gnu). Linux x86_64 : utilitaire et configuration seulement, le reste viendra de la CI.
+Plateformes compilées : Windows x86_64 (gnu) et Linux x86_64 (glibc ≥ 2.35, compilé sous Docker).
+
+Anomalies relevées, non corrigées :
+- à la purge sur Ubuntu 22.04, dpkg affiche `directory '/usr/lib/systemd/system' not empty so not removed`. L'avertissement est sans conséquence : cargo-deb installe l'unité dans `/usr/lib/systemd/system`, alors que le paquet systemd de cette version déclare `/lib/systemd/system` (fusion de `/usr`) ;
+- `crates/apex-config/build.rs` lit le commit avec `git` et surveille `../../.git/HEAD`. Dans un worktree Git (`.git` est alors un fichier), ou sans `git` installé, la version affiche `inconnu` et le script de build est relancé à chaque compilation ;
+- le texte de l'utilitaire « Les actions sur le service demandent une confirmation administrateur (UAC sous Windows) » s'affiche aussi sous Linux, même quand la règle polkit dispense de confirmation.
 
 ### 12.3 Écarts par rapport au plan
 
@@ -336,7 +349,7 @@ Plateformes compilées : Windows x86_64 (gnu). Linux x86_64 : utilitaire et conf
 
 En plus des critères du §11 :
 - valider l'installateur Windows et le service sur Windows 10 et 11 (installation, mise à jour depuis une version antérieure, désinstallation avec et sans suppression des données) ;
-- valider le paquet DEB sur Debian 12, Ubuntu 22.04 et 24.04, et l'utilitaire sous X11 et Wayland. Sur Ubuntu 22.04, polkit 0.105 ignore la règle JavaScript : une authentification est demandée pour chaque action ;
+- le paquet DEB est validé en conteneur systemd sur Debian 12, Ubuntu 22.04 et 24.04 (§12.2). Restent à valider : des machines réelles, une mise à jour depuis une version antérieure du paquet, l'utilitaire sous Wayland et avec un GPU réel, et un premier passage de la CI sur GitHub. Sur Ubuntu 22.04, polkit 0.105 ignore la règle JavaScript : une authentification est demandée pour chaque action ;
 - icône de l'application et ressources de version Windows (`VERSIONINFO`) des binaires ;
 - licence du logiciel à définir (paquet marqué `LicenseRef-Proprietary`, aucune licence dans le dépôt) ;
 - l'utilitaire lance des actions élevées par PowerShell (`Start-Process -Verb RunAs`) : seul le code de sortie est connu, pas le message détaillé ;

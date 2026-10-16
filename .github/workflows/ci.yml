@@ -87,25 +87,48 @@ jobs:
         run: |
           cargo deb -p apex-server --no-build --output dist/
           cd dist && for f in *.deb; do sha256sum "$f" > "$f.sha256"; done
-      - name: Test d'installation, de démarrage et de purge
+      # Étape rejouée à l'identique sous Docker (Ubuntu 22.04 avec systemd) : voir REFONTE_ALPHA.md §12.2
+      - name: Test d'installation, de démarrage, de mise à jour et de purge
         run: |
           set -eux
+          # Attend que le moteur réponde (30 s au plus) et affiche la réponse de /api/health
+          sante() {
+            for i in $(seq 1 30); do curl -fsS http://127.0.0.1:3000/api/health && return 0; sleep 1; done
+            return 1
+          }
+          CONF=/etc/apex-supervision/apex-scada.toml
           sudo apt-get install -y ./dist/*.deb
-          test -f /etc/apex-supervision/apex-scada.toml
+          test -f "$CONF"
+          test "$(stat -c '%a %U:%G' "$CONF")" = "660 root:apex-scada"
           getent passwd apex-scada
-          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:3000/api/health && break; sleep 1; done
-          curl -fsS http://127.0.0.1:3000/api/health | grep -q '"status":"ok"'
+          sante | grep -q '"status":"ok"'
           systemctl is-active apex-scada
-          sudo apex-scada config check --config /etc/apex-supervision/apex-scada.toml
-          # Arrêt propre (SIGTERM) consigné dans les journaux
+          sudo apex-scada config check --config "$CONF"
+          # Arrêt propre (SIGTERM) consigné dans les journaux (journald peut écrire avec retard)
           sudo systemctl stop apex-scada
-          sudo journalctl -u apex-scada --no-pager | grep -q "arrêté proprement"
+          ok=0
+          for i in $(seq 1 10); do
+            sudo journalctl -u apex-scada --no-pager | grep -q "arrêté proprement" && { ok=1; break; }
+            sleep 1
+          done
+          test "$ok" = 1
+          # Redémarrage, puis mise à jour (réinstallation) : configuration migrée, service relancé
+          sudo systemctl restart apex-scada
+          sante | grep -q '"status":"ok"'
+          pid_avant=$(systemctl show apex-scada -p MainPID --value)
+          sudo apt-get install -y --reinstall ./dist/*.deb
+          sante | grep -q '"status":"ok"'
+          test "$(systemctl show apex-scada -p MainPID --value)" != "$pid_avant"
+          test "$(stat -c '%a %U:%G' "$CONF")" = "660 root:apex-scada"
           # remove conserve les données, purge les supprime
           sudo apt-get remove -y apex-supervision
-          test -f /etc/apex-supervision/apex-scada.toml
+          test -f "$CONF"
+          test -d /var/lib/apex-supervision
           sudo apt-get purge -y apex-supervision
           test ! -e /etc/apex-supervision
           test ! -e /var/lib/apex-supervision
+          test ! -e /var/log/apex-supervision
+          test -z "$(getent passwd apex-scada)"
       - uses: actions/upload-artifact@v4
         with:
           name: linux-amd64-deb
