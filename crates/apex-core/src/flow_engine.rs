@@ -14,7 +14,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use rhai::{Dynamic, Engine, Scope, AST};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     core::ScadaCore,
@@ -43,6 +43,12 @@ pub struct FlowEngineRuntime {
     pub timer_since: DashMap<String, Option<DateTime<Utc>>>,
     /// Sorties TagOutput actuellement en échec d'écriture (anti-répétition des avertissements).
     pub failing_outputs: DashMap<String, ()>,
+    /// Nœuds RhaiScript actuellement en échec (clé `flux/nœud`) : un seul avertissement par
+    /// nœud jusqu'au retour à la normale, au lieu d'une erreur à chaque cycle.
+    pub failing_scripts: DashMap<String, ()>,
+    /// Dernière valeur écrite par chaque nœud TagOutput (clé `flux/nœud`) : la sortie n'est
+    /// réécrite que si elle change au-delà de la bande morte du tag cible.
+    pub last_outputs: DashMap<String, TagValue>,
     /// Scripts Rhai déjà compilés, indexés par leur texte source.
     ast_cache: DashMap<String, Arc<AST>>,
     /// Moteur Rhai partagé (initialisé au démarrage du worker).
@@ -64,9 +70,18 @@ impl FlowEngineRuntime {
             gate_inputs: DashMap::new(),
             timer_since: DashMap::new(),
             failing_outputs: DashMap::new(),
+            failing_scripts: DashMap::new(),
+            last_outputs: DashMap::new(),
             ast_cache: DashMap::new(),
             engine: OnceLock::new(),
         }
+    }
+
+    /// Oublie les mémoires d'exécution propres à un flux (redéploiement ou suppression).
+    pub fn forget_flow(&self, flow_id: &str) {
+        let prefix = format!("{}/", flow_id);
+        self.failing_scripts.retain(|k, _| !k.starts_with(&prefix));
+        self.last_outputs.retain(|k, _| !k.starts_with(&prefix));
     }
 
     pub fn spawn_worker(core: Arc<ScadaCore>) {
@@ -108,15 +123,37 @@ impl FlowEngineRuntime {
     }
 }
 
-pub fn build_industrial_rhai_engine(core: Arc<ScadaCore>) -> Engine {
-    let mut engine = Engine::new();
-    // Bac à sable : bornes de calcul et de mémoire pour les scripts utilisateurs
+/// Bac à sable : bornes de calcul et de mémoire pour les scripts utilisateurs.
+fn apply_rhai_sandbox(engine: &mut Engine) {
     engine.set_max_operations(15_000);
     engine.set_max_string_size(4_096);
     engine.set_max_array_size(1_024);
     engine.set_max_map_size(256);
     engine.set_max_call_levels(16);
     engine.set_max_expr_depths(64, 32);
+}
+
+/// Vérifie qu'un script Rhai compile (syntaxe et limites du bac à sable), sans l'exécuter.
+/// Appelé à l'enregistrement d'un flux pour refuser un script invalide avec le message Rhai.
+pub fn check_rhai_script(script: &str) -> Result<(), String> {
+    static CHECKER: OnceLock<Engine> = OnceLock::new();
+    if script.trim().is_empty() {
+        return Err("script vide".to_string());
+    }
+    let engine = CHECKER.get_or_init(|| {
+        let mut engine = Engine::new();
+        apply_rhai_sandbox(&mut engine);
+        engine
+    });
+    engine
+        .compile(script)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+pub fn build_industrial_rhai_engine(core: Arc<ScadaCore>) -> Engine {
+    let mut engine = Engine::new();
+    apply_rhai_sandbox(&mut engine);
 
     let core_for_num = Arc::clone(&core);
     engine.register_fn("tag", move |tag_id: &str| -> f64 {
@@ -429,13 +466,25 @@ async fn run_flow_from_entry_node(
             }
 
             FlowNodeKind::RhaiScript { script } => {
+                let key = node_key(&flow.id, &current_node.id);
                 match eval_rhai_script(rhai_engine, script, &current_val, core) {
-                    Ok(computed) => next_value = computed,
+                    Ok(computed) => {
+                        if core.flow_runtime.failing_scripts.remove(&key).is_some() {
+                            info!(
+                                "Script Rhai du nœud '{}' (flux '{}') rétabli",
+                                current_node.label, flow.id
+                            );
+                        }
+                        next_value = computed;
+                    }
+                    // Un seul avertissement par nœud en échec, jusqu'au retour à la normale
                     Err(err) => {
-                        error!(
-                            "Erreur Rhai dans le nœud '{}' : {}",
-                            current_node.label, err
-                        );
+                        if core.flow_runtime.failing_scripts.insert(key, ()).is_none() {
+                            warn!(
+                                "Erreur Rhai dans le nœud '{}' (flux '{}') : {} (avertissement unique jusqu'au rétablissement)",
+                                current_node.label, flow.id, err
+                            );
+                        }
                         continue;
                     }
                 }
@@ -443,13 +492,28 @@ async fn run_flow_from_entry_node(
 
             FlowNodeKind::TagOutput { target_tag_id } => {
                 if target_tag_id != &tag_state.tag_id {
-                    let should_write = match core.tags_state.get(target_tag_id) {
-                        Some(existing) => next_value.has_significant_change(&existing.value, 0.08),
-                        None => true,
-                    };
+                    // Déduplication sur la dernière valeur écrite par ce nœud (et non sur l'état
+                    // relu, filtré par la bande morte du tag : il ne refléterait jamais une petite
+                    // variation et la même consigne serait réécrite à chaque cycle).
+                    let key = node_key(&flow.id, &current_node.id);
+                    let target_meta = core
+                        .tags_registry
+                        .get(target_tag_id)
+                        .map(|t| (t.deadband, t.data_type));
+                    let band = target_meta.map(|(d, _)| d).unwrap_or(0.0);
+                    // Comparée sous la forme réellement écrite (convertie au type du tag)
+                    let candidate = target_meta
+                        .and_then(|(_, ty)| next_value.coerce_to(ty).ok())
+                        .unwrap_or_else(|| next_value.clone());
+                    let should_write = output_needs_write(
+                        &candidate,
+                        core.flow_runtime.last_outputs.get(&key).as_deref(),
+                        band,
+                    );
                     if should_write {
                         match core.write_tag(target_tag_id, next_value.clone()).await {
-                            Ok(_) => {
+                            Ok(written) => {
+                                core.flow_runtime.last_outputs.insert(key, written.value);
                                 core.flow_runtime.failing_outputs.remove(target_tag_id);
                             }
                             // Un seul avertissement par sortie en échec, jusqu'au retour à la normale
@@ -499,6 +563,37 @@ async fn run_flow_from_entry_node(
                 depth + 1,
             ));
         }
+    }
+}
+
+/// Clé des mémoires d'exécution propres à un nœud (les identifiants ne contiennent pas « / »).
+fn node_key(flow_id: &str, node_id: &str) -> String {
+    format!("{}/{}", flow_id, node_id)
+}
+
+/// Écart minimal entre deux écritures successives d'une sortie TagOutput.
+const OUTPUT_MIN_BAND: f64 = 0.08;
+
+/// Une sortie est (ré)écrite si rien n'a encore été écrit par ce nœud, ou si la nouvelle valeur
+/// s'écarte de la dernière écrite d'au moins `max(bande morte du tag, 0,08)`.
+/// Les valeurs numériques (Float ou Int) sont comparées numériquement.
+fn output_needs_write(next: &TagValue, last_written: Option<&TagValue>, deadband: f64) -> bool {
+    let Some(last) = last_written else {
+        return true;
+    };
+    let band = if deadband.is_finite() {
+        deadband.abs().max(OUTPUT_MIN_BAND)
+    } else {
+        OUTPUT_MIN_BAND
+    };
+    match (next, last) {
+        (TagValue::Float(_) | TagValue::Int(_), TagValue::Float(_) | TagValue::Int(_)) => {
+            match (next.as_f64(), last.as_f64()) {
+                (Some(a), Some(b)) => (a - b).abs() >= band,
+                _ => true,
+            }
+        }
+        _ => next != last,
     }
 }
 
@@ -677,5 +772,191 @@ mod tests {
             0.0,
             false
         ));
+    }
+
+    #[test]
+    fn output_dedup_uses_last_written_value_and_tag_deadband() {
+        let f = TagValue::Float;
+        assert!(output_needs_write(&f(20.0), None, 0.5));
+        // Bande morte du tag 0,5 : une variation de 0,3 n'est pas réécrite
+        assert!(!output_needs_write(&f(20.3), Some(&f(20.0)), 0.5));
+        assert!(output_needs_write(&f(20.5), Some(&f(20.0)), 0.5));
+        // Bande minimale 0,08
+        assert!(!output_needs_write(&f(20.05), Some(&f(20.0)), 0.0));
+        assert!(output_needs_write(&f(20.1), Some(&f(20.0)), 0.0));
+        // Entier et flottant comparés numériquement
+        assert!(!output_needs_write(&f(20.0), Some(&TagValue::Int(20)), 0.0));
+        assert!(!output_needs_write(
+            &TagValue::Bool(true),
+            Some(&TagValue::Bool(true)),
+            0.0
+        ));
+        assert!(output_needs_write(
+            &TagValue::Bool(false),
+            Some(&TagValue::Bool(true)),
+            0.0
+        ));
+    }
+
+    #[test]
+    fn rhai_scripts_are_checked_without_running() {
+        assert!(check_rhai_script("clamp(val * 1.5, 0.0, 100.0)").is_ok());
+        assert!(check_rhai_script("if val > 3 { true } else { false }").is_ok());
+        assert!(check_rhai_script("let x = ;").is_err());
+        assert!(check_rhai_script("").is_err());
+    }
+
+    fn internal_tag(id: &str, deadband: f64) -> crate::models::RegisteredTag {
+        crate::models::RegisteredTag {
+            id: id.into(),
+            label: id.into(),
+            module_source: "INTERNE".into(),
+            protocol_address: String::new(),
+            data_type: crate::models::TagDataType::Float,
+            unit: None,
+            writable: true,
+            deadband,
+            scale_factor: 1.0,
+            scale_offset: 0.0,
+            historize: false,
+            alarm_config: Default::default(),
+        }
+    }
+
+    fn node(id: &str, kind: FlowNodeKind) -> FlowNode {
+        FlowNode {
+            id: id.into(),
+            label: id.into(),
+            x: 0.0,
+            y: 0.0,
+            kind,
+        }
+    }
+
+    fn edge(id: &str, from: &str, to: &str) -> FlowEdge {
+        FlowEdge {
+            id: id.into(),
+            from_node: from.into(),
+            from_port: "out".into(),
+            to_node: to.into(),
+            to_port: "in".into(),
+        }
+    }
+
+    fn input(tag_id: &str, v: f64) -> TagState {
+        TagState {
+            tag_id: tag_id.into(),
+            value: TagValue::Float(v),
+            quality: Quality::Good,
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tag_output_is_not_rewritten_within_target_deadband() {
+        let core = ScadaCore::new(None, &crate::core::EngineOptions::default());
+        core.register_tag(internal_tag("INT.In", 0.0), None);
+        core.register_tag(internal_tag("INT.Out", 0.5), None);
+        let flow = FlowGraph {
+            id: "f".into(),
+            name: "f".into(),
+            description: String::new(),
+            enabled: true,
+            nodes: vec![
+                node(
+                    "in",
+                    FlowNodeKind::TagInput {
+                        tag_id: "INT.In".into(),
+                    },
+                ),
+                node(
+                    "out",
+                    FlowNodeKind::TagOutput {
+                        target_tag_id: "INT.Out".into(),
+                    },
+                ),
+            ],
+            edges: vec![edge("e", "in", "out")],
+        };
+        let engine = shared_engine(&core);
+        let out = |core: &ScadaCore| core.tags_state.get("INT.Out").unwrap().value.clone();
+
+        run_flow_from_entry_node(
+            &core,
+            &flow,
+            &flow.nodes[0],
+            &input("INT.In", 20.0),
+            &engine,
+        )
+        .await;
+        assert_eq!(out(&core), TagValue::Float(20.0));
+        // L'opérateur modifie la sortie : le flux ne la réécrit pas tant que sa propre sortie
+        // ne varie pas au-delà de la bande morte du tag (plus de réécriture à chaque cycle)
+        core.write_tag("INT.Out", TagValue::Float(30.0))
+            .await
+            .unwrap();
+        run_flow_from_entry_node(
+            &core,
+            &flow,
+            &flow.nodes[0],
+            &input("INT.In", 20.3),
+            &engine,
+        )
+        .await;
+        assert_eq!(out(&core), TagValue::Float(30.0));
+        run_flow_from_entry_node(
+            &core,
+            &flow,
+            &flow.nodes[0],
+            &input("INT.In", 20.6),
+            &engine,
+        )
+        .await;
+        assert_eq!(out(&core), TagValue::Float(20.6));
+        // Redéploiement : la mémoire du nœud est oubliée, la sortie est réécrite
+        core.flow_runtime.forget_flow("f");
+        assert!(core.flow_runtime.last_outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failing_rhai_node_is_reported_once_until_recovery() {
+        let core = ScadaCore::new(None, &crate::core::EngineOptions::default());
+        core.register_tag(internal_tag("INT.In", 0.0), None);
+        let flow = FlowGraph {
+            id: "f".into(),
+            name: "f".into(),
+            description: String::new(),
+            enabled: true,
+            nodes: vec![
+                node(
+                    "in",
+                    FlowNodeKind::TagInput {
+                        tag_id: "INT.In".into(),
+                    },
+                ),
+                // Erreur d'exécution uniquement pour val > 10 (division d'un entier par zéro)
+                node(
+                    "rhai",
+                    FlowNodeKind::RhaiScript {
+                        script: "if val > 10.0 { 1 / 0 } else { val }".into(),
+                    },
+                ),
+            ],
+            edges: vec![edge("e", "in", "rhai")],
+        };
+        let engine = shared_engine(&core);
+        let failing = |core: &ScadaCore| core.flow_runtime.failing_scripts.contains_key("f/rhai");
+        run_flow_from_entry_node(
+            &core,
+            &flow,
+            &flow.nodes[0],
+            &input("INT.In", 12.0),
+            &engine,
+        )
+        .await;
+        assert!(failing(&core));
+        run_flow_from_entry_node(&core, &flow, &flow.nodes[0], &input("INT.In", 5.0), &engine)
+            .await;
+        assert!(!failing(&core), "retour à la normale");
     }
 }

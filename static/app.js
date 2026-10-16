@@ -17,6 +17,9 @@ const WIDGET_TYPES = [
 
 // Protocoles sans implémentation réelle (valeurs fictives) : signalés comme tels dans l'IHM
 const SIMULATED_PROTOCOLS = ['Simulator', 'OpcUa', 'BacnetIp', 'SiemensS7'];
+// Auto-Découverte : catalogue de démonstration des seuls protocoles simulés, simulation active.
+// Jamais pour un équipement réel (Modbus TCP, MQTT) : ses variables se déclarent d'après sa table d'échange.
+const DISCOVERABLE_PROTOCOLS = ['OpcUa', 'BacnetIp', 'SiemensS7'];
 const WEEK_DAYS = [[1, 'Lun'], [2, 'Mar'], [3, 'Mer'], [4, 'Jeu'], [5, 'Ven'], [6, 'Sam'], [7, 'Dim']];
 
 const DEFAULT_SVG = '<svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="35" stroke="currentColor" stroke-width="3" fill="none"/></svg>';
@@ -2161,12 +2164,20 @@ function renderDriversCardsOnly() {
           }
           <button class="btn" onclick="restartDriver(${id})">🔄 Redémarrer</button>
           <button class="btn" onclick="editDriverInForm(${id})">⚙️ Paramètres</button>
-          <button class="btn" onclick="browseDriverTags(${id})">🔍 Auto-Découverte</button>
+          ${canDiscoverTags(d)
+            ? `<button class="btn" onclick="browseDriverTags(${id})" title="Catalogue de démonstration du protocole simulé">🔍 Auto-Découverte</button>`
+            : ''}
           <button class="btn btn-danger" onclick="deleteDriver(${id})">🗑️</button>
         </div>
       </div>
     `;
   }).join('');
+}
+
+/** L'Auto-Découverte n'est proposée que pour un protocole simulé, avec la simulation active. */
+function canDiscoverTags(driver) {
+  return DISCOVERABLE_PROTOCOLS.includes(driver.protocol)
+    && !!(state.systemStatus && state.systemStatus.simulation_enabled);
 }
 
 async function driverAction(id, action) {
@@ -2294,11 +2305,10 @@ async function createNewDriver() {
     body: JSON.stringify(payload)
   });
 
-  if (res.ok) {
-    await browseDriverTags(id);
-  } else {
-    alert(await apiError(res));
-  }
+  // Aucune découverte automatique : les variables d'un équipement réel se déclarent dans le
+  // catalogue d'après sa table d'échange (l'Auto-Découverte reste un geste explicite, réservé
+  // aux protocoles simulés).
+  if (!res.ok) alert(await apiError(res));
   await renderDriversAndTagDb();
 }
 
@@ -2709,6 +2719,7 @@ async function importProjectBackup(event) {
   const r = await res.json();
   const errs = (r.errors || []);
   alert(`Archive restaurée : ${r.drivers} driver(s), ${r.tags} tag(s), ${r.dashboards} synoptique(s), ${r.flows} flux, ${r.schedules} planning(s).`
+    + (r.ignored_drivers ? `\nNon importé(s) : ${Number(r.ignored_drivers)} driver(s) et ${Number(r.ignored_tags) || 0} variable(s) rattachée(s).` : '')
     + (errs.length ? `\n\n${errs.length} avertissement(s) :\n- ${errs.slice(0, 10).join('\n- ')}` : ''));
   await bootstrapData();
 }

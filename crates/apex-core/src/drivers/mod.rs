@@ -931,10 +931,20 @@ impl IndustrialDriver for ModbusTcpDriver {
                         Some(cmd) = write_rx.recv() => {
                             let start_w = Instant::now();
                             match execute_modbus_write(&mut ctx, &cmd).await {
-                                Ok(()) => {
+                                Ok(Ok(())) => {
                                     let lat = start_w.elapsed().as_millis() as u64;
                                     core_ref.record_driver_poll(&config.id, true, lat, None);
                                 }
+                                // Commande refusée (exception Modbus, adresse ou valeur invalide) :
+                                // la liaison reste saine, ni coupure ni alarme de communication.
+                                Ok(Err(err)) => {
+                                    warn!(
+                                        "Driver Modbus '{}' : écriture de '{}' ({}) refusée : {}",
+                                        config.id, cmd.tag_id, cmd.protocol_address, err
+                                    );
+                                    core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, &err);
+                                }
+                                // Défaut de transport : reconnexion
                                 Err(err) => {
                                     core_ref.record_driver_poll(&config.id, false, 0, Some(err));
                                     publish_bad_disconnect_for_all(&config.tags, &core_tx).await;
@@ -1277,42 +1287,156 @@ fn fallback_value(data_type: TagDataType) -> TagValue {
     }
 }
 
-async fn execute_modbus_write(ctx: &mut client::Context, cmd: &WriteCommand) -> Result<(), String> {
-    let spec = ModbusAddressSpec::parse(&cmd.protocol_address)?;
+impl ModbusAddressSpec {
+    /// Zones écrivables : bobines (COIL) et registres de maintien (HR).
+    /// Les entrées TOR (DI) et les registres d'entrée (IR) sont en lecture seule.
+    fn is_writable(&self) -> bool {
+        matches!(
+            self,
+            Self::Coil(_)
+                | Self::HoldingInt16(_)
+                | Self::HoldingUint16(_)
+                | Self::HoldingInt32(_)
+                | Self::HoldingFloat32(_)
+                | Self::HoldingFloat32Swap(_)
+        )
+    }
+}
+
+/// Trame d'écriture Modbus prête à l'envoi (adresse et données déjà contrôlées).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModbusWrite {
+    /// Écriture d'une bobine (fonction 05).
+    Coil(u16, bool),
+    /// Écriture d'un registre (fonction 06).
+    Register(u16, u16),
+    /// Écriture de deux registres consécutifs, mot de poids fort en premier (fonction 16).
+    Registers(u16, [u16; 2]),
+}
+
+/// Valeur entière arrondie, refusée hors de `[min, max]` : jamais de saturation silencieuse,
+/// l'équipement reçoit exactement la valeur demandée ou rien.
+fn integer_in_range(value: &TagValue, min: i64, max: i64, type_name: &str) -> Result<i64, String> {
+    let n = value
+        .as_f64()
+        .filter(|n| n.is_finite())
+        .ok_or_else(|| format!("Valeur numérique requise pour un registre {}", type_name))?;
+    let r = n.round();
+    if r < min as f64 || r > max as f64 {
+        return Err(format!(
+            "Valeur {} hors plage pour un registre {} ({}..={})",
+            n, type_name, min, max
+        ));
+    }
+    Ok(r as i64)
+}
+
+/// Convertit une valeur (brute équipement) en trame d'écriture pour une adresse donnée.
+fn encode_modbus_write(spec: ModbusAddressSpec, value: &TagValue) -> Result<ModbusWrite, String> {
     match spec {
         ModbusAddressSpec::Coil(addr) => {
-            let b = cmd.value.as_bool().ok_or("Booléen requis")?;
-            ctx.write_single_coil(addr, b)
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|exc| format!("{:?}", exc))?;
+            let b = value
+                .as_bool()
+                .ok_or("Valeur booléenne requise pour une bobine (COIL)")?;
+            Ok(ModbusWrite::Coil(addr, b))
         }
-        ModbusAddressSpec::HoldingInt16(addr) | ModbusAddressSpec::HoldingUint16(addr) => {
-            let n = cmd.value.as_f64().ok_or("Nombre requis")?;
-            ctx.write_single_register(addr, (n.round() as i16) as u16)
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|exc| format!("{:?}", exc))?;
+        ModbusAddressSpec::HoldingInt16(addr) => {
+            let n = integer_in_range(value, i16::MIN as i64, i16::MAX as i64, "INT16")?;
+            Ok(ModbusWrite::Register(addr, (n as i16) as u16))
         }
-        ModbusAddressSpec::HoldingFloat32(addr) => {
-            let n = cmd.value.as_f64().ok_or("Float requis")?;
-            let words = encode_f32_to_registers_be(n as f32, false);
-            ctx.write_multiple_registers(addr, &words)
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|exc| format!("{:?}", exc))?;
+        ModbusAddressSpec::HoldingUint16(addr) => {
+            let n = integer_in_range(value, 0, u16::MAX as i64, "UINT16")?;
+            Ok(ModbusWrite::Register(addr, n as u16))
         }
-        ModbusAddressSpec::HoldingFloat32Swap(addr) => {
-            let n = cmd.value.as_f64().ok_or("Float requis")?;
-            let words = encode_f32_to_registers_be(n as f32, true);
-            ctx.write_multiple_registers(addr, &words)
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|exc| format!("{:?}", exc))?;
+        ModbusAddressSpec::HoldingInt32(addr) => {
+            let n = integer_in_range(value, i32::MIN as i64, i32::MAX as i64, "INT32")?;
+            let mut buf = [0u8; 4];
+            BigEndian::write_i32(&mut buf, n as i32);
+            Ok(ModbusWrite::Registers(
+                addr,
+                [
+                    BigEndian::read_u16(&buf[0..2]),
+                    BigEndian::read_u16(&buf[2..4]),
+                ],
+            ))
         }
-        _ => return Err("Registre Modbus en lecture seule".to_string()),
+        ModbusAddressSpec::HoldingFloat32(addr) | ModbusAddressSpec::HoldingFloat32Swap(addr) => {
+            let n = value
+                .as_f64()
+                .filter(|n| n.is_finite())
+                .ok_or("Valeur numérique requise pour un registre FLOAT32")?;
+            if n.abs() > f32::MAX as f64 {
+                return Err(format!("Valeur {} hors plage pour un registre FLOAT32", n));
+            }
+            let swap = matches!(spec, ModbusAddressSpec::HoldingFloat32Swap(_));
+            Ok(ModbusWrite::Registers(
+                addr,
+                encode_f32_to_registers_be(n as f32, swap),
+            ))
+        }
+        ModbusAddressSpec::DiscreteInput(_)
+        | ModbusAddressSpec::InputRegInt16(_)
+        | ModbusAddressSpec::InputRegFloat32(_) => Err(format!(
+            "Adresse Modbus en lecture seule ({:?}) : seules les bobines (COIL) et les registres de maintien (HR) sont écrivables",
+            spec.area()
+        )),
+    }
+}
+
+/// Contrôle, avant l'envoi, qu'une valeur brute peut être écrite à une adresse Modbus
+/// (adresse écrivable, valeur dans la plage du type). Appelé par `ScadaCore::write_tag`
+/// pour renvoyer l'erreur à l'opérateur ou au flux au lieu d'une erreur différée.
+pub fn check_modbus_write(protocol_address: &str, value: &TagValue) -> Result<(), String> {
+    let spec = ModbusAddressSpec::parse(protocol_address)?;
+    encode_modbus_write(spec, value).map(|_| ())
+}
+
+/// Contrôle à l'enregistrement qu'une variable Modbus déclarée inscriptible vise une zone
+/// écrivable (COIL ou HR) avec un type numérique ou booléen.
+pub fn validate_modbus_tag(tag: &RegisteredTag) -> Result<(), String> {
+    if !tag.writable {
+        return Ok(());
+    }
+    let spec = ModbusAddressSpec::parse(&tag.protocol_address)
+        .map_err(|e| format!("Variable inscriptible '{}' : {}", tag.id, e))?;
+    if !spec.is_writable() {
+        return Err(format!(
+            "Variable '{}' : l'adresse '{}' est en lecture seule (entrées TOR « DI » et registres d'entrée « IR ») ; elle ne peut pas être déclarée inscriptible",
+            tag.id, tag.protocol_address
+        ));
+    }
+    if tag.data_type == TagDataType::Text {
+        return Err(format!(
+            "Variable '{}' : une variable texte ne peut pas être écrite dans un registre Modbus",
+            tag.id
+        ));
     }
     Ok(())
+}
+
+/// Exécute une écriture. Erreur externe : défaut de transport (connexion perdue).
+/// Erreur interne : commande refusée (adresse ou valeur invalide, exception Modbus renvoyée par
+/// l'équipement) : la liaison reste valide.
+async fn execute_modbus_write(
+    ctx: &mut client::Context,
+    cmd: &WriteCommand,
+) -> Result<Result<(), String>, String> {
+    let frame = match ModbusAddressSpec::parse(&cmd.protocol_address)
+        .and_then(|spec| encode_modbus_write(spec, &cmd.value))
+    {
+        Ok(frame) => frame,
+        Err(e) => return Ok(Err(e)),
+    };
+    let res = match frame {
+        ModbusWrite::Coil(addr, b) => ctx.write_single_coil(addr, b).await,
+        ModbusWrite::Register(addr, word) => ctx.write_single_register(addr, word).await,
+        ModbusWrite::Registers(addr, words) => ctx.write_multiple_registers(addr, &words).await,
+    };
+    match res {
+        Err(e) => Err(e.to_string()),
+        Ok(Err(exc)) => Ok(Err(format!("exception Modbus {:?}", exc))),
+        Ok(Ok(())) => Ok(Ok(())),
+    }
 }
 
 async fn publish_bad_disconnect_for_all(tags: &[RegisteredTag], core_tx: &mpsc::Sender<TagState>) {
@@ -1574,16 +1698,20 @@ impl IndustrialDriver for FieldbusDriver {
     }
 
     async fn browse_tags(&self) -> Result<Vec<RegisteredTag>, String> {
-        Ok(discover_protocol_tags(
-            &self.config.id,
-            &self.config.protocol,
-        ))
+        discover_protocol_tags(&self.config.id, &self.config.protocol)
     }
 }
 
-pub fn discover_protocol_tags(driver_id: &str, protocol: &ProtocolType) -> Vec<RegisteredTag> {
+/// Catalogue de démonstration des protocoles simulés (OPC-UA, BACnet/IP, Siemens S7).
+///
+/// Refusé pour les drivers réels (Modbus TCP, MQTT) et pour le simulateur GTB. Le contrôle de
+/// la simulation active est fait par `ScadaCore::discover_driver_tags`.
+pub fn discover_protocol_tags(
+    driver_id: &str,
+    protocol: &ProtocolType,
+) -> Result<Vec<RegisteredTag>, String> {
     let src = driver_id.to_string();
-    match protocol {
+    let tags = match protocol {
         ProtocolType::OpcUa => vec![
             RegisteredTag {
                 id: format!("{}.OPC.Chiller_Temp_Eau_Glacee", src),
@@ -1674,37 +1802,23 @@ pub fn discover_protocol_tags(driver_id: &str, protocol: &ProtocolType) -> Vec<R
                 alarm_config: TagAlarmConfig::default(),
             },
         ],
-        _ => vec![
-            RegisteredTag {
-                id: format!("{}.Mesure_Analogique_01", src),
-                label: "Mesure Principale Équipement".to_string(),
-                module_source: src.clone(),
-                protocol_address: "HR:0:FLOAT32".to_string(),
-                data_type: TagDataType::Float,
-                unit: Some("°C".to_string()),
-                writable: false,
-                deadband: 0.05,
-                scale_factor: 1.0,
-                scale_offset: 0.0,
-                historize: true,
-                alarm_config: TagAlarmConfig::default(),
-            },
-            RegisteredTag {
-                id: format!("{}.Consigne_01", src),
-                label: "Consigne Principale Équipement".to_string(),
-                module_source: src,
-                protocol_address: "HR:2:FLOAT32".to_string(),
-                data_type: TagDataType::Float,
-                unit: Some("°C".to_string()),
-                writable: true,
-                deadband: 0.05,
-                scale_factor: 1.0,
-                scale_offset: 0.0,
-                historize: true,
-                alarm_config: TagAlarmConfig::default(),
-            },
-        ],
-    }
+        // Le simulateur GTB a un catalogue fixe, déjà déclaré avec le driver
+        ProtocolType::Simulator => {
+            return Err(
+                "Auto-Découverte sans objet pour le simulateur GTB : son catalogue de variables est fixe"
+                    .to_string(),
+            )
+        }
+        // Un équipement réel ne décrit pas sa table d'échange : inventer des variables
+        // (dont des consignes inscriptibles) écrirait à des adresses inconnues.
+        ProtocolType::ModbusTcp | ProtocolType::Mqtt => {
+            return Err(format!(
+                "Auto-Découverte non disponible pour le protocole {:?} : déclarez les variables d'après la table d'échange de l'équipement",
+                protocol
+            ))
+        }
+    };
+    Ok(tags)
 }
 
 #[cfg(test)]
@@ -1812,5 +1926,94 @@ mod tests {
             decode_from_block(&ModbusAddressSpec::Coil(1), 0, &bits).unwrap(),
             TagValue::Bool(false)
         );
+    }
+
+    fn encode(addr: &str, v: TagValue) -> Result<ModbusWrite, String> {
+        encode_modbus_write(ModbusAddressSpec::parse(addr).unwrap(), &v)
+    }
+
+    #[test]
+    fn int32_write_is_big_endian_and_decodes_back() {
+        let w = encode("HR:20:INT32", TagValue::Int(-123_456)).unwrap();
+        let ModbusWrite::Registers(20, regs) = w else {
+            panic!("deux registres attendus : {:?}", w);
+        };
+        let block = BlockData::Registers(regs.to_vec());
+        assert_eq!(
+            decode_from_block(&ModbusAddressSpec::HoldingInt32(20), 20, &block).unwrap(),
+            TagValue::Int(-123_456)
+        );
+        assert_eq!(
+            encode("HR:0:INT32", TagValue::Int(0x0001_0002)).unwrap(),
+            ModbusWrite::Registers(0, [0x0001, 0x0002])
+        );
+        assert!(encode("HR:0:INT32", TagValue::Float(3_000_000_000.0)).is_err());
+    }
+
+    #[test]
+    fn int16_and_uint16_writes_are_range_checked() {
+        // Plus aucune saturation silencieuse (40000 → 32767, -1 → 65535)
+        assert!(encode("HR:20:UINT16", TagValue::Int(40_000)).is_ok());
+        assert_eq!(
+            encode("HR:20:UINT16", TagValue::Int(40_000)).unwrap(),
+            ModbusWrite::Register(20, 40_000)
+        );
+        assert!(encode("HR:20:UINT16", TagValue::Int(-1)).is_err());
+        assert!(encode("HR:20:UINT16", TagValue::Int(65_536)).is_err());
+        assert!(encode("HR:10:INT16", TagValue::Int(50_000)).is_err());
+        assert!(encode("HR:10:INT16", TagValue::Int(-32_769)).is_err());
+        assert_eq!(
+            encode("HR:10:INT16", TagValue::Int(-2)).unwrap(),
+            ModbusWrite::Register(10, 0xFFFE)
+        );
+        assert_eq!(
+            encode("HR:10", TagValue::Float(12.6)).unwrap(),
+            ModbusWrite::Register(10, 13)
+        );
+        assert!(encode("HR:10:INT16", TagValue::Float(f64::NAN)).is_err());
+        assert!(encode("HR:0:FLOAT32", TagValue::Float(1e300)).is_err());
+        assert!(check_modbus_write("HR:20:UINT16", &TagValue::Int(65_535)).is_ok());
+        assert!(check_modbus_write("HR:20:UINT16", &TagValue::Int(65_536)).is_err());
+    }
+
+    #[test]
+    fn read_only_areas_cannot_be_written_nor_declared_writable() {
+        assert!(encode("IR:4:FLOAT32", TagValue::Float(1.0)).is_err());
+        assert!(encode("DI:0", TagValue::Bool(true)).is_err());
+        assert!(check_modbus_write("IR:0", &TagValue::Int(1)).is_err());
+
+        let mut t = build_local_modbus_plc_config(5502).tags[0].clone();
+        assert!(t.writable);
+        for tag in build_local_modbus_plc_config(5502).tags {
+            assert!(validate_modbus_tag(&tag).is_ok(), "{}", tag.id);
+        }
+        t.protocol_address = "DI:3".to_string();
+        assert!(validate_modbus_tag(&t).is_err());
+        t.protocol_address = "IR:3:FLOAT32".to_string();
+        assert!(validate_modbus_tag(&t).is_err());
+        t.protocol_address = "HR:3:INT32".to_string();
+        assert!(validate_modbus_tag(&t).is_ok());
+        t.data_type = TagDataType::Text;
+        assert!(validate_modbus_tag(&t).is_err());
+        // Une variable en lecture seule peut viser n'importe quelle zone
+        t.writable = false;
+        t.protocol_address = "IR:3:FLOAT32".to_string();
+        assert!(validate_modbus_tag(&t).is_ok());
+    }
+
+    #[test]
+    fn discovery_never_invents_tags_on_real_drivers() {
+        assert!(discover_protocol_tags("MB", &ProtocolType::ModbusTcp).is_err());
+        assert!(discover_protocol_tags("MQ", &ProtocolType::Mqtt).is_err());
+        assert!(discover_protocol_tags("SIM", &ProtocolType::Simulator).is_err());
+        for p in [
+            ProtocolType::OpcUa,
+            ProtocolType::BacnetIp,
+            ProtocolType::SiemensS7,
+        ] {
+            let tags = discover_protocol_tags("D1", &p).unwrap();
+            assert!(!tags.is_empty());
+            assert!(tags.iter().all(|t| t.module_source == "D1"));
+        }
     }
 }

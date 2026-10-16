@@ -14,7 +14,6 @@ use std::{
 
 use apex_core::{
     core::{ScadaCore, APP_VERSION},
-    drivers::discover_protocol_tags,
     flow_engine::trigger_flow_now,
     models::{
         AckAlarmRequest, AlarmInstance, AlarmJournalEntry, AuditLogEntry, ChangePasswordRequest,
@@ -702,19 +701,11 @@ async fn api_browse_driver(
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<Vec<TagFullView>>, ApiError> {
     require_supervisor(&user)?;
-    let drv = state
+    // Refusée (400) pour les drivers réels et sans simulation active : voir discover_driver_tags
+    let views = state
         .core
-        .drivers_config
-        .get(&driver_id)
-        .map(|d| d.clone())
-        .ok_or_else(|| ScadaError::DriverNotFound(driver_id.clone()))?;
-
-    let discovered = discover_protocol_tags(&drv.id, &drv.protocol);
-    let mut views = Vec::new();
-    for tag in discovered {
-        let v = state.core.upsert_tag(&user.0.username, tag).await?;
-        views.push(v);
-    }
+        .discover_driver_tags(&user.0.username, &driver_id)
+        .await?;
     Ok(Json(views))
 }
 
