@@ -294,21 +294,22 @@ La version est définie **une seule fois** (`[workspace.package] version`) et pr
 
 | Étape | Contenu livré |
 |---|---|
-| 3a Socle | Workspace de 4 crates. `apex-config` : modèle v1, validation par champ, migrations, écriture atomique sous verrou, détection de conflit, 20 sauvegardes, couche OS. `apex-core` découplé d'Axum. |
+| 3a Socle | Workspace de 4 crates (plus `apex-build`, outil des scripts de compilation). `apex-config` : modèle v1, validation par champ, migrations, écriture atomique sous verrou, détection de conflit, 20 sauvegardes, couche OS. `apex-core` découplé d'Axum. |
 | 3b Cycle de vie | CLI (`run`, `config check/show/init/migrate`, `migrate-legacy`, `service …`, `version`), codes de sortie documentés, journaux fichiers avec rotation, instance unique (PID dans `apex-scada.pid`), réservation du port avant les drivers, arrêt propre unifié (API, Ctrl+C, SIGTERM, SCM) avec suspension des automatismes avant l'arrêt des drivers, mode sûr, option simulation, reprise des bases 1.x par copie. |
 | 3c Service Windows | `service install/uninstall/start/stop/restart/status/enable/disable`, compte LocalService, permissions des répertoires, redémarrage après échec, messages SCM explicites. L'installation est refusée **avant** toute création de répertoire si les droits manquent. |
 | 4 Utilitaire desktop | `apex-scada-admin` (egui 0.37, rendu wgpu) : état, démarrage, arrêt et redémarrage (service ou manuel), configuration validée, journaux, diagnostics, restauration des sauvegardes, assistant initial (5 étapes avec retour arrière), relance en administrateur, protection contre la fermeture avec des modifications non enregistrées. |
 | 5a Installateur Windows | `packaging/windows/apex-supervision.iss` et `build-installer.ps1` : installation, service, assistant, mise à jour (arrêt, `config migrate`, redémarrage), désinstallation conservant les données sauf demande explicite, empreinte SHA-256. |
 | 5b Paquet Linux | Métadonnées `cargo-deb` (paquet `apex-supervision`), `postinst` et `postrm`, unité systemd durcie, règle polkit, raccourci desktop. |
 | 6 CI et documentation | `.github/workflows/ci.yml` (Windows et Ubuntu 22.04, artefacts sur tag), [INSTALLATION.md](INSTALLATION.md), [ADMINISTRATION.md](ADMINISTRATION.md), [DEVELOPPEMENT.md](DEVELOPPEMENT.md), README. |
+| Icône et ressources de version | Icône sobre générée par code (`packaging/icons/generer-icones.ps1` → SVG, PNG 256 px, ICO 16 à 256 px, sortie reproductible). Crate de compilation `apex-build` (`embed-resource` : `windres` pour windows-gnu, `rc.exe` pour windows-msvc, rien pour une cible Linux) : icône et `VERSIONINFO` en français dans `apex-scada.exe` et `apex-scada-admin.exe` (version de fichier `0.4.0.1` dérivée de `0.4.0-alpha.1`, comme l'installateur). Icône de la fenêtre de l'utilitaire, de l'installateur (`SetupIconFile`) et du raccourci Linux (thème `hicolor`, 256 px et SVG). `build-installer.ps1` refuse des binaires sans la bonne version de fichier. |
 | Exigence « rien de simulé présenté comme réel » | L'IHM web regroupe et étiquette OPC-UA, BACnet/IP et S7 comme « SIMULÉ », avec un badge sur les drivers concernés. Le moteur refuse ces drivers si la simulation est désactivée. |
 
 ### 12.2 État des vérifications
 
 | Vérification | Résultat |
 |---|---|
-| `cargo test --workspace` (Windows, windows-gnu) | ✅ 76 tests réussis |
-| `cargo clippy --workspace --all-targets` (Windows) | ✅ aucun avertissement |
+| `cargo test --workspace` (Windows, windows-gnu) | ✅ 81 tests réussis (dont 5 pour l'icône et la version Windows) |
+| `cargo clippy --workspace --all-targets -- -D warnings` (Windows) | ✅ aucun avertissement |
 | `clippy -D warnings` de `apex-admin` et `apex-config` pour `x86_64-unknown-linux-gnu` | ✅ compilation croisée sans avertissement |
 | Compilation Linux du moteur (`apex-core`, `apex-server`) | ⚠️ **non exécutée** : compilateur C Linux absent. Elle sera faite par la CI au premier push. |
 | `cargo fmt --check` | ✅ appliqué à tout le workspace (commit dédié) |
@@ -316,6 +317,12 @@ La version est définie **une seule fois** (`[workspace.package] version`) et pr
 | Utilitaire desktop piloté par UI Automation : assistant complet, enregistrement, démarrage du moteur, tableau de bord, configuration, diagnostics, arrêt avec confirmation, erreur de port | ✅ exécuté |
 | Utilitaire : onglets Journaux, Sauvegardes, À propos | ⚠️ compilés, non vérifiés visuellement |
 | IHM web : nom du produit, version, étiquetage « SIMULÉ » | ✅ vérifié dans un navigateur |
+| Ressources Windows (windows-gnu, `windres`) : `(Get-Item …).VersionInfo` des deux `.exe` en debug et en release (version `0.4.0.1` / `0.4.0-alpha.1`, nom du produit, description, éditeur, langue français), icône extraite des `.exe` | ✅ exécuté |
+| Ressources Windows avec la chaîne windows-msvc (`rc.exe`) | ⚠️ non exécuté ici (chaîne GNU seulement) : couvert par la CI Windows |
+| Ressources Windows pour une cible Linux (`cargo check --target x86_64-unknown-linux-gnu -p apex-admin`) | ✅ aucun script de ressources généré ni lié |
+| Icône : fenêtre de l'utilitaire (PNG décodé, test unitaire), installateur recompilé par `build-installer.ps1 -SkipBuild` avec `SetupIconFile` (icône extraite de l'installateur) | ✅ exécuté (fenêtre : décodage testé, affichage non vérifié visuellement) |
+| `generer-icones.ps1` relancé dans un dossier vide : SVG, PNG et ICO identiques octet pour octet aux fichiers versionnés | ✅ exécuté |
+| Icône du raccourci Linux (`Icon=apex-supervision`, thème `hicolor`) | ⚠️ non vérifié : paquet DEB non construit ici |
 | `service install` sans droits administrateur : refus explicite, aucun répertoire créé | ✅ exécuté |
 | Service Windows installé et piloté (SCM) | ⚠️ **à valider manuellement** : il faut les droits administrateur |
 | Installateur Windows | ⚠️ **compilé** par Inno Setup (`apex-supervision-0.4.0-alpha.1-windows-x64-setup.exe`), **non exécuté**. Installation, mise à jour et désinstallation restent à valider sur Windows 10 et 11. |
@@ -337,7 +344,6 @@ Plateformes compilées : Windows x86_64 (gnu). Linux x86_64 : utilitaire et conf
 En plus des critères du §11 :
 - valider l'installateur Windows et le service sur Windows 10 et 11 (installation, mise à jour depuis une version antérieure, désinstallation avec et sans suppression des données) ;
 - valider le paquet DEB sur Debian 12, Ubuntu 22.04 et 24.04, et l'utilitaire sous X11 et Wayland. Sur Ubuntu 22.04, polkit 0.105 ignore la règle JavaScript : une authentification est demandée pour chaque action ;
-- icône de l'application et ressources de version Windows (`VERSIONINFO`) des binaires ;
 - licence du logiciel à définir (paquet marqué `LicenseRef-Proprietary`, aucune licence dans le dépôt) ;
 - l'utilitaire lance des actions élevées par PowerShell (`Start-Process -Verb RunAs`) : seul le code de sortie est connu, pas le message détaillé ;
 - tests d'intégration automatisés du serveur web (authentification, RBAC, WebSocket) et de l'utilitaire, encore manuels.

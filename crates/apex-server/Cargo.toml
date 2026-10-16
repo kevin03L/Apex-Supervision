@@ -31,6 +31,10 @@ tracing-appender.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
 
+# Icône et VERSIONINFO de l'exécutable Windows (build.rs ; rien pour Linux)
+[build-dependencies]
+apex-build.workspace = true
+
 # Paquet Debian/Ubuntu (cargo deb -p apex-server) — voir packaging/linux/
 [package.metadata.deb]
 name = "apex-supervision"
@@ -60,6 +64,8 @@ assets = [
     ["../../bibliotheque_exemple_iso10628.json", "usr/share/apex-supervision/exemples/", "644"],
     ["../../packaging/linux/polkit/50-apex-scada.rules", "usr/share/polkit-1/rules.d/", "644"],
     ["../../packaging/linux/apex-scada-admin.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/icons/apex-supervision-256.png", "usr/share/icons/hicolor/256x256/apps/apex-supervision.png", "644"],
+    ["../../packaging/icons/apex-supervision.svg", "usr/share/icons/hicolor/scalable/apps/apex-supervision.svg", "644"],
     ["../../README.md", "usr/share/doc/apex-supervision/README.md", "644"],
     ["../../docs/INSTALLATION.md", "usr/share/doc/apex-supervision/INSTALLATION.md", "644"],
     ["../../docs/ADMINISTRATION.md", "usr/share/doc/apex-supervision/ADMINISTRATION.md", "644"],

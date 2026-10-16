@@ -34,6 +34,15 @@ UTILISATION :
   --version           Affiche la version
 ";
 
+/// Icône du produit (PNG 256 px produit par `packaging/icons/generer-icones.ps1`), embarquée
+/// dans l'exécutable : la fenêtre a son icône sur toutes les plateformes, sans fichier externe.
+const ICONE_PNG: &[u8] = include_bytes!("../../../packaging/icons/apex-supervision-256.png");
+
+/// Icône de la fenêtre, décodée au démarrage (décodeur PNG déjà fourni par eframe).
+fn icone_fenetre() -> Option<egui::IconData> {
+    eframe::icon_data::from_png_bytes(ICONE_PNG).ok()
+}
+
 fn parse_args() -> Result<Option<app::Args>, String> {
     let mut args = app::Args::default();
     let mut it = std::env::args().skip(1);
@@ -72,12 +81,17 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(format!("{} — Administration", version::PRODUCT_NAME))
+        .with_inner_size([1000.0, 700.0])
+        .with_min_inner_size([780.0, 520.0])
+        .with_app_id("apex-scada-admin");
+    // Icône illisible (impossible en pratique, vérifié par un test) : icône par défaut d'eframe
+    if let Some(icone) = icone_fenetre() {
+        viewport = viewport.with_icon(icone);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(format!("{} — Administration", version::PRODUCT_NAME))
-            .with_inner_size([1000.0, 700.0])
-            .with_min_inner_size([780.0, 520.0])
-            .with_app_id("apex-scada-admin"),
+        viewport,
         ..Default::default()
     };
     let result = eframe::run_native(
@@ -99,5 +113,15 @@ fn main() {
             &message,
         );
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn icone_fenetre_decodable() {
+        let icone = super::icone_fenetre().expect("PNG de l'icône illisible");
+        assert_eq!((icone.width, icone.height), (256, 256));
+        assert_eq!(icone.rgba.len(), 256 * 256 * 4);
     }
 }
