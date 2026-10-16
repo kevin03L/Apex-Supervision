@@ -67,6 +67,9 @@ mod tests {
     #[test]
     fn newer_format_is_rejected() {
         let v: toml::Value = toml::from_str("config_version = 99\n").unwrap();
-        assert!(matches!(migrate(v), Err(ConfigError::TooNew { found: 99, .. })));
+        assert!(matches!(
+            migrate(v),
+            Err(ConfigError::TooNew { found: 99, .. })
+        ));
     }
 }

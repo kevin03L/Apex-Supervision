@@ -259,12 +259,15 @@ pub fn service_action(action: &str) -> Result<String, String> {
         Ok(action_done(action))
     } else {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        Err(if err.contains("Interactive authentication required") || err.contains("Access denied") {
-            "action refusée : ajoutez votre compte au groupe apex-scada (sudo usermod -aG apex-scada $USER), puis reconnectez-vous"
+        Err(
+            if err.contains("Interactive authentication required") || err.contains("Access denied")
+            {
+                "action refusée : ajoutez votre compte au groupe apex-scada (sudo usermod -aG apex-scada $USER), puis reconnectez-vous"
                 .into()
-        } else {
-            format!("systemctl {action} a échoué : {err}")
-        })
+            } else {
+                format!("systemctl {action} a échoué : {err}")
+            },
+        )
     }
 }
 
@@ -321,7 +324,11 @@ pub fn start_manual(config_file: &Path) -> Result<String, String> {
             return Err(format!(
                 "le moteur s'est arrêté au démarrage (code {code} : {}){}",
                 exit::describe(code),
-                if detail.is_empty() { String::new() } else { format!("\n{detail}") }
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{detail}")
+                }
             ));
         }
         std::thread::sleep(Duration::from_millis(150));
@@ -386,15 +393,22 @@ pub fn run_elevated(exe: &Path, args: &[&str], wait: bool) -> Result<i32, String
     if wait {
         script.push_str("; $p.WaitForExit(); exit $p.ExitCode");
     }
-    let out = hidden(Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", &script]))
-        .output()
-        .map_err(|e| format!("PowerShell introuvable : {e}"))?;
+    let out = hidden(Command::new("powershell.exe").args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &script,
+    ]))
+    .output()
+    .map_err(|e| format!("PowerShell introuvable : {e}"))?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     if !stderr.trim().is_empty() && (stderr.contains("annul") || stderr.contains("cancel")) {
         return Err("élévation refusée : l'action n'a pas été effectuée".into());
     }
     match out.status.code() {
-        Some(code) if !stderr.trim().is_empty() && code != 0 && !wait => Err(stderr.trim().to_string()),
+        Some(code) if !stderr.trim().is_empty() && code != 0 && !wait => {
+            Err(stderr.trim().to_string())
+        }
         Some(code) => Ok(code),
         None => Err("élévation interrompue".into()),
     }
@@ -423,7 +437,9 @@ pub fn open_path(path: &Path) -> Result<(), String> {
 /// Indique si le fichier de configuration peut être écrit par l'utilisateur courant
 /// (création d'un fichier témoin dans son dossier).
 pub fn config_dir_writable(config_file: &Path) -> bool {
-    let Some(dir) = config_file.parent() else { return false };
+    let Some(dir) = config_file.parent() else {
+        return false;
+    };
     if !dir.exists() {
         // Dossier absent : on remonte au premier parent existant
         return dir
@@ -431,7 +447,12 @@ pub fn config_dir_writable(config_file: &Path) -> bool {
             .find(|d| d.exists())
             .is_some_and(probe_write);
     }
-    probe_write(dir) && (!config_file.exists() || std::fs::OpenOptions::new().append(true).open(config_file).is_ok())
+    probe_write(dir)
+        && (!config_file.exists()
+            || std::fs::OpenOptions::new()
+                .append(true)
+                .open(config_file)
+                .is_ok())
 }
 
 fn probe_write(dir: &Path) -> bool {
@@ -452,7 +473,11 @@ mod tests {
     #[test]
     fn engine_is_expected_next_to_admin() {
         let p = engine_path();
-        assert!(p.file_name().unwrap().to_string_lossy().starts_with(version::ENGINE_BIN));
+        assert!(p
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(version::ENGINE_BIN));
     }
 
     #[test]

@@ -75,7 +75,8 @@ impl From<ScadaError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = StatusCode::from_u16(self.0.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status =
+            StatusCode::from_u16(self.0.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let body = serde_json::json!({
             "error": true,
             "message": self.0.to_string(),
@@ -129,7 +130,10 @@ pub fn router(state: AppState, web_dir: &FsPath) -> Router {
         .route("/api/tags/:id/write", post(api_write_tag))
         // --- DRIVERS ---
         .route("/api/drivers", get(api_get_drivers).post(api_add_driver))
-        .route("/api/drivers/:id", delete(api_delete_driver).put(api_update_driver))
+        .route(
+            "/api/drivers/:id",
+            delete(api_delete_driver).put(api_update_driver),
+        )
         .route("/api/drivers/:id/start", post(api_start_driver))
         .route("/api/drivers/:id/stop", post(api_stop_driver))
         .route("/api/drivers/:id/restart", post(api_restart_driver))
@@ -164,7 +168,10 @@ pub fn router(state: AppState, web_dir: &FsPath) -> Router {
         .route("/api/history/:tag_id/csv", get(api_export_history_csv))
         // --- WEBSOCKET TEMPS RÉEL ---
         .route("/ws/realtime", get(ws_realtime_handler))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     Router::new()
         // Routes publiques
@@ -229,7 +236,10 @@ async fn security_headers_middleware(req: Request, next: Next) -> Response {
     let is_api = req.uri().path().starts_with("/api/");
     let mut res = next.run(req).await;
     let h = res.headers_mut();
-    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    h.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
     h.insert("x-frame-options", HeaderValue::from_static("DENY"));
     h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     if is_api {
@@ -401,7 +411,9 @@ async fn api_delete_symbol(
 // HANDLERS REST : SYSTÈME (RÉSERVÉS AU GROUPE ADMINISTRATEUR)
 // ============================================================================
 
-async fn api_get_settings(State(state): State<AppState>) -> Json<apex_core::models::SystemSettings> {
+async fn api_get_settings(
+    State(state): State<AppState>,
+) -> Json<apex_core::models::SystemSettings> {
     Json(state.core.get_settings())
 }
 
@@ -411,7 +423,9 @@ async fn api_update_settings(
     Json(req): Json<apex_core::models::SystemSettings>,
 ) -> Result<Json<apex_core::models::SystemSettings>, ApiError> {
     require_admin(&user)?;
-    Ok(Json(state.core.update_settings(&user.0.username, req).await?))
+    Ok(Json(
+        state.core.update_settings(&user.0.username, req).await?,
+    ))
 }
 
 async fn api_system_status(State(state): State<AppState>) -> Json<SystemStatus> {
@@ -476,7 +490,10 @@ async fn api_system_restart(
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<SystemStatus>, ApiError> {
     require_admin(&user)?;
-    info!("Redémarrage / Rallumage du moteur SCADA demandé par '{}'", user.0.username);
+    info!(
+        "Redémarrage / Rallumage du moteur SCADA demandé par '{}'",
+        user.0.username
+    );
     state.core.restart_all_systems(&user.0.username).await;
     Ok(Json(state.core.get_system_status()))
 }
@@ -820,7 +837,9 @@ async fn api_unshelve_alarm(
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<AlarmInstance>, ApiError> {
     require_supervisor(&user)?;
-    Ok(Json(state.core.unshelve_alarm(&alarm_id, &user.0.username)?))
+    Ok(Json(
+        state.core.unshelve_alarm(&alarm_id, &user.0.username)?,
+    ))
 }
 
 async fn api_ack_all_alarms(
@@ -912,7 +931,10 @@ async fn api_get_history(
 ) -> Result<Json<HistoryResponse>, ApiError> {
     require_supervisor(&user)?;
     let (limit, from, to) = parse_history_params(&params, 200)?;
-    let res = state.core.query_tag_history(&tag_id, limit, from, to).await?;
+    let res = state
+        .core
+        .query_tag_history(&tag_id, limit, from, to)
+        .await?;
     Ok(Json(res))
 }
 
@@ -933,7 +955,10 @@ async fn api_export_history_csv(
 ) -> Result<impl IntoResponse, ApiError> {
     require_supervisor(&user)?;
     let (limit, from, to) = parse_history_params(&params, 5000)?;
-    let hist = state.core.query_tag_history(&tag_id, limit, from, to).await?;
+    let hist = state
+        .core
+        .query_tag_history(&tag_id, limit, from, to)
+        .await?;
     let mut csv = String::from("Timestamp_UTC;Tag_ID;Value;Quality\n");
     for pt in hist.points {
         let val_str = match pt.value {
@@ -991,10 +1016,22 @@ async fn ws_realtime_handler(
 fn build_snapshot(state: &AppState, viewer: bool) -> WsServerMessage {
     WsServerMessage::InitialSnapshot {
         tags: state.core.get_all_tags(),
-        flows: if viewer { vec![] } else { state.core.get_all_flows() },
+        flows: if viewer {
+            vec![]
+        } else {
+            state.core.get_all_flows()
+        },
         alarms: state.core.get_all_alarms(),
-        drivers: if viewer { vec![] } else { state.core.get_all_drivers() },
-        schedules: if viewer { vec![] } else { state.core.get_all_schedules() },
+        drivers: if viewer {
+            vec![]
+        } else {
+            state.core.get_all_drivers()
+        },
+        schedules: if viewer {
+            vec![]
+        } else {
+            state.core.get_all_schedules()
+        },
         status: state.core.get_system_status(),
     }
 }

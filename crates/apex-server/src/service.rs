@@ -7,12 +7,7 @@
 //! accorde à ce compte l'écriture sur les seuls répertoires `data`, `logs` et `run`, et réserve
 //! `run` (jeton de contrôle local) et `data` (base) aux administrateurs et au service.
 
-use std::{
-    ffi::OsString,
-    path::PathBuf,
-    sync::OnceLock,
-    time::Duration,
-};
+use std::{ffi::OsString, path::PathBuf, sync::OnceLock, time::Duration};
 
 use apex_config::{version, Layout};
 use tokio::sync::watch;
@@ -72,24 +67,41 @@ fn run_service() -> windows_service::Result<()> {
         _ => ServiceControlHandlerResult::NotImplemented,
     };
     let status = service_control_handler::register(version::SERVICE_NAME, handler)?;
-    let set = |state: ServiceState, accept: ServiceControlAccept, exit: ServiceExitCode, wait: u64| {
-        let _ = status.set_service_status(ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
-            current_state: state,
-            controls_accepted: accept,
-            exit_code: exit,
-            checkpoint: 0,
-            wait_hint: Duration::from_secs(wait),
-            process_id: None,
-        });
-    };
-    set(ServiceState::StartPending, ServiceControlAccept::empty(), ServiceExitCode::Win32(0), 60);
+    let set =
+        |state: ServiceState, accept: ServiceControlAccept, exit: ServiceExitCode, wait: u64| {
+            let _ = status.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: state,
+                controls_accepted: accept,
+                exit_code: exit,
+                checkpoint: 0,
+                wait_hint: Duration::from_secs(wait),
+                process_id: None,
+            });
+        };
+    set(
+        ServiceState::StartPending,
+        ServiceControlAccept::empty(),
+        ServiceExitCode::Win32(0),
+        60,
+    );
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
-            crate::logging::startup_error(&Layout::system().log_dir, &format!("runtime Tokio : {e}"));
-            set(ServiceState::Stopped, ServiceControlAccept::empty(), ServiceExitCode::ServiceSpecific(1), 0);
+            crate::logging::startup_error(
+                &Layout::system().log_dir,
+                &format!("runtime Tokio : {e}"),
+            );
+            set(
+                ServiceState::Stopped,
+                ServiceControlAccept::empty(),
+                ServiceExitCode::ServiceSpecific(1),
+                0,
+            );
             return Ok(());
         }
     };
@@ -102,7 +114,12 @@ fn run_service() -> windows_service::Result<()> {
             0,
         );
     }));
-    set(ServiceState::StopPending, ServiceControlAccept::empty(), ServiceExitCode::Win32(0), 15);
+    set(
+        ServiceState::StopPending,
+        ServiceControlAccept::empty(),
+        ServiceExitCode::Win32(0),
+        15,
+    );
     drop(runtime);
 
     let exit = match result {
@@ -110,7 +127,12 @@ fn run_service() -> windows_service::Result<()> {
         // Code spécifique : visible dans le journal des événements et lu par l'utilitaire desktop
         Err(e) => ServiceExitCode::ServiceSpecific(e.code as u32),
     };
-    set(ServiceState::Stopped, ServiceControlAccept::empty(), exit, 0);
+    set(
+        ServiceState::Stopped,
+        ServiceControlAccept::empty(),
+        exit,
+        0,
+    );
     Ok(())
 }
 
@@ -134,7 +156,10 @@ pub fn manage(action: &str, config: Option<PathBuf>) -> Result<String, String> {
 
 fn manager(access: ServiceManagerAccess) -> Result<ServiceManager, String> {
     ServiceManager::local_computer(None::<&str>, access).map_err(|e| {
-        format!("accès au gestionnaire de services impossible : {}", explain(&e))
+        format!(
+            "accès au gestionnaire de services impossible : {}",
+            explain(&e)
+        )
     })
 }
 
@@ -164,7 +189,10 @@ fn install(config: Option<PathBuf>) -> Result<String, String> {
         account_password: None,
     };
     let service = mgr
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_STATUS)
+        .create_service(
+            &info,
+            ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_STATUS,
+        )
         .map_err(|e| format!("création du service impossible : {}", explain(&e)))?;
     let _ = service.set_description(DESCRIPTION);
     // Redémarrage automatique après un échec (10 s, 3 fois, compteur remis à zéro chaque jour)
@@ -173,9 +201,18 @@ fn install(config: Option<PathBuf>) -> Result<String, String> {
         reboot_msg: None,
         command: None,
         actions: Some(vec![
-            ServiceAction { action_type: ServiceActionType::Restart, delay: Duration::from_secs(10) },
-            ServiceAction { action_type: ServiceActionType::Restart, delay: Duration::from_secs(30) },
-            ServiceAction { action_type: ServiceActionType::Restart, delay: Duration::from_secs(60) },
+            ServiceAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(10),
+            },
+            ServiceAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(30),
+            },
+            ServiceAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(60),
+            },
         ]),
     });
     let _ = service.set_failure_actions_on_non_crash_failures(true);
@@ -192,8 +229,15 @@ pub fn prepare_directories(layout: &Layout) -> Result<(), String> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_default();
-    for dir in [&config_dir, &layout.backup_dir, &layout.data_dir, &layout.log_dir, &layout.run_dir] {
-        std::fs::create_dir_all(dir).map_err(|e| format!("création de « {} » impossible : {e}", dir.display()))?;
+    for dir in [
+        &config_dir,
+        &layout.backup_dir,
+        &layout.data_dir,
+        &layout.log_dir,
+        &layout.run_dir,
+    ] {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("création de « {} » impossible : {e}", dir.display()))?;
     }
     let grant_service = format!("{SID_LOCAL_SERVICE}:(OI)(CI)M");
     let full = |sid: &str| format!("{sid}:(OI)(CI)F");
@@ -213,7 +257,14 @@ pub fn prepare_directories(layout: &Layout) -> Result<(), String> {
         )?;
     }
     // Configuration : lecture par le service et les utilisateurs, écriture par les administrateurs
-    icacls(&config_dir, &["/grant", &format!("{SID_USERS}:(OI)(CI)RX"), &format!("{SID_LOCAL_SERVICE}:(OI)(CI)RX")])?;
+    icacls(
+        &config_dir,
+        &[
+            "/grant",
+            &format!("{SID_USERS}:(OI)(CI)RX"),
+            &format!("{SID_LOCAL_SERVICE}:(OI)(CI)RX"),
+        ],
+    )?;
     Ok(())
 }
 
@@ -242,16 +293,26 @@ fn uninstall() -> Result<String, String> {
             ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
         )
         .map_err(|e| explain(&e))?;
-    if service.query_status().map(|s| s.current_state != ServiceState::Stopped).unwrap_or(false) {
+    if service
+        .query_status()
+        .map(|s| s.current_state != ServiceState::Stopped)
+        .unwrap_or(false)
+    {
         let _ = service.stop();
         for _ in 0..30 {
             std::thread::sleep(Duration::from_millis(500));
-            if service.query_status().map(|s| s.current_state == ServiceState::Stopped).unwrap_or(true) {
+            if service
+                .query_status()
+                .map(|s| s.current_state == ServiceState::Stopped)
+                .unwrap_or(true)
+            {
                 break;
             }
         }
     }
-    service.delete().map_err(|e| format!("suppression du service impossible : {}", explain(&e)))?;
+    service
+        .delete()
+        .map_err(|e| format!("suppression du service impossible : {}", explain(&e)))?;
     Ok(format!(
         "Service « {} » supprimé. La configuration, les données et les journaux sont conservés.",
         version::SERVICE_NAME
@@ -274,7 +335,9 @@ fn stop() -> Result<String, String> {
     let service = mgr
         .open_service(version::SERVICE_NAME, ServiceAccess::STOP)
         .map_err(|e| explain(&e))?;
-    service.stop().map_err(|e| format!("arrêt impossible : {}", explain(&e)))?;
+    service
+        .stop()
+        .map_err(|e| format!("arrêt impossible : {}", explain(&e)))?;
     Ok("Arrêt du service demandé.".into())
 }
 
@@ -289,7 +352,11 @@ fn status() -> Result<String, String> {
         ServiceExitCode::Win32(c) => format!(" — code Windows {c}"),
         ServiceExitCode::ServiceSpecific(c) => format!(" — code de sortie {c}"),
     };
-    Ok(format!("Service « {} » : {:?}{exit}", version::SERVICE_NAME, st.current_state))
+    Ok(format!(
+        "Service « {} » : {:?}{exit}",
+        version::SERVICE_NAME,
+        st.current_state
+    ))
 }
 
 /// Traduit les erreurs du gestionnaire de services en message exploitable.
@@ -300,9 +367,15 @@ fn explain(e: &windows_service::Error) -> String {
     match io.raw_os_error() {
         Some(5) => "accès refusé : cette action exige les droits administrateur".into(),
         Some(1056) => "le service est déjà démarré".into(),
-        Some(1060) => format!("le service « {} » n'est pas installé", version::SERVICE_NAME),
+        Some(1060) => format!(
+            "le service « {} » n'est pas installé",
+            version::SERVICE_NAME
+        ),
         Some(1062) => "le service n'est pas démarré".into(),
-        Some(1072) => "le service est marqué pour suppression : fermez la console Services puis réessayez".into(),
+        Some(1072) => {
+            "le service est marqué pour suppression : fermez la console Services puis réessayez"
+                .into()
+        }
         Some(1073) => format!("le service « {} » existe déjà", version::SERVICE_NAME),
         _ => io.to_string(),
     }
@@ -324,7 +397,9 @@ fn restart() -> Result<String, String> {
             .unwrap_or(false)
     };
     if !is_stopped() {
-        service.stop().map_err(|e| format!("arrêt impossible : {}", explain(&e)))?;
+        service
+            .stop()
+            .map_err(|e| format!("arrêt impossible : {}", explain(&e)))?;
         // L'arrêt propre (drivers, historique) prend quelques secondes
         let mut stopped = false;
         for _ in 0..60 {
@@ -366,7 +441,10 @@ fn set_start_type(automatic: bool) -> Result<String, String> {
     } else {
         Err(match out.status.code() {
             Some(5) => "accès refusé : cette action exige les droits administrateur".into(),
-            Some(1060) => format!("le service « {} » n'est pas installé", version::SERVICE_NAME),
+            Some(1060) => format!(
+                "le service « {} » n'est pas installé",
+                version::SERVICE_NAME
+            ),
             _ => format!(
                 "modification du démarrage impossible : {}",
                 String::from_utf8_lossy(&out.stdout).trim()

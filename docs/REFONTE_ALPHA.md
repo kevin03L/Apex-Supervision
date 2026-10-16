@@ -311,7 +311,7 @@ La version est définie **une seule fois** (`[workspace.package] version`) et pr
 | `cargo clippy --workspace --all-targets` (Windows) | ✅ aucun avertissement |
 | `clippy -D warnings` de `apex-admin` et `apex-config` pour `x86_64-unknown-linux-gnu` | ✅ compilation croisée sans avertissement |
 | Compilation Linux du moteur (`apex-core`, `apex-server`) | ⚠️ **non exécutée** : compilateur C Linux absent. Elle sera faite par la CI au premier push. |
-| `cargo fmt --check` | ❌ code historique jamais formaté : à appliquer dans un commit dédié |
+| `cargo fmt --check` | ✅ appliqué à tout le workspace (commit dédié) |
 | Moteur en mode portable (Windows) : démarrage, `/api/health`, 2ᵉ instance (code 4, PID affiché), port occupé (code 5), configuration invalide (code 3), arrêt propre par jeton, `config migrate` v0 → v1, `migrate-legacy` sur une copie de la base 1.x (source inchangée, empreinte SHA-256 identique) | ✅ exécuté |
 | Utilitaire desktop piloté par UI Automation : assistant complet, enregistrement, démarrage du moteur, tableau de bord, configuration, diagnostics, arrêt avec confirmation, erreur de port | ✅ exécuté |
 | Utilitaire : onglets Journaux, Sauvegardes, À propos | ⚠️ compilés, non vérifiés visuellement |
@@ -337,7 +337,6 @@ Plateformes compilées : Windows x86_64 (gnu). Linux x86_64 : utilitaire et conf
 En plus des critères du §11 :
 - valider l'installateur Windows et le service sur Windows 10 et 11 (installation, mise à jour depuis une version antérieure, désinstallation avec et sans suppression des données) ;
 - valider le paquet DEB sur Debian 12, Ubuntu 22.04 et 24.04, et l'utilitaire sous X11 et Wayland. Sur Ubuntu 22.04, polkit 0.105 ignore la règle JavaScript : une authentification est demandée pour chaque action ;
-- appliquer `cargo fmt` (commit dédié) pour que l'étape « Formatage » de la CI passe ;
 - icône de l'application et ressources de version Windows (`VERSIONINFO`) des binaires ;
 - licence du logiciel à définir (paquet marqué `LicenseRef-Proprietary`, aucune licence dans le dépôt) ;
 - l'utilitaire lance des actions élevées par PowerShell (`Start-Process -Verb RunAs`) : seul le code de sortie est connu, pas le message détaillé ;

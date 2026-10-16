@@ -65,11 +65,16 @@ pub fn health(cfg: &AppConfig) -> Result<Health, String> {
     if status != 200 {
         return Err(format!("réponse HTTP {status} inattendue de {addr}"));
     }
-    let v: serde_json::Value =
-        serde_json::from_str(&body).map_err(|_| format!("réponse illisible de {addr} : est-ce bien Apex Supervision ?"))?;
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|_| format!("réponse illisible de {addr} : est-ce bien Apex Supervision ?"))?;
     let u = |k: &str| v.get(k).and_then(|x| x.as_u64());
     let runtime = v.get("runtime").filter(|r| r.is_object()).map(|r| {
-        let s = |k: &str| r.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+        let s = |k: &str| {
+            r.get(k)
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
         let b = |k: &str| r.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
         Runtime {
             config_fingerprint: s("config_fingerprint"),
@@ -82,12 +87,19 @@ pub fn health(cfg: &AppConfig) -> Result<Health, String> {
         }
     });
     Ok(Health {
-        version: v.get("version").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
+        version: v
+            .get("version")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?")
+            .to_string(),
         uptime_seconds: u("uptime_seconds").unwrap_or(0),
         running_drivers: u("running_drivers").unwrap_or(0),
         total_drivers: u("total_drivers"),
         active_alarms: u("active_alarms"),
-        acquisition_paused: v.get("acquisition_paused").and_then(|x| x.as_bool()).unwrap_or(false),
+        acquisition_paused: v
+            .get("acquisition_paused")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
         runtime,
     })
 }
@@ -112,10 +124,18 @@ pub fn request_shutdown(layout: &Layout, cfg: &AppConfig) -> Result<(), String> 
             "le moteur écoute sur {addr} et non en boucle locale : l'arrêt par jeton local est impossible"
         ));
     }
-    let (status, body) = request(addr, "POST", "/api/system/shutdown", Some(token.trim()), Duration::from_secs(5))?;
+    let (status, body) = request(
+        addr,
+        "POST",
+        "/api/system/shutdown",
+        Some(token.trim()),
+        Duration::from_secs(5),
+    )?;
     match status {
         200 => Ok(()),
-        401 | 403 => Err("jeton de contrôle refusé : il ne correspond pas au moteur en marche".into()),
+        401 | 403 => {
+            Err("jeton de contrôle refusé : il ne correspond pas au moteur en marche".into())
+        }
         _ => Err(format!("arrêt refusé (HTTP {status}) : {}", body.trim())),
     }
 }
@@ -132,7 +152,9 @@ fn request(
         std::io::ErrorKind::ConnectionRefused => format!("aucun serveur n'écoute sur {addr}"),
         // Sous Windows, un port local fermé n'est signalé qu'après plusieurs tentatives :
         // le délai expire avant le refus.
-        std::io::ErrorKind::TimedOut if addr.ip().is_loopback() => format!("aucun serveur n'écoute sur {addr}"),
+        std::io::ErrorKind::TimedOut if addr.ip().is_loopback() => {
+            format!("aucun serveur n'écoute sur {addr}")
+        }
         std::io::ErrorKind::TimedOut => format!("{addr} ne répond pas (délai dépassé)"),
         _ => format!("connexion à {addr} impossible : {e}"),
     })?;
@@ -161,12 +183,22 @@ fn parse_response(raw: &[u8]) -> Option<(u16, String)> {
     let split = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
     let head = std::str::from_utf8(&raw[..split]).ok()?;
     let body = &raw[split + 4..];
-    let status = head.lines().next()?.split_whitespace().nth(1)?.parse().ok()?;
+    let status = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
     let chunked = head.lines().any(|l| {
         let l = l.to_ascii_lowercase();
         l.starts_with("transfer-encoding:") && l.contains("chunked")
     });
-    let body = if chunked { dechunk(body)? } else { body.to_vec() };
+    let body = if chunked {
+        dechunk(body)?
+    } else {
+        body.to_vec()
+    };
     Some((status, String::from_utf8_lossy(&body).into_owned()))
 }
 
@@ -213,9 +245,16 @@ mod tests {
     fn unreachable_server_gives_readable_error() {
         let mut cfg = AppConfig::default();
         // Port réservé puis libéré : personne n'y écoute
-        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let free = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         cfg.server.port = free;
         let err = health(&cfg).unwrap_err();
-        assert!(err.contains("aucun serveur") || err.contains("impossible"), "{err}");
+        assert!(
+            err.contains("aucun serveur") || err.contains("impossible"),
+            "{err}"
+        );
     }
 }

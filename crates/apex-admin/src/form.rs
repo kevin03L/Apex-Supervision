@@ -31,7 +31,8 @@ pub fn info_color(ui: &egui::Ui) -> Color32 {
 pub fn dot(ui: &mut egui::Ui, color: Color32) {
     let size = ui.text_style_height(&egui::TextStyle::Body);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), size * 0.32, color);
+    ui.painter()
+        .circle_filled(rect.center(), size * 0.32, color);
 }
 
 /// Texte d'aide discret sous un champ (retour à la ligne automatique).
@@ -48,12 +49,18 @@ pub fn wrapped(ui: &mut egui::Ui, text: impl Into<RichText>) {
 pub fn truncated(ui: &mut egui::Ui, text: impl Into<RichText>) {
     let text: RichText = text.into();
     let full = text.text().to_string();
-    ui.add(egui::Label::new(text).truncate()).on_hover_text(full);
+    ui.add(egui::Label::new(text).truncate())
+        .on_hover_text(full);
 }
 
 /// Problèmes de validation dont le champ commence par `prefix`.
-pub fn issues_for<'a>(issues: &'a [Issue], prefix: &'a str) -> impl Iterator<Item = &'a Issue> + 'a {
-    issues.iter().filter(move |i| i.field == prefix || i.field.starts_with(&format!("{prefix}.")))
+pub fn issues_for<'a>(
+    issues: &'a [Issue],
+    prefix: &'a str,
+) -> impl Iterator<Item = &'a Issue> + 'a {
+    issues
+        .iter()
+        .filter(move |i| i.field == prefix || i.field.starts_with(&format!("{prefix}.")))
 }
 
 pub fn has_errors_for(issues: &[Issue], prefixes: &[&str]) -> bool {
@@ -69,7 +76,10 @@ pub fn show_issues(ui: &mut egui::Ui, issues: &[Issue], field: &str) {
             Severity::Error => (error_color(ui), "Erreur : "),
             Severity::Warning => (warn_color(ui), "Attention : "),
         };
-        wrapped(ui, RichText::new(format!("{prefix}{}", i.message)).color(color));
+        wrapped(
+            ui,
+            RichText::new(format!("{prefix}{}", i.message)).color(color),
+        );
     }
 }
 
@@ -106,7 +116,10 @@ pub fn bind_editor(ui: &mut egui::Ui, bind: &mut String) {
     let mode = bind_mode_of(bind);
     ui.vertical(|ui| {
         if ui
-            .radio(mode == BindMode::Local, "Ce poste uniquement (127.0.0.1) — recommandé")
+            .radio(
+                mode == BindMode::Local,
+                "Ce poste uniquement (127.0.0.1) — recommandé",
+            )
             .clicked()
         {
             *bind = "127.0.0.1".into();
@@ -118,7 +131,11 @@ pub fn bind_editor(ui: &mut egui::Ui, bind: &mut String) {
             *bind = "0.0.0.0".into();
         }
         ui.horizontal(|ui| {
-            if ui.radio(mode == BindMode::Specific, "Adresse précise :").clicked() && mode != BindMode::Specific {
+            if ui
+                .radio(mode == BindMode::Specific, "Adresse précise :")
+                .clicked()
+                && mode != BindMode::Specific
+            {
                 bind.clear();
             }
             ui.add_enabled(
@@ -141,8 +158,12 @@ pub fn port_available(bind: &str, port: u16) -> Result<(), String> {
         .map(|_| ())
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::AddrInUse => format!("le port {port} est déjà utilisé sur {ip}"),
-            std::io::ErrorKind::AddrNotAvailable => format!("l'adresse {ip} n'appartient pas à ce poste"),
-            std::io::ErrorKind::PermissionDenied => format!("ouverture du port {port} refusée par le système"),
+            std::io::ErrorKind::AddrNotAvailable => {
+                format!("l'adresse {ip} n'appartient pas à ce poste")
+            }
+            std::io::ErrorKind::PermissionDenied => {
+                format!("ouverture du port {port} refusée par le système")
+            }
             _ => format!("port {port} indisponible sur {ip} : {e}"),
         })
 }
@@ -157,10 +178,17 @@ pub fn path_field(ui: &mut egui::Ui, value: &mut String, default: &std::path::Pa
 }
 
 /// Emplacements par défaut (sans les personnalisations) pour les indications.
-pub fn default_locations(layout: &Layout, cfg: &AppConfig) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+pub fn default_locations(
+    layout: &Layout,
+    cfg: &AppConfig,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let mut plain = cfg.clone();
     plain.paths = Default::default();
-    (layout.data_dir.clone(), layout.log_dir.clone(), layout.web_dir(&plain))
+    (
+        layout.data_dir.clone(),
+        layout.log_dir.clone(),
+        layout.web_dir(&plain),
+    )
 }
 
 /// Libellé du niveau de journalisation.
@@ -191,7 +219,9 @@ mod tests {
     fn port_check_detects_busy_port() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
-        assert!(port_available("127.0.0.1", port).unwrap_err().contains("déjà utilisé"));
+        assert!(port_available("127.0.0.1", port)
+            .unwrap_err()
+            .contains("déjà utilisé"));
         drop(l);
         assert!(port_available("127.0.0.1", port).is_ok());
         assert!(port_available("pas-une-ip", port).is_err());

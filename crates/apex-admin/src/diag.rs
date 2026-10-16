@@ -94,7 +94,9 @@ pub fn run(layout: &Layout, service: Option<&ServiceInfo>) -> Vec<Check> {
             }
             loaded.config
         }
-        Err(apex_config::ConfigError::Read { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+        Err(apex_config::ConfigError::Read { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
             out.push(check(
                 Level::Warning,
                 "Configuration",
@@ -121,7 +123,11 @@ pub fn run(layout: &Layout, service: Option<&ServiceInfo>) -> Vec<Check> {
             out.push(check(
                 Level::Ok,
                 "Serveur web",
-                format!("En ligne sur {} (version {}).", probe::web_url(&cfg), h.version),
+                format!(
+                    "En ligne sur {} (version {}).",
+                    probe::web_url(&cfg),
+                    h.version
+                ),
             ));
             if h.version != version::VERSION {
                 out.push(check(
@@ -137,7 +143,11 @@ pub fn run(layout: &Layout, service: Option<&ServiceInfo>) -> Vec<Check> {
             Some(h)
         }
         Err(e) => {
-            out.push(check(Level::Info, "Serveur web", format!("Injoignable : {e}.")));
+            out.push(check(
+                Level::Info,
+                "Serveur web",
+                format!("Injoignable : {e}."),
+            ));
             None
         }
     };
@@ -182,7 +192,11 @@ pub fn run(layout: &Layout, service: Option<&ServiceInfo>) -> Vec<Check> {
                 "Le fichier a été modifié depuis le démarrage du moteur : redémarrez-le pour appliquer les changements.",
             ));
         } else {
-            out.push(check(Level::Ok, "Configuration appliquée", "Le moteur utilise la configuration du fichier."));
+            out.push(check(
+                Level::Ok,
+                "Configuration appliquée",
+                "Le moteur utilise la configuration du fichier.",
+            ));
         }
         if rt.safe_mode {
             out.push(check(
@@ -211,7 +225,11 @@ pub fn run(layout: &Layout, service: Option<&ServiceInfo>) -> Vec<Check> {
     // 5. IHM web
     let web_dir = layout.web_dir(&cfg);
     if web_dir.join("index.html").is_file() {
-        out.push(check(Level::Ok, "IHM web", format!("Fichiers présents dans « {} ».", web_dir.display())));
+        out.push(check(
+            Level::Ok,
+            "IHM web",
+            format!("Fichiers présents dans « {} ».", web_dir.display()),
+        ));
     } else {
         out.push(check(
             Level::Error,
@@ -261,8 +279,15 @@ pub fn run(layout: &Layout, service: Option<&ServiceInfo>) -> Vec<Check> {
     match logs::list(&layout.log_dir) {
         Ok(files) => {
             let problems = logs::recent_problems(&layout.log_dir, 1000);
-            let errors = problems.iter().filter(|l| l.contains(" ERROR ") || l.contains(" ERREUR ")).count();
-            let level = if errors > 0 { Level::Warning } else { Level::Ok };
+            let errors = problems
+                .iter()
+                .filter(|l| l.contains(" ERROR ") || l.contains(" ERREUR "))
+                .count();
+            let level = if errors > 0 {
+                Level::Warning
+            } else {
+                Level::Ok
+            };
             out.push(check(
                 level,
                 "Journaux",
@@ -383,14 +408,28 @@ mod tests {
         let layout = Layout::portable(&base);
         let checks = run(&layout, None);
         let cfg = checks.iter().find(|c| c.title == "Configuration").unwrap();
-        assert_eq!(cfg.level, Level::Warning, "fichier absent signalé : {cfg:?}");
+        assert_eq!(
+            cfg.level,
+            Level::Warning,
+            "fichier absent signalé : {cfg:?}"
+        );
         assert!(checks.iter().any(|c| c.title == "Serveur web"));
-        assert!(checks.iter().any(|c| c.title == "Base de données" && c.detail.contains("sera créée")));
+        assert!(checks
+            .iter()
+            .any(|c| c.title == "Base de données" && c.detail.contains("sera créée")));
 
         std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(&layout.config_file, "config_version = 1\n[server]\nport = 0\n").unwrap();
+        std::fs::write(
+            &layout.config_file,
+            "config_version = 1\n[server]\nport = 0\n",
+        )
+        .unwrap();
         let checks = run(&layout, None);
-        assert_eq!(checks[0].level, Level::Error, "les erreurs passent en tête : {checks:?}");
+        assert_eq!(
+            checks[0].level,
+            Level::Error,
+            "les erreurs passent en tête : {checks:?}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

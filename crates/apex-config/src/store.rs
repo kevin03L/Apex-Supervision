@@ -26,9 +26,15 @@ pub const MAX_BACKUPS: usize = 20;
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("lecture de « {path} » impossible : {source}")]
-    Read { path: PathBuf, source: std::io::Error },
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("écriture de « {path} » impossible : {source}")]
-    Write { path: PathBuf, source: std::io::Error },
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("syntaxe TOML invalide dans « {path} » : {message}")]
     Syntax { path: PathBuf, message: String },
     #[error("paramètre invalide dans « {path} » : {message}")]
@@ -92,10 +98,12 @@ fn parse(raw: &str, path: &Path) -> Result<(AppConfig, Option<u32>), ConfigError
         message: e.message().to_string(),
     })?;
     let (value, migrated_from) = crate::migrate::migrate(value)?;
-    let config: AppConfig = value.try_into().map_err(|e: toml::de::Error| ConfigError::Schema {
-        path: path.to_path_buf(),
-        message: e.message().to_string(),
-    })?;
+    let config: AppConfig = value
+        .try_into()
+        .map_err(|e: toml::de::Error| ConfigError::Schema {
+            path: path.to_path_buf(),
+            message: e.message().to_string(),
+        })?;
     Ok((config, migrated_from))
 }
 
@@ -161,7 +169,9 @@ pub fn save(
     let content = render(config);
     let tmp = dir.join(format!(
         ".{}.tmp-{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("config"),
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("config"),
         std::process::id()
     ));
     let write_tmp = || -> std::io::Result<()> {
@@ -369,7 +379,10 @@ mod tests {
         // Écriture basée sur une lecture périmée → conflit, fichier inchangé
         let mut cfg3 = cfg.clone();
         cfg3.server.port = 3200;
-        assert!(matches!(save(&layout, &cfg3, Some(first.file_hash)), Err(ConfigError::Conflict)));
+        assert!(matches!(
+            save(&layout, &cfg3, Some(first.file_hash)),
+            Err(ConfigError::Conflict)
+        ));
         assert_eq!(load(&layout.config_file).unwrap().config.server.port, 3100);
         let _ = fs::remove_dir_all(layout.config_file.parent().unwrap());
     }
@@ -379,7 +392,10 @@ mod tests {
         let layout = temp_layout("invalid");
         let mut cfg = AppConfig::default();
         cfg.server.bind = "pas-une-ip".into();
-        assert!(matches!(save(&layout, &cfg, None), Err(ConfigError::Invalid(_))));
+        assert!(matches!(
+            save(&layout, &cfg, None),
+            Err(ConfigError::Invalid(_))
+        ));
         assert!(!layout.config_file.exists());
     }
 
@@ -393,8 +409,15 @@ mod tests {
         let backups = list_backups(&layout.backup_dir);
         assert_eq!(backups.len(), 1);
         restore_backup(&layout, &backups[0], Some(b.file_hash)).unwrap();
-        assert_eq!(load(&layout.config_file).unwrap().config.instance.name, "Apex Supervision");
-        assert_eq!(list_backups(&layout.backup_dir).len(), 2, "la version remplacée est sauvegardée");
+        assert_eq!(
+            load(&layout.config_file).unwrap().config.instance.name,
+            "Apex Supervision"
+        );
+        assert_eq!(
+            list_backups(&layout.backup_dir).len(),
+            2,
+            "la version remplacée est sauvegardée"
+        );
         let _ = fs::remove_dir_all(layout.config_file.parent().unwrap());
     }
 
@@ -402,9 +425,17 @@ mod tests {
     fn concurrent_writer_gets_locked_error() {
         let layout = temp_layout("lock");
         fs::create_dir_all(layout.config_file.parent().unwrap()).unwrap();
-        let holder = OpenOptions::new().create(true).truncate(false).write(true).open(layout.config_lock_file()).unwrap();
+        let holder = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(layout.config_lock_file())
+            .unwrap();
         holder.lock().unwrap();
-        assert!(matches!(save(&layout, &AppConfig::default(), None), Err(ConfigError::Locked)));
+        assert!(matches!(
+            save(&layout, &AppConfig::default(), None),
+            Err(ConfigError::Locked)
+        ));
         drop(holder);
         assert!(save(&layout, &AppConfig::default(), None).is_ok());
         let _ = fs::remove_dir_all(layout.config_file.parent().unwrap());
@@ -414,15 +445,33 @@ mod tests {
     fn readable_errors_for_bad_files() {
         let layout = temp_layout("bad");
         fs::create_dir_all(layout.config_file.parent().unwrap()).unwrap();
-        fs::write(&layout.config_file, "config_version = 1\n[server]\nport = \"trois mille\"\n").unwrap();
+        fs::write(
+            &layout.config_file,
+            "config_version = 1\n[server]\nport = \"trois mille\"\n",
+        )
+        .unwrap();
         let err = load(&layout.config_file).unwrap_err().to_string();
         assert!(err.contains("paramètre invalide"), "{err}");
-        fs::write(&layout.config_file, "config_version = 1\n[serveur]\nport = 3000\n").unwrap();
+        fs::write(
+            &layout.config_file,
+            "config_version = 1\n[serveur]\nport = 3000\n",
+        )
+        .unwrap();
         let err = load(&layout.config_file).unwrap_err().to_string();
-        assert!(err.contains("serveur"), "une section inconnue est signalée : {err}");
-        fs::write(&layout.config_file, "config_version = 1\n[server]\nbind = \"0.0.0.0\"\n").unwrap();
+        assert!(
+            err.contains("serveur"),
+            "une section inconnue est signalée : {err}"
+        );
+        fs::write(
+            &layout.config_file,
+            "config_version = 1\n[server]\nbind = \"0.0.0.0\"\n",
+        )
+        .unwrap();
         let loaded = load(&layout.config_file).unwrap();
-        assert!(loaded.issues.iter().any(|i| i.severity == Severity::Warning));
+        assert!(loaded
+            .issues
+            .iter()
+            .any(|i| i.severity == Severity::Warning));
         let _ = fs::remove_dir_all(layout.config_file.parent().unwrap());
     }
 }

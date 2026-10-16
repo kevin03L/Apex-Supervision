@@ -15,7 +15,12 @@ pub const LEGACY_DB_FILE: &str = "rust_scada_flow.db";
 /// Applique les anciennes variables d'environnement. Renvoie la liste des surcharges appliquées.
 pub fn apply_env_overrides(cfg: &mut AppConfig) -> Vec<String> {
     let mut applied = Vec::new();
-    let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let var = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
 
     if let Some(v) = var("SCADA_BIND") {
         cfg.server.bind = v.clone();
@@ -90,7 +95,9 @@ pub async fn migrate_database(
     force: bool,
 ) -> Result<MigrationReport, String> {
     let destination = layout.database_file(cfg);
-    if std::fs::canonicalize(source).ok() == std::fs::canonicalize(&destination).ok() && destination.exists() {
+    if std::fs::canonicalize(source).ok() == std::fs::canonicalize(&destination).ok()
+        && destination.exists()
+    {
         return Err("la source et la destination sont le même fichier".into());
     }
 
@@ -113,7 +120,8 @@ pub async fn migrate_database(
         previous_destination_backup = Some(backup);
     }
     if let Some(dir) = destination.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("création de « {} » impossible : {e}", dir.display()))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("création de « {} » impossible : {e}", dir.display()))?;
     }
 
     let mut conn = SqliteConnectOptions::new()
@@ -129,7 +137,15 @@ pub async fn migrate_database(
         .map_err(|e| format!("copie de la base impossible : {e}"))?;
 
     let mut counts = Vec::new();
-    for table in ["tags_catalog", "drivers_config", "dashboards", "flows", "schedules", "users_accounts", "tag_history"] {
+    for table in [
+        "tags_catalog",
+        "drivers_config",
+        "dashboards",
+        "flows",
+        "schedules",
+        "users_accounts",
+        "tag_history",
+    ] {
         if let Ok(row) = sqlx::query(&format!("SELECT COUNT(*) AS n FROM {table}"))
             .fetch_one(&mut conn)
             .await

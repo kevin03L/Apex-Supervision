@@ -16,7 +16,9 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use apex_config::{has_errors, store, AppConfig, Layout, LayoutKind, Severity};
 use apex_core::{
-    drivers::{build_local_modbus_plc_config, modbus_slave::spawn_embedded_modbus_plc, GtbSimulatorDriver},
+    drivers::{
+        build_local_modbus_plc_config, modbus_slave::spawn_embedded_modbus_plc, GtbSimulatorDriver,
+    },
     EngineOptions, ScadaCore,
 };
 use tokio::sync::watch;
@@ -146,7 +148,11 @@ pub async fn run(
     info!(
         "Configuration : {}{}",
         layout.config_file.display(),
-        if eff.file_exists { "" } else { " (absente : valeurs par défaut)" }
+        if eff.file_exists {
+            ""
+        } else {
+            " (absente : valeurs par défaut)"
+        }
     );
     if let Some(v) = eff.migrated_from {
         warn!(
@@ -160,7 +166,11 @@ pub async fn run(
     for i in issues.iter().filter(|i| i.severity == Severity::Warning) {
         warn!("Configuration : {i}");
     }
-    info!("Données : {} · Journaux : {}", layout.data_dir.display(), layout.log_dir.display());
+    info!(
+        "Données : {} · Journaux : {}",
+        layout.data_dir.display(),
+        layout.log_dir.display()
+    );
 
     // 3. Instance unique
     let _instance = InstanceLock::acquire(&layout.lock_file()).map_err(|e| {
@@ -174,7 +184,10 @@ pub async fn run(
 
     // 4. Port web (réservé avant de démarrer les drivers)
     let ip: std::net::IpAddr = cfg.server.bind.trim().parse().map_err(|_| {
-        StartupError::new(exit::CONFIG, format!("adresse d'écoute invalide « {} »", cfg.server.bind))
+        StartupError::new(
+            exit::CONFIG,
+            format!("adresse d'écoute invalide « {} »", cfg.server.bind),
+        )
     })?;
     let addr = SocketAddr::new(ip, cfg.server.port);
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
@@ -189,12 +202,19 @@ pub async fn run(
     // 5. Base de données
     let db_file = layout.database_file(cfg);
     let pool = crate::db::open(Some(&db_file)).await.map_err(|e| {
-        let message = format!("base de données « {} » inaccessible : {e}", db_file.display());
+        let message = format!(
+            "base de données « {} » inaccessible : {e}",
+            db_file.display()
+        );
         error!("{message}");
         StartupError::new(exit::DATABASE, message)
     })?;
     info!("Base SQLite : {} (mode WAL)", db_file.display());
-    if !db_file.exists() || std::fs::metadata(&db_file).map(|m| m.len() < 8192).unwrap_or(false) {
+    if !db_file.exists()
+        || std::fs::metadata(&db_file)
+            .map(|m| m.len() < 8192)
+            .unwrap_or(false)
+    {
         hint_legacy_database(layout);
     }
 
@@ -232,7 +252,10 @@ pub async fn run(
     // 7. Jeton de contrôle local, puis service HTTP
     let token_file = layout.control_token_file();
     if let Err(e) = write_control_token(&token_file, &core.local_control_token) {
-        warn!("Écriture du jeton de contrôle local « {} » impossible : {e}", token_file.display());
+        warn!(
+            "Écriture du jeton de contrôle local « {} » impossible : {e}",
+            token_file.display()
+        );
     }
 
     let web_dir = layout.web_dir(cfg);
@@ -266,7 +289,11 @@ pub async fn run(
         "SERVEUR",
         "STARTUP",
         &cfg.instance.name,
-        &format!("Démarrage ({}, mode {})", apex_config::version::VERSION, mode.as_str()),
+        &format!(
+            "Démarrage ({}, mode {})",
+            apex_config::version::VERSION,
+            mode.as_str()
+        ),
     );
     info!("IHM web : http://{}:{}", display_host(ip), cfg.server.port);
     if !ip.is_loopback() {
@@ -278,17 +305,20 @@ pub async fn run(
     // sans quoi l'arrêt propre attendrait indéfiniment la fermeture des connexions.
     on_ready();
     let shutdown = Arc::clone(&core.shutdown_notify);
-    let served = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = shutdown.notified() => info!("Arrêt demandé depuis l'IHM ou l'API"),
-                _ = wait_os_signal() => info!("Signal d'arrêt du système reçu"),
-                _ = stop.wait_for(|s| *s) => info!("Arrêt demandé par le gestionnaire de services"),
-            }
-            shutdown.notify_waiters();
-            info!("Arrêt propre en cours : fermeture du serveur web...");
-        })
-        .await;
+    let served = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        tokio::select! {
+            _ = shutdown.notified() => info!("Arrêt demandé depuis l'IHM ou l'API"),
+            _ = wait_os_signal() => info!("Signal d'arrêt du système reçu"),
+            _ = stop.wait_for(|s| *s) => info!("Arrêt demandé par le gestionnaire de services"),
+        }
+        shutdown.notify_waiters();
+        info!("Arrêt propre en cours : fermeture du serveur web...");
+    })
+    .await;
 
     // Arrêt propre
     core.shutdown();

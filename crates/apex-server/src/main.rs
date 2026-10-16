@@ -33,7 +33,9 @@ fn main() {
         Command::ConfigShow => config_show(cli.config.as_deref()),
         Command::ConfigInit(opts) => config_init(cli.config.as_deref(), opts),
         Command::ConfigMigrate => config_migrate(cli.config.as_deref()),
-        Command::MigrateLegacy { from, force } => migrate_legacy(cli.config.as_deref(), &from, force),
+        Command::MigrateLegacy { from, force } => {
+            migrate_legacy(cli.config.as_deref(), &from, force)
+        }
         Command::Service(action) => manage_service(&action, cli.config.as_deref()),
         Command::Version => {
             println!("{} {}", version::PRODUCT_NAME, version::full_version());
@@ -63,7 +65,12 @@ fn run_foreground(config: Option<&Path>) -> i32 {
         app::RunMode::Manual
     };
     let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    match runtime().block_on(app::run(config.map(Path::to_path_buf), mode, stop_rx, || {})) {
+    match runtime().block_on(app::run(
+        config.map(Path::to_path_buf),
+        mode,
+        stop_rx,
+        || {},
+    )) {
         Ok(()) => exit::OK,
         Err(e) => {
             eprintln!("Démarrage impossible : {}", e.message);
@@ -80,9 +87,20 @@ fn config_check(config: Option<&Path>) -> i32 {
             return e.code;
         }
     };
-    println!("Fichier : {}{}", eff.layout.config_file.display(), if eff.file_exists { "" } else { " (absent : valeurs par défaut)" });
+    println!(
+        "Fichier : {}{}",
+        eff.layout.config_file.display(),
+        if eff.file_exists {
+            ""
+        } else {
+            " (absent : valeurs par défaut)"
+        }
+    );
     if let Some(v) = eff.migrated_from {
-        println!("Format v{v} : sera migré vers v{} à l'enregistrement.", apex_config::CONFIG_VERSION);
+        println!(
+            "Format v{v} : sera migré vers v{} à l'enregistrement.",
+            apex_config::CONFIG_VERSION
+        );
     }
     for o in &eff.env_overrides {
         println!("Surcharge d'environnement : {o}");
@@ -118,10 +136,20 @@ fn config_show(config: Option<&Path>) -> i32 {
     match app::load_effective(config) {
         Ok(eff) => {
             let l = &eff.layout;
-            println!("# Mode : {}", if l.kind == LayoutKind::System { "installation système" } else { "portable" });
+            println!(
+                "# Mode : {}",
+                if l.kind == LayoutKind::System {
+                    "installation système"
+                } else {
+                    "portable"
+                }
+            );
             println!("# Configuration : {}", l.config_file.display());
             println!("# Données       : {}", l.data_dir.display());
-            println!("# Base          : {}", l.database_file(&eff.config).display());
+            println!(
+                "# Base          : {}",
+                l.database_file(&eff.config).display()
+            );
             println!("# Journaux      : {}", l.log_dir.display());
             println!("# IHM web       : {}", l.web_dir(&eff.config).display());
             println!("# Sauvegardes   : {}", l.backup_dir.display());
@@ -245,9 +273,18 @@ fn migrate_legacy(config: Option<&Path>, from: &Path, force: bool) -> i32 {
             return exit::ALREADY_RUNNING;
         }
     };
-    match runtime().block_on(legacy::migrate_database(&source, &eff.layout, &eff.config, force)) {
+    match runtime().block_on(legacy::migrate_database(
+        &source,
+        &eff.layout,
+        &eff.config,
+        force,
+    )) {
         Ok(r) => {
-            println!("Base copiée : {} → {}", r.source.display(), r.destination.display());
+            println!(
+                "Base copiée : {} → {}",
+                r.source.display(),
+                r.destination.display()
+            );
             if let Some(b) = r.previous_destination_backup {
                 println!("Base précédente conservée sous : {}", b.display());
             }

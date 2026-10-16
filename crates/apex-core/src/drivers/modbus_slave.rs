@@ -342,7 +342,10 @@ mod tests {
     #[test]
     fn read_coils_bits() {
         let mut mem = PlcMemory::new();
-        assert_eq!(process_pdu(&mut mem, 0x01, &req(0, 3)), vec![0x01, 1, 0b011]);
+        assert_eq!(
+            process_pdu(&mut mem, 0x01, &req(0, 3)),
+            vec![0x01, 1, 0b011]
+        );
     }
 
     #[test]

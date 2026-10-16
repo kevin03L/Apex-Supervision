@@ -18,7 +18,13 @@ pub enum Step {
     Summary,
 }
 
-const STEPS: [Step; 5] = [Step::Welcome, Step::Network, Step::Operation, Step::Locations, Step::Summary];
+const STEPS: [Step; 5] = [
+    Step::Welcome,
+    Step::Network,
+    Step::Operation,
+    Step::Locations,
+    Step::Summary,
+];
 
 impl Step {
     fn title(self) -> &'static str {
@@ -77,7 +83,12 @@ pub struct Wizard {
 }
 
 impl Wizard {
-    pub fn new(start: AppConfig, layout: &Layout, has_service: bool, legacy_db: Option<PathBuf>) -> Self {
+    pub fn new(
+        start: AppConfig,
+        layout: &Layout,
+        has_service: bool,
+        legacy_db: Option<PathBuf>,
+    ) -> Self {
         let custom_paths = !start.paths.data_dir.is_empty() || !start.paths.log_dir.is_empty();
         Self {
             step: Step::Welcome,
@@ -146,7 +157,10 @@ impl Wizard {
                             self.step = STEPS[self.step.index() + 1];
                         }
                         if !step_ok {
-                            ui.label(RichText::new("Corrigez les erreurs pour continuer").color(form::error_color(ui)));
+                            ui.label(
+                                RichText::new("Corrigez les erreurs pour continuer")
+                                    .color(form::error_color(ui)),
+                            );
                         }
                     }
                     if self.step != Step::Welcome && ui.button("‹ Précédent").clicked() {
@@ -158,16 +172,18 @@ impl Wizard {
         });
 
         egui::CentralPanel::default_margins().show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.set_max_width(720.0);
-                match self.step {
-                    Step::Welcome => self.welcome(ui, layout, can_write),
-                    Step::Network => self.network(ui, &issues),
-                    Step::Operation => self.operation(ui, &issues),
-                    Step::Locations => self.locations(ui, layout, &issues),
-                    Step::Summary => self.summary(ui, layout, &issues, can_write),
-                }
-            });
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_max_width(720.0);
+                    match self.step {
+                        Step::Welcome => self.welcome(ui, layout, can_write),
+                        Step::Network => self.network(ui, &issues),
+                        Step::Operation => self.operation(ui, &issues),
+                        Step::Locations => self.locations(ui, layout, &issues),
+                        Step::Summary => self.summary(ui, layout, &issues, can_write),
+                    }
+                });
         });
         outcome
     }
@@ -181,7 +197,11 @@ impl Wizard {
         Plan {
             config,
             autostart: self.has_service.then_some(self.autostart),
-            migrate_legacy: if self.migrate_legacy { self.legacy_db.clone() } else { None },
+            migrate_legacy: if self.migrate_legacy {
+                self.legacy_db.clone()
+            } else {
+                None
+            },
             start_engine: self.start_engine,
         }
     }
@@ -195,17 +215,20 @@ impl Wizard {
         ui.add_space(4.0);
         ui.label("Vous pourrez modifier chaque paramètre plus tard depuis l'onglet Configuration de cet utilitaire.");
         ui.add_space(12.0);
-        egui::Grid::new("wizard_welcome").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-            ui.label("Mode :");
-            ui.label(match layout.kind {
-                LayoutKind::System => "installation système (service)",
-                LayoutKind::Portable => "portable (tout dans un dossier, lancement manuel)",
+        egui::Grid::new("wizard_welcome")
+            .num_columns(2)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Mode :");
+                ui.label(match layout.kind {
+                    LayoutKind::System => "installation système (service)",
+                    LayoutKind::Portable => "portable (tout dans un dossier, lancement manuel)",
+                });
+                ui.end_row();
+                ui.label("Fichier de configuration :");
+                ui.monospace(layout.config_file.display().to_string());
+                ui.end_row();
             });
-            ui.end_row();
-            ui.label("Fichier de configuration :");
-            ui.monospace(layout.config_file.display().to_string());
-            ui.end_row();
-        });
         ui.add_space(12.0);
         if layout.config_file.exists() {
             form::banner(
@@ -238,7 +261,10 @@ impl Wizard {
         ui.add_space(8.0);
         ui.strong("Nom de l'instance");
         ui.add(egui::TextEdit::singleline(&mut self.cfg.instance.name).desired_width(320.0));
-        form::hint(ui, "Affiché dans l'IHM web, les journaux et cet utilitaire (ex. « Bâtiment A — CTA »).");
+        form::hint(
+            ui,
+            "Affiché dans l'IHM web, les journaux et cet utilitaire (ex. « Bâtiment A — CTA »).",
+        );
         form::show_issues(ui, issues, "instance.name");
 
         ui.add_space(14.0);
@@ -267,7 +293,10 @@ impl Wizard {
                 }
             }
         });
-        form::hint(ui, "Par défaut 3000. L'adresse de l'IHM sera http://<poste>:<port>/.");
+        form::hint(
+            ui,
+            "Par défaut 3000. L'adresse de l'IHM sera http://<poste>:<port>/.",
+        );
         form::show_issues(ui, issues, "server.port");
     }
 
@@ -275,9 +304,20 @@ impl Wizard {
         ui.add_space(8.0);
         ui.strong("Lancement du moteur");
         if self.has_service {
-            ui.radio_value(&mut self.autostart, true, "Démarrer automatiquement avec le système (service) — recommandé");
-            ui.radio_value(&mut self.autostart, false, "Démarrage manuel du service (depuis cet utilitaire)");
-            form::hint(ui, "Le service fonctionne en arrière-plan, sans session ouverte.");
+            ui.radio_value(
+                &mut self.autostart,
+                true,
+                "Démarrer automatiquement avec le système (service) — recommandé",
+            );
+            ui.radio_value(
+                &mut self.autostart,
+                false,
+                "Démarrage manuel du service (depuis cet utilitaire)",
+            );
+            form::hint(
+                ui,
+                "Le service fonctionne en arrière-plan, sans session ouverte.",
+            );
         } else if self.kind == LayoutKind::System {
             form::banner(
                 ui,
@@ -297,7 +337,10 @@ impl Wizard {
              et les sorties des flux sont bloqués. Désactivez-le une fois l'installation vérifiée.",
         );
         ui.add_space(6.0);
-        ui.checkbox(&mut self.cfg.simulation.enabled, "Simulation et données de démonstration");
+        ui.checkbox(
+            &mut self.cfg.simulation.enabled,
+            "Simulation et données de démonstration",
+        );
         form::hint(
             ui,
             "Automate Modbus embarqué, simulateur GTB et drivers OPC-UA / BACnet / S7 SIMULÉS. \
@@ -306,32 +349,41 @@ impl Wizard {
         if self.cfg.simulation.enabled {
             ui.horizontal(|ui| {
                 ui.label("Port de l'automate embarqué :");
-                ui.add(egui::DragValue::new(&mut self.cfg.simulation.modbus_slave_port).range(1..=65535u16));
+                ui.add(
+                    egui::DragValue::new(&mut self.cfg.simulation.modbus_slave_port)
+                        .range(1..=65535u16),
+                );
             });
             form::show_issues(ui, issues, "simulation.modbus_slave_port");
         }
 
         ui.add_space(14.0);
         ui.strong("Conservation et sessions");
-        egui::Grid::new("wizard_operation").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-            ui.label("Historique des mesures :");
-            ui.add(
-                egui::DragValue::new(&mut self.cfg.history.retention_days)
-                    .range(0..=3650u32)
-                    .suffix(" jours"),
-            );
-            ui.end_row();
-            ui.label("");
-            form::hint(ui, "0 = conservation illimitée (la base grossit sans limite).");
-            ui.end_row();
-            ui.label("Expiration des sessions :");
-            ui.add(
-                egui::DragValue::new(&mut self.cfg.security.session_ttl_hours)
-                    .range(1..=720u32)
-                    .suffix(" h"),
-            );
-            ui.end_row();
-        });
+        egui::Grid::new("wizard_operation")
+            .num_columns(2)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Historique des mesures :");
+                ui.add(
+                    egui::DragValue::new(&mut self.cfg.history.retention_days)
+                        .range(0..=3650u32)
+                        .suffix(" jours"),
+                );
+                ui.end_row();
+                ui.label("");
+                form::hint(
+                    ui,
+                    "0 = conservation illimitée (la base grossit sans limite).",
+                );
+                ui.end_row();
+                ui.label("Expiration des sessions :");
+                ui.add(
+                    egui::DragValue::new(&mut self.cfg.security.session_ttl_hours)
+                        .range(1..=720u32)
+                        .suffix(" h"),
+                );
+                ui.end_row();
+            });
         form::show_issues(ui, issues, "history.retention_days");
         form::show_issues(ui, issues, "security.session_ttl_hours");
         ui.add_space(10.0);
@@ -345,26 +397,38 @@ impl Wizard {
     fn locations(&mut self, ui: &mut egui::Ui, layout: &Layout, issues: &[apex_config::Issue]) {
         ui.add_space(8.0);
         let (data, logs, _) = form::default_locations(layout, &self.cfg);
-        egui::Grid::new("wizard_locations").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-            ui.label("Données (base, historique) :");
-            ui.monospace(data.display().to_string());
-            ui.end_row();
-            ui.label("Journaux :");
-            ui.monospace(logs.display().to_string());
-            ui.end_row();
-        });
-        form::hint(ui, "Ces emplacements sont conservés lors des mises à jour et de la désinstallation.");
-        ui.add_space(10.0);
-        ui.checkbox(&mut self.custom_paths, "Utiliser d'autres emplacements (chemins absolus)");
-        if self.custom_paths {
-            egui::Grid::new("wizard_custom_paths").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-                ui.label("Données :");
-                form::path_field(ui, &mut self.cfg.paths.data_dir, &data);
+        egui::Grid::new("wizard_locations")
+            .num_columns(2)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Données (base, historique) :");
+                ui.monospace(data.display().to_string());
                 ui.end_row();
                 ui.label("Journaux :");
-                form::path_field(ui, &mut self.cfg.paths.log_dir, &logs);
+                ui.monospace(logs.display().to_string());
                 ui.end_row();
             });
+        form::hint(
+            ui,
+            "Ces emplacements sont conservés lors des mises à jour et de la désinstallation.",
+        );
+        ui.add_space(10.0);
+        ui.checkbox(
+            &mut self.custom_paths,
+            "Utiliser d'autres emplacements (chemins absolus)",
+        );
+        if self.custom_paths {
+            egui::Grid::new("wizard_custom_paths")
+                .num_columns(2)
+                .spacing([16.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Données :");
+                    form::path_field(ui, &mut self.cfg.paths.data_dir, &data);
+                    ui.end_row();
+                    ui.label("Journaux :");
+                    form::path_field(ui, &mut self.cfg.paths.log_dir, &logs);
+                    ui.end_row();
+                });
             form::show_issues(ui, issues, "paths.data_dir");
             form::show_issues(ui, issues, "paths.log_dir");
             if self.kind == LayoutKind::System {
@@ -391,46 +455,64 @@ impl Wizard {
         }
     }
 
-    fn summary(&mut self, ui: &mut egui::Ui, layout: &Layout, issues: &[apex_config::Issue], can_write: bool) {
+    fn summary(
+        &mut self,
+        ui: &mut egui::Ui,
+        layout: &Layout,
+        issues: &[apex_config::Issue],
+        can_write: bool,
+    ) {
         ui.add_space(8.0);
         let plan = self.plan();
         let c = &plan.config;
         let (data, logs, _) = form::default_locations(layout, c);
         let yes_no = |b: bool| if b { "oui" } else { "non" };
-        egui::Grid::new("wizard_summary").num_columns(2).striped(true).spacing([16.0, 6.0]).show(ui, |ui| {
-            let mut row = |k: &str, v: String| {
-                ui.label(k);
-                ui.label(v);
-                ui.end_row();
-            };
-            row("Instance", c.instance.name.clone());
-            row("Adresse de l'IHM", crate::probe::web_url(c));
-            row("Écoute", format!("{}:{}", c.server.bind, c.server.port));
-            if let Some(a) = plan.autostart {
-                row("Démarrage automatique", yes_no(a).into());
-            }
-            row("Mode sûr", yes_no(c.safety.safe_mode).into());
-            row("Simulation", yes_no(c.simulation.enabled).into());
-            row(
-                "Historique",
-                if c.history.retention_days == 0 {
-                    "illimité".into()
-                } else {
-                    format!("{} jours", c.history.retention_days)
-                },
-            );
-            row(
-                "Données",
-                if c.paths.data_dir.is_empty() { data.display().to_string() } else { c.paths.data_dir.clone() },
-            );
-            row(
-                "Journaux",
-                if c.paths.log_dir.is_empty() { logs.display().to_string() } else { c.paths.log_dir.clone() },
-            );
-            if let Some(db) = &plan.migrate_legacy {
-                row("Reprise des données", db.display().to_string());
-            }
-        });
+        egui::Grid::new("wizard_summary")
+            .num_columns(2)
+            .striped(true)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                let mut row = |k: &str, v: String| {
+                    ui.label(k);
+                    ui.label(v);
+                    ui.end_row();
+                };
+                row("Instance", c.instance.name.clone());
+                row("Adresse de l'IHM", crate::probe::web_url(c));
+                row("Écoute", format!("{}:{}", c.server.bind, c.server.port));
+                if let Some(a) = plan.autostart {
+                    row("Démarrage automatique", yes_no(a).into());
+                }
+                row("Mode sûr", yes_no(c.safety.safe_mode).into());
+                row("Simulation", yes_no(c.simulation.enabled).into());
+                row(
+                    "Historique",
+                    if c.history.retention_days == 0 {
+                        "illimité".into()
+                    } else {
+                        format!("{} jours", c.history.retention_days)
+                    },
+                );
+                row(
+                    "Données",
+                    if c.paths.data_dir.is_empty() {
+                        data.display().to_string()
+                    } else {
+                        c.paths.data_dir.clone()
+                    },
+                );
+                row(
+                    "Journaux",
+                    if c.paths.log_dir.is_empty() {
+                        logs.display().to_string()
+                    } else {
+                        c.paths.log_dir.clone()
+                    },
+                );
+                if let Some(db) = &plan.migrate_legacy {
+                    row("Reprise des données", db.display().to_string());
+                }
+            });
         ui.add_space(10.0);
         for i in issues {
             let color = match i.severity {
@@ -440,18 +522,28 @@ impl Wizard {
             ui.colored_label(color, i.to_string());
         }
         ui.add_space(10.0);
-        ui.checkbox(&mut self.start_engine, "Démarrer le moteur à la fin de l'assistant");
+        ui.checkbox(
+            &mut self.start_engine,
+            "Démarrer le moteur à la fin de l'assistant",
+        );
         ui.add_space(6.0);
         form::hint(
             ui,
             format!(
                 "La configuration sera écrite dans « {} »{}.",
                 layout.config_file.display(),
-                if layout.config_file.exists() { " (l'ancienne version est sauvegardée)" } else { "" }
+                if layout.config_file.exists() {
+                    " (l'ancienne version est sauvegardée)"
+                } else {
+                    ""
+                }
             ),
         );
         if !can_write {
-            ui.colored_label(form::error_color(ui), "Droits insuffisants pour enregistrer : relancez l'utilitaire en administrateur.");
+            ui.colored_label(
+                form::error_color(ui),
+                "Droits insuffisants pour enregistrer : relancez l'utilitaire en administrateur.",
+            );
         }
     }
 }

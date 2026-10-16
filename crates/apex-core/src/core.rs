@@ -34,8 +34,8 @@ use crate::{
         DriverRuntimeStats, FlowEdge, FlowExecutionTrace, FlowGraph, FlowNode, FlowNodeKind,
         HistoryPoint, HistoryResponse, ImportSymbolLibraryRequest, LoginRequest, LoginResponse,
         ProjectBackupBundle, Quality, RegisteredTag, ScadaError, ScheduleRule, SymbolLibraryItem,
-        SystemStatus, TagFullView, SystemSettings, TagState, TagValue, UpsertUserRequest, UserAccount,
-        UserPublicView, UserRole, WidgetType, WriteCommand,
+        SystemSettings, SystemStatus, TagFullView, TagState, TagValue, UpsertUserRequest,
+        UserAccount, UserPublicView, UserRole, WidgetType, WriteCommand,
     },
     security,
 };
@@ -363,7 +363,10 @@ impl ScadaCore {
     }
 
     /// Démarre la tâche d'acquisition et met à jour les statistiques de la configuration.
-    async fn spawn_and_track(self: &Arc<Self>, config: &mut DriverConfig) -> Result<(), ScadaError> {
+    async fn spawn_and_track(
+        self: &Arc<Self>,
+        config: &mut DriverConfig,
+    ) -> Result<(), ScadaError> {
         if config.protocol.is_simulated() && !self.simulation_enabled {
             let err = format!(
                 "Protocole {:?} simulé : il ne fonctionne qu'avec la simulation active ([simulation] enabled = true)",
@@ -431,7 +434,11 @@ impl ScadaCore {
     }
 
     /// Arrête la tâche d'acquisition d'un driver sans le supprimer (état voulu : arrêté).
-    pub async fn stop_driver(&self, actor: &str, driver_id: &str) -> Result<DriverConfig, ScadaError> {
+    pub async fn stop_driver(
+        &self,
+        actor: &str,
+        driver_id: &str,
+    ) -> Result<DriverConfig, ScadaError> {
         self.abort_driver_task(driver_id);
 
         let mut drv = self
@@ -529,13 +536,21 @@ impl ScadaCore {
             .ok_or_else(|| ScadaError::DriverNotFound(driver_id.to_string()))?;
 
         let mut changes: Vec<String> = Vec::new();
-        if let Some(name) = req.name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
+        if let Some(name) = req
+            .name
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+        {
             if name != cfg.name {
                 changes.push(format!("nom « {} »", name));
                 cfg.name = name;
             }
         }
-        if let Some(ep) = req.endpoint.map(|e| e.trim().to_string()).filter(|e| !e.is_empty()) {
+        if let Some(ep) = req
+            .endpoint
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty())
+        {
             if cfg.protocol == crate::models::ProtocolType::ModbusTcp
                 && ep.parse::<std::net::SocketAddr>().is_err()
             {
@@ -566,7 +581,8 @@ impl ScadaCore {
             return Ok(cfg);
         }
 
-        self.drivers_config.insert(driver_id.to_string(), cfg.clone());
+        self.drivers_config
+            .insert(driver_id.to_string(), cfg.clone());
         self.persist_driver(driver_id).await;
         self.record_audit(actor, "DRIVER", "UPDATE", driver_id, &changes.join(", "));
 
@@ -623,7 +639,10 @@ impl ScadaCore {
             "DRIVER",
             "DELETE",
             driver_id,
-            &format!("Suppression du driver et de ses {} variable(s)", tag_ids.len()),
+            &format!(
+                "Suppression du driver et de ses {} variable(s)",
+                tag_ids.len()
+            ),
         );
         Ok(tag_ids.len())
     }
@@ -631,7 +650,11 @@ impl ScadaCore {
     /// Arrête toutes les tâches d'acquisition (extinction, mise hors tension) sans modifier
     /// l'état voulu des drivers : ils redémarreront au prochain rallumage.
     pub fn stop_all_drivers(&self) {
-        let ids: Vec<String> = self.driver_handles.iter().map(|e| e.key().clone()).collect();
+        let ids: Vec<String> = self
+            .driver_handles
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
         for id in ids {
             self.abort_driver_task(&id);
             if let Some(mut drv) = self.drivers_config.get_mut(&id) {
@@ -766,11 +789,7 @@ impl ScadaCore {
     // GESTION DES VARIABLES (TAG DATABASE CRUD)
     // ========================================================================
 
-    pub fn register_tag(
-        &self,
-        tag: RegisteredTag,
-        initial_value: Option<TagValue>,
-    ) -> TagFullView {
+    pub fn register_tag(&self, tag: RegisteredTag, initial_value: Option<TagValue>) -> TagFullView {
         let tag_id = tag.id.clone();
         let default_val = initial_value.unwrap_or_else(|| match tag.data_type {
             crate::models::TagDataType::Bool => TagValue::Bool(false),
@@ -797,7 +816,11 @@ impl ScadaCore {
         }
     }
 
-    pub async fn upsert_tag(&self, actor: &str, tag: RegisteredTag) -> Result<TagFullView, ScadaError> {
+    pub async fn upsert_tag(
+        &self,
+        actor: &str,
+        tag: RegisteredTag,
+    ) -> Result<TagFullView, ScadaError> {
         security::validate_id("tag", &tag.id)?;
         if tag.module_source.trim().is_empty() {
             return Err(ScadaError::BadRequest(
@@ -853,7 +876,10 @@ impl ScadaCore {
             "TAG_DB",
             "UPSERT_TAG",
             &tag.id,
-            &format!("Configuration variable {} ({})", tag.label, tag.protocol_address),
+            &format!(
+                "Configuration variable {} ({})",
+                tag.label, tag.protocol_address
+            ),
         );
 
         Ok(view)
@@ -885,7 +911,13 @@ impl ScadaCore {
         }
         self.persist_driver(&removed.module_source).await;
         let _ = self.alarm_tx.send(self.get_all_alarms());
-        self.record_audit(actor, "TAG_DB", "DELETE_TAG", tag_id, "Suppression variable");
+        self.record_audit(
+            actor,
+            "TAG_DB",
+            "DELETE_TAG",
+            tag_id,
+            "Suppression variable",
+        );
         Ok(())
     }
 
@@ -909,7 +941,8 @@ impl ScadaCore {
                 if let (TagValue::Float(_) | TagValue::Int(_), Some(raw)) =
                     (&incoming.value, incoming.value.as_f64())
                 {
-                    let scaled = ((raw * meta.scale_factor + meta.scale_offset) * 1000.0).round() / 1000.0;
+                    let scaled =
+                        ((raw * meta.scale_factor + meta.scale_offset) * 1000.0).round() / 1000.0;
                     incoming.value = TagValue::Float(scaled);
                 }
             }
@@ -978,13 +1011,7 @@ impl ScadaCore {
             )
         });
         let reason = compute_alarm_reason(meta, &state.value, currently_active);
-        self.apply_alarm_transition(
-            &meta.id,
-            &meta.id,
-            &meta.label,
-            reason,
-            state.value.clone(),
-        );
+        self.apply_alarm_transition(&meta.id, &meta.id, &meta.label, reason, state.value.clone());
     }
 
     /// Applique le cycle de vie ISA-18.2 à une alarme (apparition, aggravation, disparition,
@@ -1056,13 +1083,15 @@ impl ScadaCore {
                     existing.state = AlarmLifecycleState::ClearedUnack;
                     existing.cleared_at = Some(Utc::now());
                     changed = true;
-                    journal_event = Some(("DISPARITION", existing.severity, existing.message.clone()));
+                    journal_event =
+                        Some(("DISPARITION", existing.severity, existing.message.clone()));
                 }
                 AlarmLifecycleState::ActiveAck => {
                     existing.state = AlarmLifecycleState::Normal;
                     existing.cleared_at = Some(Utc::now());
                     changed = true;
-                    journal_event = Some(("RETOUR_NORMAL", existing.severity, existing.message.clone()));
+                    journal_event =
+                        Some(("RETOUR_NORMAL", existing.severity, existing.message.clone()));
                 }
                 _ => {}
             },
@@ -1228,7 +1257,11 @@ impl ScadaCore {
         Ok(updated)
     }
 
-    pub fn unshelve_alarm(&self, alarm_id: &str, operator: &str) -> Result<AlarmInstance, ScadaError> {
+    pub fn unshelve_alarm(
+        &self,
+        alarm_id: &str,
+        operator: &str,
+    ) -> Result<AlarmInstance, ScadaError> {
         let updated = {
             let mut alarm = self
                 .alarms
@@ -1246,7 +1279,13 @@ impl ScadaCore {
             "Réveil manuel de l'alarme",
             Some(operator.to_string()),
         );
-        self.record_audit(operator, "ALARME", "UNSHELVE_ALARM", alarm_id, "Réveil manuel de l'alarme");
+        self.record_audit(
+            operator,
+            "ALARME",
+            "UNSHELVE_ALARM",
+            alarm_id,
+            "Réveil manuel de l'alarme",
+        );
         let _ = self.alarm_tx.send(self.get_all_alarms());
         Ok(updated)
     }
@@ -1272,10 +1311,7 @@ impl ScadaCore {
     // ========================================================================
 
     pub fn get_settings(&self) -> SystemSettings {
-        self.settings
-            .read()
-            .map(|s| s.clone())
-            .unwrap_or_default()
+        self.settings.read().map(|s| s.clone()).unwrap_or_default()
     }
 
     pub fn subscribe_settings(&self) -> broadcast::Receiver<SystemSettings> {
@@ -1314,7 +1350,11 @@ impl ScadaCore {
         if previous.alarm_shelving_enabled != new.alarm_shelving_enabled {
             changes.push(format!(
                 "mise en sommeil des alarmes {}",
-                if new.alarm_shelving_enabled { "activée" } else { "désactivée" }
+                if new.alarm_shelving_enabled {
+                    "activée"
+                } else {
+                    "désactivée"
+                }
             ));
         }
         if previous.alarm_shelve_max_minutes != new.alarm_shelve_max_minutes {
@@ -1335,7 +1375,8 @@ impl ScadaCore {
             }
         } else {
             // Une durée maximale réduite s'applique aussi aux mises en sommeil en cours
-            let max_until = Utc::now() + chrono::Duration::minutes(new.alarm_shelve_max_minutes as i64);
+            let max_until =
+                Utc::now() + chrono::Duration::minutes(new.alarm_shelve_max_minutes as i64);
             let mut shortened = Vec::new();
             for mut a in self.alarms.iter_mut() {
                 if a.shelved_until.is_some_and(|u| u > max_until) {
@@ -1352,7 +1393,13 @@ impl ScadaCore {
         }
 
         if !changes.is_empty() {
-            self.record_audit(actor, "SYSTÈME", "UPDATE_SETTINGS", "Réglages", &changes.join(", "));
+            self.record_audit(
+                actor,
+                "SYSTÈME",
+                "UPDATE_SETTINGS",
+                "Réglages",
+                &changes.join(", "),
+            );
         }
         let _ = self.settings_tx.send(new.clone());
         Ok(new)
@@ -1375,7 +1422,13 @@ impl ScadaCore {
             }
         }
         for (id, tag_id, sev) in &woken {
-            self.record_alarm_journal(tag_id, sev, "FIN_SOMMEIL", reason, operator.map(str::to_string));
+            self.record_alarm_journal(
+                tag_id,
+                sev,
+                "FIN_SOMMEIL",
+                reason,
+                operator.map(str::to_string),
+            );
             self.persist_alarm(id);
         }
         if !woken.is_empty() {
@@ -1445,7 +1498,12 @@ impl ScadaCore {
             if al.state == AlarmLifecycleState::ActiveUnack
                 || al.state == AlarmLifecycleState::ClearedUnack
             {
-                acked.push((al.id.clone(), al.tag_id.clone(), format!("{:?}", al.severity), al.message.clone()));
+                acked.push((
+                    al.id.clone(),
+                    al.tag_id.clone(),
+                    format!("{:?}", al.severity),
+                    al.message.clone(),
+                ));
                 al.acked_at = Some(Utc::now());
                 al.acked_by = Some(operator.to_string());
                 al.state = if al.state == AlarmLifecycleState::ActiveUnack {
@@ -1489,7 +1547,10 @@ impl ScadaCore {
             "ALARME",
             "CLEAR_NORMAL",
             "Résolues",
-            &format!("Effacement de {} alarme(s) revenue(s) à la normale", removed),
+            &format!(
+                "Effacement de {} alarme(s) revenue(s) à la normale",
+                removed
+            ),
         );
         let all = self.get_all_alarms();
         let _ = self.alarm_tx.send(all.clone());
@@ -1497,8 +1558,7 @@ impl ScadaCore {
     }
 
     pub fn get_all_alarms(&self) -> Vec<AlarmInstance> {
-        let mut list: Vec<AlarmInstance> =
-            self.alarms.iter().map(|e| e.value().clone()).collect();
+        let mut list: Vec<AlarmInstance> = self.alarms.iter().map(|e| e.value().clone()).collect();
         list.sort_by_key(|a| std::cmp::Reverse(a.raised_at));
         list
     }
@@ -1537,7 +1597,10 @@ impl ScadaCore {
         }
     }
 
-    pub async fn query_alarm_journal(&self, limit: u32) -> Result<Vec<AlarmJournalEntry>, ScadaError> {
+    pub async fn query_alarm_journal(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<AlarmJournalEntry>, ScadaError> {
         let Some(pool) = &self.db_pool else {
             return Ok(vec![]);
         };
@@ -1598,7 +1661,9 @@ impl ScadaCore {
         let coerced_value = raw_value.coerce_to(tag_meta.data_type)?;
         if let Some(f) = coerced_value.as_f64() {
             if matches!(coerced_value, TagValue::Float(_) | TagValue::Int(_)) && !f.is_finite() {
-                return Err(ScadaError::BadRequest("Valeur numérique invalide".to_string()));
+                return Err(ScadaError::BadRequest(
+                    "Valeur numérique invalide".to_string(),
+                ));
             }
         }
 
@@ -1609,10 +1674,13 @@ impl ScadaCore {
             timestamp: Utc::now(),
         };
 
-        let driver_status = self
-            .drivers_config
-            .get(&tag_meta.module_source)
-            .map(|d| (d.stats.running, d.stats.connected, d.protocol.is_simulated()));
+        let driver_status = self.drivers_config.get(&tag_meta.module_source).map(|d| {
+            (
+                d.stats.running,
+                d.stats.connected,
+                d.protocol.is_simulated(),
+            )
+        });
 
         let Some((running, connected, simulated)) = driver_status else {
             // Variable interne (mémoire) : pas d'équipement à piloter
@@ -1734,7 +1802,13 @@ impl ScadaCore {
                     .await,
             );
         }
-        self.record_audit(actor, "PLANNING", "DELETE_SCHEDULE", id, "Suppression programme horaire");
+        self.record_audit(
+            actor,
+            "PLANNING",
+            "DELETE_SCHEDULE",
+            id,
+            "Suppression programme horaire",
+        );
         Ok(())
     }
 
@@ -1768,7 +1842,10 @@ impl ScadaCore {
                     } else {
                         rule.inactive_value.clone()
                     };
-                    match core.write_tag(&rule.target_tag_id, target_val.clone()).await {
+                    match core
+                        .write_tag(&rule.target_tag_id, target_val.clone())
+                        .await
+                    {
                         Ok(_) => {
                             failing.remove(&rule.id);
                             if let Some(mut r_mut) = core.schedules.get_mut(&rule.id) {
@@ -1884,7 +1961,13 @@ impl ScadaCore {
                     .await,
             );
         }
-        self.record_audit(actor, "STUDIO", "DELETE_DASHBOARD", id, "Suppression synoptique");
+        self.record_audit(
+            actor,
+            "STUDIO",
+            "DELETE_DASHBOARD",
+            id,
+            "Suppression synoptique",
+        );
         Ok(())
     }
 
@@ -1951,10 +2034,7 @@ impl ScadaCore {
         from: Option<DateTime<Utc>>,
         to: Option<DateTime<Utc>>,
     ) -> Result<HistoryResponse, ScadaError> {
-        let unit = self
-            .tags_registry
-            .get(tag_id)
-            .and_then(|t| t.unit.clone());
+        let unit = self.tags_registry.get(tag_id).and_then(|t| t.unit.clone());
         let limit = limit.clamp(10, 5000) as i64;
 
         let Some(pool) = &self.db_pool else {
@@ -2028,7 +2108,9 @@ impl ScadaCore {
                 total_points = row.try_get::<i64, _>("total").unwrap_or(0).max(0) as usize;
             }
             let val_str: String = row.try_get("value_json").unwrap_or_default();
-            let quality: String = row.try_get("quality").unwrap_or_else(|_| "Good".to_string());
+            let quality: String = row
+                .try_get("quality")
+                .unwrap_or_else(|_| "Good".to_string());
             let timestamp: String = row.try_get("recorded_at").unwrap_or_default();
 
             if let Ok(value) = serde_json::from_str::<TagValue>(&val_str) {
@@ -2286,10 +2368,11 @@ impl ScadaCore {
             return Ok(());
         };
 
-        let seeded: Option<String> = sqlx::query_scalar("SELECT value FROM meta WHERE key = 'seeded'")
-            .fetch_optional(&pool)
-            .await
-            .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+        let seeded: Option<String> =
+            sqlx::query_scalar("SELECT value FROM meta WHERE key = 'seeded'")
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
 
         if seeded.is_none() {
             self.write_seed_to_db(&pool, &default_drivers).await?;
@@ -2395,7 +2478,10 @@ impl ScadaCore {
                         *cur = s;
                     }
                 }
-                Err(e) => warn!("Réglages système illisibles, valeurs par défaut utilisées : {}", e),
+                Err(e) => warn!(
+                    "Réglages système illisibles, valeurs par défaut utilisées : {}",
+                    e
+                ),
             }
         }
 
@@ -2423,7 +2509,10 @@ impl ScadaCore {
             self.persist_alarm(id);
         }
         if !self.alarms.is_empty() {
-            info!("{} alarme(s) restaurée(s) depuis la base", self.alarms.len());
+            info!(
+                "{} alarme(s) restaurée(s) depuis la base",
+                self.alarms.len()
+            );
         }
 
         // Garde-fou : sans aucun administrateur actif, on recrée le compte admin d'usine
@@ -2433,7 +2522,8 @@ impl ScadaCore {
             .any(|u| u.value().role == UserRole::Admin && u.value().enabled);
         if !has_admin {
             warn!("Aucun administrateur actif en base : recréation du compte 'admin' d'usine");
-            self.users.insert("admin".to_string(), factory_admin_account());
+            self.users
+                .insert("admin".to_string(), factory_admin_account());
         }
 
         self.migrate_legacy_passwords().await;
@@ -2453,7 +2543,8 @@ impl ScadaCore {
             .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
 
         for cfg in default_drivers {
-            let js = serde_json::to_string(cfg).map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+            let js =
+                serde_json::to_string(cfg).map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
             sqlx::query("INSERT OR IGNORE INTO drivers_config (id, config_json, updated_at) VALUES (?, ?, ?)")
                 .bind(&cfg.id)
                 .bind(js)
@@ -2464,11 +2555,24 @@ impl ScadaCore {
         }
         // Données de démonstration (synoptiques, flux, plannings liés au simulateur) :
         // uniquement si la simulation est active. Comptes et symboles sont toujours créés.
-        let demo_dashboards = if self.simulation_enabled { self.get_all_dashboards() } else { Vec::new() };
-        let demo_flows = if self.simulation_enabled { self.get_all_flows() } else { Vec::new() };
-        let demo_schedules = if self.simulation_enabled { self.get_all_schedules() } else { Vec::new() };
+        let demo_dashboards = if self.simulation_enabled {
+            self.get_all_dashboards()
+        } else {
+            Vec::new()
+        };
+        let demo_flows = if self.simulation_enabled {
+            self.get_all_flows()
+        } else {
+            Vec::new()
+        };
+        let demo_schedules = if self.simulation_enabled {
+            self.get_all_schedules()
+        } else {
+            Vec::new()
+        };
         for d in demo_dashboards {
-            let js = serde_json::to_string(&d).map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+            let js =
+                serde_json::to_string(&d).map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
             sqlx::query("INSERT OR IGNORE INTO dashboards (id, name, layout_json, updated_at) VALUES (?, ?, ?, ?)")
                 .bind(&d.id)
                 .bind(&d.name)
@@ -2479,29 +2583,36 @@ impl ScadaCore {
                 .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
         }
         for f in demo_flows {
-            let js = serde_json::to_string(&f).map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
-            sqlx::query("INSERT OR IGNORE INTO flows (id, name, flow_json, updated_at) VALUES (?, ?, ?, ?)")
-                .bind(&f.id)
-                .bind(&f.name)
-                .bind(js)
-                .bind(&now)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+            let js =
+                serde_json::to_string(&f).map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO flows (id, name, flow_json, updated_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(&f.id)
+            .bind(&f.name)
+            .bind(js)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
         }
         for s in demo_schedules {
-            let js = serde_json::to_string(&s).map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
-            sqlx::query("INSERT OR IGNORE INTO schedules (id, rule_json, updated_at) VALUES (?, ?, ?)")
-                .bind(&s.id)
-                .bind(js)
-                .bind(&now)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+            let js =
+                serde_json::to_string(&s).map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO schedules (id, rule_json, updated_at) VALUES (?, ?, ?)",
+            )
+            .bind(&s.id)
+            .bind(js)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
         }
         let users: Vec<UserAccount> = self.users.iter().map(|u| u.value().clone()).collect();
         for u in users {
-            let js = serde_json::to_string(&u).map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+            let js =
+                serde_json::to_string(&u).map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
             sqlx::query("INSERT OR IGNORE INTO users_accounts (username, user_json, updated_at) VALUES (?, ?, ?)")
                 .bind(&u.username)
                 .bind(js)
@@ -2511,7 +2622,8 @@ impl ScadaCore {
                 .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
         }
         for sym in self.get_all_symbols() {
-            let js = serde_json::to_string(&sym).map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+            let js = serde_json::to_string(&sym)
+                .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
             sqlx::query("INSERT OR IGNORE INTO symbol_libraries (id, symbol_json, updated_at) VALUES (?, ?, ?)")
                 .bind(&sym.id)
                 .bind(js)
@@ -2542,10 +2654,19 @@ impl ScadaCore {
                     account.password_hash = hash;
                     self.users.insert(account.username.clone(), account.clone());
                     self.persist_user(&account).await;
-                    info!("Mot de passe du compte '{}' migré vers Argon2id", account.username);
+                    info!(
+                        "Mot de passe du compte '{}' migré vers Argon2id",
+                        account.username
+                    );
                 }
-                Ok(Err(e)) => error!("Migration du mot de passe de '{}' impossible : {}", account.username, e),
-                Err(e) => error!("Migration du mot de passe de '{}' interrompue : {}", account.username, e),
+                Ok(Err(e)) => error!(
+                    "Migration du mot de passe de '{}' impossible : {}",
+                    account.username, e
+                ),
+                Err(e) => error!(
+                    "Migration du mot de passe de '{}' interrompue : {}",
+                    account.username, e
+                ),
             }
         }
     }
@@ -2668,7 +2789,10 @@ impl ScadaCore {
                     }
                 }
                 if total > 0 {
-                    info!("Rétention historique : {} points de plus de {} jours supprimés", total, days);
+                    info!(
+                        "Rétention historique : {} points de plus de {} jours supprimés",
+                        total, days
+                    );
                     core.record_audit(
                         "Système",
                         "HISTORIAN",
@@ -3225,15 +3349,20 @@ impl ScadaCore {
             .unwrap_or_default();
         let password = req.password.clone();
         let password_ok = !stored_hash.is_empty()
-            && tokio::task::spawn_blocking(move || security::verify_password(&password, &stored_hash))
-                .await
-                .unwrap_or(false);
+            && tokio::task::spawn_blocking(move || {
+                security::verify_password(&password, &stored_hash)
+            })
+            .await
+            .unwrap_or(false);
 
         let Some(account) = account.filter(|_| password_ok) else {
-            let mut entry = self.login_failures.entry(key.clone()).or_insert(LoginFailure {
-                count: 0,
-                last_at: now,
-            });
+            let mut entry = self
+                .login_failures
+                .entry(key.clone())
+                .or_insert(LoginFailure {
+                    count: 0,
+                    last_at: now,
+                });
             // Le compteur repart de zéro une fois le verrouillage expiré
             if (now - entry.last_at).num_seconds() >= LOGIN_LOCK_SECONDS {
                 entry.count = 0;
@@ -3241,7 +3370,13 @@ impl ScadaCore {
             entry.count += 1;
             entry.last_at = now;
             drop(entry);
-            self.record_audit(&key, "AUTH", "LOGIN_FAILED", &key, "Échec d'authentification");
+            self.record_audit(
+                &key,
+                "AUTH",
+                "LOGIN_FAILED",
+                &key,
+                "Échec d'authentification",
+            );
             return Err(ScadaError::Unauthorized(
                 "Identifiant ou mot de passe incorrect".to_string(),
             ));
@@ -3312,7 +3447,11 @@ impl ScadaCore {
         }
 
         if peer_is_loopback && constant_time_eq(clean, &self.local_control_token) {
-            return self.users.get("admin").map(|u| u.clone()).filter(|u| u.enabled);
+            return self
+                .users
+                .get("admin")
+                .map(|u| u.clone())
+                .filter(|u| u.enabled);
         }
 
         let ttl = chrono::Duration::hours(self.session_ttl_hours as i64);
@@ -3390,7 +3529,9 @@ impl ScadaCore {
         let existing = self.users.get(&uname).map(|u| u.clone());
 
         // On ne peut pas retirer le dernier administrateur actif
-        let loses_admin = existing.as_ref().is_some_and(|u| u.role == UserRole::Admin && u.enabled)
+        let loses_admin = existing
+            .as_ref()
+            .is_some_and(|u| u.role == UserRole::Admin && u.enabled)
             && (req.role != UserRole::Admin || !req.enabled);
         if loses_admin && self.active_admin_count_excluding(&uname) == 0 {
             return Err(ScadaError::BadRequest(
@@ -3434,7 +3575,10 @@ impl ScadaCore {
             password_hash,
             department: req.department.trim().to_string(),
             enabled: req.enabled,
-            created_at: existing.as_ref().map(|u| u.created_at).unwrap_or_else(Utc::now),
+            created_at: existing
+                .as_ref()
+                .map(|u| u.created_at)
+                .unwrap_or_else(Utc::now),
             last_login_at: existing.and_then(|u| u.last_login_at),
         };
 
@@ -3449,7 +3593,11 @@ impl ScadaCore {
             "UTILISATEURS",
             "UPSERT_USER",
             &uname,
-            &format!("Profil '{}' configuré dans le groupe '{}'", account.display_name, account.role.label_fr()),
+            &format!(
+                "Profil '{}' configuré dans le groupe '{}'",
+                account.display_name,
+                account.role.label_fr()
+            ),
         );
 
         Ok(account.to_public_view())
@@ -3467,9 +3615,9 @@ impl ScadaCore {
                 "Vous ne pouvez pas supprimer votre propre compte".to_string(),
             ));
         }
-        self.users
-            .remove(&uname)
-            .ok_or_else(|| ScadaError::BadRequest(format!("Utilisateur '{}' introuvable", uname)))?;
+        self.users.remove(&uname).ok_or_else(|| {
+            ScadaError::BadRequest(format!("Utilisateur '{}' introuvable", uname))
+        })?;
         self.revoke_user_sessions(&uname);
 
         if let Some(pool) = &self.db_pool {
@@ -3600,7 +3748,13 @@ impl ScadaCore {
                     .await,
             );
         }
-        self.record_audit(actor, "BIBLIOTHÈQUE", "DELETE_SYMBOL", id, "Suppression d'un symbole industriel");
+        self.record_audit(
+            actor,
+            "BIBLIOTHÈQUE",
+            "DELETE_SYMBOL",
+            id,
+            "Suppression d'un symbole industriel",
+        );
         Ok(())
     }
 
@@ -3626,7 +3780,10 @@ impl ScadaCore {
             "BIBLIOTHÈQUE",
             "INSTALL_PACK",
             pack_id,
-            &format!("Installation de {} symboles industriels normalisés", items.len()),
+            &format!(
+                "Installation de {} symboles industriels normalisés",
+                items.len()
+            ),
         );
         Ok(items)
     }
@@ -3715,9 +3872,7 @@ impl ScadaCore {
             let arr_opt = if let Some(a) = val.as_array() {
                 Some(a.clone())
             } else {
-                val.get("symbols")
-                    .and_then(|s| s.as_array())
-                    .cloned()
+                val.get("symbols").and_then(|s| s.as_array()).cloned()
             };
 
             let Some(arr) = arr_opt else {
@@ -3797,7 +3952,12 @@ impl ScadaCore {
                         view_box, inner_svg
                     );
                     let item = SymbolLibraryItem {
-                        id: format!("sprite-{}-{}-{}", id_attr, Utc::now().timestamp_millis(), idx),
+                        id: format!(
+                            "sprite-{}-{}-{}",
+                            id_attr,
+                            Utc::now().timestamp_millis(),
+                            idx
+                        ),
                         name: format!("{} ({})", default_name, id_attr),
                         category: default_cat.clone(),
                         standard: "W3C SVG Sprite / Inkscape".to_string(),
@@ -3840,7 +4000,10 @@ impl ScadaCore {
             "BIBLIOTHÈQUE",
             "IMPORT_SYMBOLS",
             &req.library_name,
-            &format!("Import réussi de {} symbole(s) industriel(s)", imported.len()),
+            &format!(
+                "Import réussi de {} symbole(s) industriel(s)",
+                imported.len()
+            ),
         );
 
         Ok(imported)
@@ -3980,7 +4143,6 @@ impl ScadaCore {
     }
 }
 
-
 // ============================================================================
 // FONCTIONS UTILITAIRES DU NOYAU
 // ============================================================================
@@ -4020,7 +4182,12 @@ fn series_stats(nums: &[f64]) -> (Option<f64>, Option<f64>, Option<f64>, Option<
     let max_v = nums.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let mean = nums.iter().sum::<f64>() / nums.len() as f64;
     let variance = nums.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / nums.len() as f64;
-    (Some(min_v), Some(max_v), Some(round2(mean)), Some(round2(variance.sqrt())))
+    (
+        Some(min_v),
+        Some(max_v),
+        Some(round2(mean)),
+        Some(round2(variance.sqrt())),
+    )
 }
 
 /// Identifiant de l'alarme de communication d'un driver.
@@ -4185,7 +4352,10 @@ fn sanitize_dashboard(layout: &mut DashboardLayout) -> Result<(), ScadaError> {
     security::validate_id("synoptique", &layout.id)?;
     for w in layout.widgets.iter_mut() {
         security::validate_id("widget", &w.id)?;
-        if w.bound_tag_id.as_deref().is_some_and(|t| t.trim().is_empty()) {
+        if w.bound_tag_id
+            .as_deref()
+            .is_some_and(|t| t.trim().is_empty())
+        {
             w.bound_tag_id = None;
         }
         if let Some(tag_id) = &w.bound_tag_id {
@@ -4256,7 +4426,10 @@ mod tests {
     fn device_value_is_inverse_of_scaling() {
         let t = tag(0.1, 2.0);
         // valeur d'ingénierie 23.5 = brute × 0.1 + 2  ⇒ brute = 215
-        assert_eq!(to_device_value(&t, &TagValue::Float(23.5)), TagValue::Float(215.0));
+        assert_eq!(
+            to_device_value(&t, &TagValue::Float(23.5)),
+            TagValue::Float(215.0)
+        );
         assert_eq!(
             to_device_value(&tag(1.0, 0.0), &TagValue::Float(7.25)),
             TagValue::Float(7.25)
@@ -4346,8 +4519,18 @@ mod tests {
         let (msg, sev) = compute_alarm_reason(&t, &TagValue::Float(28.0), false).unwrap();
         assert_eq!(sev, AlarmSeverity::High);
         assert!(msg.contains("H ≥ 27"));
-        assert_eq!(compute_alarm_reason(&t, &TagValue::Float(31.5), false).unwrap().1, AlarmSeverity::Critical);
-        assert_eq!(compute_alarm_reason(&t, &TagValue::Float(14.0), false).unwrap().1, AlarmSeverity::High);
+        assert_eq!(
+            compute_alarm_reason(&t, &TagValue::Float(31.5), false)
+                .unwrap()
+                .1,
+            AlarmSeverity::Critical
+        );
+        assert_eq!(
+            compute_alarm_reason(&t, &TagValue::Float(14.0), false)
+                .unwrap()
+                .1,
+            AlarmSeverity::High
+        );
     }
 
     #[test]
@@ -4355,16 +4538,29 @@ mod tests {
         let t = alarmed_tag();
         // Bande morte par défaut sur H=27 : max(2 × 0.05, 1 % de 27) = 0.27
         assert!(compute_alarm_reason(&t, &TagValue::Float(26.9), false).is_none());
-        assert!(compute_alarm_reason(&t, &TagValue::Float(26.9), true).is_some(), "reste active dans la bande morte");
-        assert!(compute_alarm_reason(&t, &TagValue::Float(26.7), true).is_none(), "disparaît sous seuil - bande morte");
+        assert!(
+            compute_alarm_reason(&t, &TagValue::Float(26.9), true).is_some(),
+            "reste active dans la bande morte"
+        );
+        assert!(
+            compute_alarm_reason(&t, &TagValue::Float(26.7), true).is_none(),
+            "disparaît sous seuil - bande morte"
+        );
     }
 
     #[test]
     fn alarm_messages_are_stable() {
         let t = alarmed_tag();
-        let a = compute_alarm_reason(&t, &TagValue::Float(28.1), false).unwrap().0;
-        let b = compute_alarm_reason(&t, &TagValue::Float(29.4), false).unwrap().0;
-        assert_eq!(a, b, "le message ne doit pas dépendre de la valeur courante");
+        let a = compute_alarm_reason(&t, &TagValue::Float(28.1), false)
+            .unwrap()
+            .0;
+        let b = compute_alarm_reason(&t, &TagValue::Float(29.4), false)
+            .unwrap()
+            .0;
+        assert_eq!(
+            a, b,
+            "le message ne doit pas dépendre de la valeur courante"
+        );
     }
 
     #[test]
@@ -4377,7 +4573,12 @@ mod tests {
             message: Some("Encrassement filtre".into()),
             ..Default::default()
         };
-        assert_eq!(compute_alarm_reason(&t, &TagValue::Bool(true), false).unwrap().0, "Encrassement filtre");
+        assert_eq!(
+            compute_alarm_reason(&t, &TagValue::Bool(true), false)
+                .unwrap()
+                .0,
+            "Encrassement filtre"
+        );
         assert!(compute_alarm_reason(&t, &TagValue::Bool(false), true).is_none());
         t.alarm_config.enabled = false;
         assert!(compute_alarm_reason(&t, &TagValue::Bool(true), false).is_none());

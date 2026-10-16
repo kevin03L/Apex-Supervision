@@ -307,7 +307,10 @@ impl AppConfig {
         }
 
         if self.server.port == 0 {
-            issues.push(Issue::error("server.port", "le port doit être compris entre 1 et 65535"));
+            issues.push(Issue::error(
+                "server.port",
+                "le port doit être compris entre 1 et 65535",
+            ));
         } else if self.server.port < 1024 && cfg!(unix) {
             issues.push(Issue::warning(
                 "server.port",
@@ -330,7 +333,10 @@ impl AppConfig {
 
         let db = self.database.file.trim();
         if db.is_empty() {
-            issues.push(Issue::error("database.file", "le nom du fichier de base est requis"));
+            issues.push(Issue::error(
+                "database.file",
+                "le nom du fichier de base est requis",
+            ));
         } else if Path::new(db)
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -358,7 +364,11 @@ impl AppConfig {
         if !LOG_LEVELS.contains(&self.logging.level.trim()) {
             issues.push(Issue::error(
                 "logging.level",
-                format!("niveau inconnu « {} » (valeurs : {})", self.logging.level, LOG_LEVELS.join(", ")),
+                format!(
+                    "niveau inconnu « {} » (valeurs : {})",
+                    self.logging.level,
+                    LOG_LEVELS.join(", ")
+                ),
             ));
         }
         if !(1..=365).contains(&self.logging.retention_files) {
@@ -416,11 +426,19 @@ impl AppConfig {
 
 fn flatten(value: &toml::Value) -> std::collections::BTreeMap<String, toml::Value> {
     let mut out = std::collections::BTreeMap::new();
-    fn walk(prefix: &str, v: &toml::Value, out: &mut std::collections::BTreeMap<String, toml::Value>) {
+    fn walk(
+        prefix: &str,
+        v: &toml::Value,
+        out: &mut std::collections::BTreeMap<String, toml::Value>,
+    ) {
         match v {
             toml::Value::Table(t) => {
                 for (k, child) in t {
-                    let key = if prefix.is_empty() { k.clone() } else { format!("{}.{}", prefix, k) };
+                    let key = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{}.{}", prefix, k)
+                    };
                     walk(&key, child, out);
                 }
             }
@@ -450,7 +468,10 @@ mod tests {
     fn defaults_are_safe_and_valid() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.server.bind, "127.0.0.1", "écoute locale par défaut");
-        assert!(!cfg.simulation.enabled, "pas de simulation dans une installation");
+        assert!(
+            !cfg.simulation.enabled,
+            "pas de simulation dans une installation"
+        );
         assert!(!cfg.safety.safe_mode);
         assert!(!has_errors(&cfg.validate()), "{:?}", cfg.validate());
         assert!(AppConfig::portable_default().simulation.enabled);
@@ -465,9 +486,24 @@ mod tests {
         cfg.security.session_ttl_hours = 0;
         cfg.paths.data_dir = "relatif/data".into();
         cfg.database.file = "../evasion.db".into();
-        let fields: Vec<String> = cfg.validate().into_iter().filter(|i| i.severity == Severity::Error).map(|i| i.field).collect();
-        for f in ["server.bind", "server.port", "logging.level", "security.session_ttl_hours", "paths.data_dir", "database.file"] {
-            assert!(fields.iter().any(|x| x == f), "erreur attendue sur {f} : {fields:?}");
+        let fields: Vec<String> = cfg
+            .validate()
+            .into_iter()
+            .filter(|i| i.severity == Severity::Error)
+            .map(|i| i.field)
+            .collect();
+        for f in [
+            "server.bind",
+            "server.port",
+            "logging.level",
+            "security.session_ttl_hours",
+            "paths.data_dir",
+            "database.file",
+        ] {
+            assert!(
+                fields.iter().any(|x| x == f),
+                "erreur attendue sur {f} : {fields:?}"
+            );
         }
     }
 
@@ -477,14 +513,19 @@ mod tests {
         cfg.server.bind = "0.0.0.0".into();
         let issues = cfg.validate();
         assert!(!has_errors(&issues));
-        assert!(issues.iter().any(|i| i.field == "server.bind" && i.severity == Severity::Warning));
+        assert!(issues
+            .iter()
+            .any(|i| i.field == "server.bind" && i.severity == Severity::Warning));
     }
 
     #[test]
     fn port_conflict_with_embedded_plc() {
         let mut cfg = AppConfig::portable_default();
         cfg.simulation.modbus_slave_port = cfg.server.port;
-        assert!(cfg.validate().iter().any(|i| i.field == "simulation.modbus_slave_port"));
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|i| i.field == "simulation.modbus_slave_port"));
     }
 
     #[test]
@@ -494,7 +535,10 @@ mod tests {
         assert_eq!(a.fingerprint(), b.fingerprint());
         b.server.port = 8080;
         b.logging.level = "debug".into();
-        assert_eq!(a.changed_fields(&b), vec!["logging.level".to_string(), "server.port".to_string()]);
+        assert_eq!(
+            a.changed_fields(&b),
+            vec!["logging.level".to_string(), "server.port".to_string()]
+        );
         assert_ne!(a.fingerprint(), b.fingerprint());
     }
 }

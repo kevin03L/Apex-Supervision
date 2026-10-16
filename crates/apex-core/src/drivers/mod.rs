@@ -522,24 +522,54 @@ impl GtbSimulatorDriver {
         let (write_tx, write_rx) = mpsc::channel::<WriteCommand>(256);
         let internal_values = Arc::new(DashMap::new());
         internal_values.insert("GTB.CTA01.Temp_Ext".to_string(), TagValue::Float(13.5));
-        internal_values.insert("GTB.CTA01.Temp_Soufflage".to_string(), TagValue::Float(20.4));
+        internal_values.insert(
+            "GTB.CTA01.Temp_Soufflage".to_string(),
+            TagValue::Float(20.4),
+        );
         internal_values.insert("GTB.CTA01.Consigne_Temp".to_string(), TagValue::Float(21.5));
-        internal_values.insert("GTB.CTA01.Vanne_Chaud_Cmd".to_string(), TagValue::Float(48.0));
-        internal_values.insert("GTB.CTA01.Registre_AirNeuf".to_string(), TagValue::Float(65.0));
-        internal_values.insert("GTB.CTA01.Hygrometrie_Reprise".to_string(), TagValue::Float(51.2));
-        internal_values.insert("GTB.CTA01.Ventilateur_Marche".to_string(), TagValue::Bool(true));
+        internal_values.insert(
+            "GTB.CTA01.Vanne_Chaud_Cmd".to_string(),
+            TagValue::Float(48.0),
+        );
+        internal_values.insert(
+            "GTB.CTA01.Registre_AirNeuf".to_string(),
+            TagValue::Float(65.0),
+        );
+        internal_values.insert(
+            "GTB.CTA01.Hygrometrie_Reprise".to_string(),
+            TagValue::Float(51.2),
+        );
+        internal_values.insert(
+            "GTB.CTA01.Ventilateur_Marche".to_string(),
+            TagValue::Bool(true),
+        );
         internal_values.insert("GTB.CTA01.Defaut_Filtre".to_string(), TagValue::Bool(false));
         internal_values.insert(
             "IND.CHAUF.Temp_Depart_Chaudiere".to_string(),
             TagValue::Float(72.5),
         );
         internal_values.insert("IND.CHAUF.Pompe_P1_Etat".to_string(), TagValue::Bool(true));
-        internal_values.insert("IND.CHAUF.Pompe_P2_Secours".to_string(), TagValue::Bool(false));
-        internal_values.insert("IND.CHAUF.Pression_Reseau".to_string(), TagValue::Float(3.2));
-        internal_values.insert("IND.CHAUF.Debit_Primaire".to_string(), TagValue::Float(18.5));
+        internal_values.insert(
+            "IND.CHAUF.Pompe_P2_Secours".to_string(),
+            TagValue::Bool(false),
+        );
+        internal_values.insert(
+            "IND.CHAUF.Pression_Reseau".to_string(),
+            TagValue::Float(3.2),
+        );
+        internal_values.insert(
+            "IND.CHAUF.Debit_Primaire".to_string(),
+            TagValue::Float(18.5),
+        );
         internal_values.insert("IND.CHAUF.Niveau_Bache".to_string(), TagValue::Float(75.0));
-        internal_values.insert("NRJ.TGBT.Puissance_Active".to_string(), TagValue::Float(44.2));
-        internal_values.insert("NRJ.TGBT.Tension_Triphasee".to_string(), TagValue::Float(401.2));
+        internal_values.insert(
+            "NRJ.TGBT.Puissance_Active".to_string(),
+            TagValue::Float(44.2),
+        );
+        internal_values.insert(
+            "NRJ.TGBT.Tension_Triphasee".to_string(),
+            TagValue::Float(401.2),
+        );
         internal_values.insert("NRJ.TGBT.Cos_Phi".to_string(), TagValue::Float(0.94));
 
         // Restaure les dernières valeurs connues (consignes opérateur, états de commande)
@@ -1121,7 +1151,12 @@ fn decode_from_block(
     data: &BlockData,
 ) -> Result<TagValue, String> {
     let offset = (spec.address() - block_start) as usize;
-    let missing = || format!("Réponse Modbus trop courte pour l'adresse {}", spec.address());
+    let missing = || {
+        format!(
+            "Réponse Modbus trop courte pour l'adresse {}",
+            spec.address()
+        )
+    };
     match data {
         BlockData::Bits(bits) => bits
             .get(offset)
@@ -1181,7 +1216,11 @@ async fn poll_modbus_tags(
                 if warned.insert(format!("{}|{}", tag.id, tag.protocol_address)) {
                     warn!("Tag '{}' ignoré : {}", tag.id, e);
                 }
-                out.push((tag.id.clone(), fallback_value(tag.data_type), Quality::BadDisconnect));
+                out.push((
+                    tag.id.clone(),
+                    fallback_value(tag.data_type),
+                    Quality::BadDisconnect,
+                ));
             }
         }
     }
@@ -1217,7 +1256,11 @@ async fn poll_modbus_tags(
                 }
                 for &i in &block.members {
                     let tag = readable[i];
-                    out.push((tag.id.clone(), fallback_value(tag.data_type), Quality::BadDisconnect));
+                    out.push((
+                        tag.id.clone(),
+                        fallback_value(tag.data_type),
+                        Quality::BadDisconnect,
+                    ));
                 }
             }
         }
@@ -1234,10 +1277,7 @@ fn fallback_value(data_type: TagDataType) -> TagValue {
     }
 }
 
-async fn execute_modbus_write(
-    ctx: &mut client::Context,
-    cmd: &WriteCommand,
-) -> Result<(), String> {
+async fn execute_modbus_write(ctx: &mut client::Context, cmd: &WriteCommand) -> Result<(), String> {
     let spec = ModbusAddressSpec::parse(&cmd.protocol_address)?;
     match spec {
         ModbusAddressSpec::Coil(addr) => {
@@ -1275,10 +1315,7 @@ async fn execute_modbus_write(
     Ok(())
 }
 
-async fn publish_bad_disconnect_for_all(
-    tags: &[RegisteredTag],
-    core_tx: &mpsc::Sender<TagState>,
-) {
+async fn publish_bad_disconnect_for_all(tags: &[RegisteredTag], core_tx: &mpsc::Sender<TagState>) {
     for tag in tags {
         let fallback_val = fallback_value(tag.data_type);
         let _ = core_tx
@@ -1676,11 +1713,26 @@ mod tests {
 
     #[test]
     fn modbus_address_parsing() {
-        assert!(matches!(ModbusAddressSpec::parse("COIL:0"), Ok(ModbusAddressSpec::Coil(0))));
-        assert!(matches!(ModbusAddressSpec::parse("HR:10:INT16"), Ok(ModbusAddressSpec::HoldingInt16(10))));
-        assert!(matches!(ModbusAddressSpec::parse("HR:2:FLOAT32"), Ok(ModbusAddressSpec::HoldingFloat32(2))));
-        assert!(matches!(ModbusAddressSpec::parse(" IR:4:FLOAT32 "), Ok(ModbusAddressSpec::InputRegFloat32(4))));
-        assert!(matches!(ModbusAddressSpec::parse("HR:6:FLOAT32_SWAP"), Ok(ModbusAddressSpec::HoldingFloat32Swap(6))));
+        assert!(matches!(
+            ModbusAddressSpec::parse("COIL:0"),
+            Ok(ModbusAddressSpec::Coil(0))
+        ));
+        assert!(matches!(
+            ModbusAddressSpec::parse("HR:10:INT16"),
+            Ok(ModbusAddressSpec::HoldingInt16(10))
+        ));
+        assert!(matches!(
+            ModbusAddressSpec::parse("HR:2:FLOAT32"),
+            Ok(ModbusAddressSpec::HoldingFloat32(2))
+        ));
+        assert!(matches!(
+            ModbusAddressSpec::parse(" IR:4:FLOAT32 "),
+            Ok(ModbusAddressSpec::InputRegFloat32(4))
+        ));
+        assert!(matches!(
+            ModbusAddressSpec::parse("HR:6:FLOAT32_SWAP"),
+            Ok(ModbusAddressSpec::HoldingFloat32Swap(6))
+        ));
         assert!(ModbusAddressSpec::parse("HR:70000").is_err());
         assert!(ModbusAddressSpec::parse("XX:1").is_err());
     }
@@ -1697,17 +1749,33 @@ mod tests {
         assert!(decode_registers_f32_be(&[1], false).is_err());
     }
     fn specs(addrs: &[&str]) -> Vec<ModbusAddressSpec> {
-        addrs.iter().map(|a| ModbusAddressSpec::parse(a).unwrap()).collect()
+        addrs
+            .iter()
+            .map(|a| ModbusAddressSpec::parse(a).unwrap())
+            .collect()
     }
 
     #[test]
     fn block_planning_groups_groupe_froid_tags() {
         // Les 6 tags du groupe froid MODBUS_GF01 : 2 trames au lieu de 6
-        let s = specs(&["COIL:0", "COIL:1", "HR:0:FLOAT32", "HR:2:FLOAT32", "HR:4:FLOAT32", "HR:10:INT16"]);
+        let s = specs(&[
+            "COIL:0",
+            "COIL:1",
+            "HR:0:FLOAT32",
+            "HR:2:FLOAT32",
+            "HR:4:FLOAT32",
+            "HR:10:INT16",
+        ]);
         let blocks = plan_read_blocks(&s);
         assert_eq!(blocks.len(), 2);
-        assert_eq!((blocks[0].area, blocks[0].start, blocks[0].count), (RegisterArea::Coils, 0, 2));
-        assert_eq!((blocks[1].area, blocks[1].start, blocks[1].count), (RegisterArea::HoldingRegisters, 0, 11));
+        assert_eq!(
+            (blocks[0].area, blocks[0].start, blocks[0].count),
+            (RegisterArea::Coils, 0, 2)
+        );
+        assert_eq!(
+            (blocks[1].area, blocks[1].start, blocks[1].count),
+            (RegisterArea::HoldingRegisters, 0, 11)
+        );
         assert_eq!(blocks[1].members.len(), 4);
     }
 
@@ -1715,7 +1783,11 @@ mod tests {
     fn block_planning_splits_on_gap_area_and_size() {
         let s = specs(&["HR:0", "HR:50", "IR:0", "HR:1"]);
         let blocks = plan_read_blocks(&s);
-        assert_eq!(blocks.len(), 3, "écart > 8 et zones différentes : blocs séparés");
+        assert_eq!(
+            blocks.len(),
+            3,
+            "écart > 8 et zones différentes : blocs séparés"
+        );
         // Limite de 125 registres par requête
         let many: Vec<String> = (0..130).map(|i| format!("HR:{}", i)).collect();
         let refs: Vec<&str> = many.iter().map(|s| s.as_str()).collect();
@@ -1736,6 +1808,9 @@ mod tests {
         assert_eq!(d("HR:13:INT32").unwrap(), TagValue::Int(0x0001_0002));
         assert!(d("HR:14:FLOAT32").is_err(), "registre hors réponse");
         let bits = BlockData::Bits(vec![true, false]);
-        assert_eq!(decode_from_block(&ModbusAddressSpec::Coil(1), 0, &bits).unwrap(), TagValue::Bool(false));
+        assert_eq!(
+            decode_from_block(&ModbusAddressSpec::Coil(1), 0, &bits).unwrap(),
+            TagValue::Bool(false)
+        );
     }
 }

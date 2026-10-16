@@ -117,7 +117,10 @@ impl Layout {
         if file == system.config_file {
             return system;
         }
-        let base = file.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+        let base = file
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
         let mut layout = Self::portable(&base);
         layout.config_file = file;
         layout
@@ -247,7 +250,9 @@ mod tests {
 
     #[test]
     fn explicit_config_file_drives_layout() {
-        let file = std::env::temp_dir().join("apex-explicit").join("site-a.toml");
+        let file = std::env::temp_dir()
+            .join("apex-explicit")
+            .join("site-a.toml");
         let l = Layout::for_config_file(&file);
         assert_eq!(l.config_file, file);
         assert_eq!(l.data_dir, file.parent().unwrap().join("data"));

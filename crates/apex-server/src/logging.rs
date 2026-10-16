@@ -19,7 +19,8 @@ pub fn init(cfg: &AppConfig, log_dir: &Path) -> Result<Option<WorkerGuard>, Stri
     let level = cfg.logging.level.trim();
     // `apex_scada` : nom du binaire du serveur (crate apex-server)
     let directive = format!("apex_scada={level},apex_core={level},apex_config={level},warn");
-    let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&directive));
+    let filter =
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&directive));
 
     let stdout_layer = fmt::layer()
         .with_ansi(std::io::stdout().is_terminal())
@@ -33,15 +34,24 @@ pub fn init(cfg: &AppConfig, log_dir: &Path) -> Result<Option<WorkerGuard>, Stri
         return Ok(None);
     }
 
-    std::fs::create_dir_all(log_dir)
-        .map_err(|e| format!("création du dossier de journaux « {} » impossible : {e}", log_dir.display()))?;
+    std::fs::create_dir_all(log_dir).map_err(|e| {
+        format!(
+            "création du dossier de journaux « {} » impossible : {e}",
+            log_dir.display()
+        )
+    })?;
     let appender = rolling::Builder::new()
         .rotation(rolling::Rotation::DAILY)
         .filename_prefix(LOG_FILE_PREFIX)
         .filename_suffix("log")
         .max_log_files(cfg.logging.retention_files as usize)
         .build(log_dir)
-        .map_err(|e| format!("ouverture des journaux dans « {} » impossible : {e}", log_dir.display()))?;
+        .map_err(|e| {
+            format!(
+                "ouverture des journaux dans « {} » impossible : {e}",
+                log_dir.display()
+            )
+        })?;
     let (writer, guard) = tracing_appender::non_blocking(appender);
     let file_layer = fmt::layer()
         .with_ansi(false)

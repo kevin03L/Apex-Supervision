@@ -46,7 +46,11 @@ fn parse_args() -> Result<Option<app::Args>, String> {
             }
             "--wizard" => args.wizard = true,
             "-V" | "--version" => {
-                println!("{} (administration) {}", version::PRODUCT_NAME, version::full_version());
+                println!(
+                    "{} (administration) {}",
+                    version::PRODUCT_NAME,
+                    version::full_version()
+                );
                 return Ok(None);
             }
             "-h" | "--help" => {
@@ -90,7 +94,10 @@ fn main() {
              En attendant, le moteur s'administre en ligne de commande : apex-scada config show | config check | service status"
         );
         eprintln!("{message}");
-        let _ = std::fs::write(std::env::temp_dir().join("apex-scada-admin-erreur.txt"), &message);
+        let _ = std::fs::write(
+            std::env::temp_dir().join("apex-scada-admin-erreur.txt"),
+            &message,
+        );
         std::process::exit(1);
     }
 }

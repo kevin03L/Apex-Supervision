@@ -183,7 +183,11 @@ pub fn sanitize_svg(input: &str) -> String {
                 .map(|m| m.as_str().trim())
                 .unwrap_or("");
             let lower = value.to_ascii_lowercase();
-            if value.starts_with('#') || lower.starts_with("data:image/png") || lower.starts_with("data:image/jpeg") || lower.starts_with("data:image/gif") {
+            if value.starts_with('#')
+                || lower.starts_with("data:image/png")
+                || lower.starts_with("data:image/jpeg")
+                || lower.starts_with("data:image/gif")
+            {
                 format!(" {}=\"{}\"", attr, value.replace('"', "&quot;"))
             } else {
                 format!(" {}=\"#\"", attr)
@@ -252,7 +256,10 @@ mod tests {
         let clean = sanitize_svg(dirty);
         let lower = clean.to_lowercase();
         assert!(!lower.contains("script"));
-        assert!(!lower.contains("<style"), "un <style> SVG s'appliquerait à toute la page");
+        assert!(
+            !lower.contains("<style"),
+            "un <style> SVG s'appliquerait à toute la page"
+        );
         assert!(!lower.contains("onload"));
         assert!(!lower.contains("onclick"));
         assert!(!lower.contains("foreignobject"));

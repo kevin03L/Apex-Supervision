@@ -28,7 +28,9 @@ impl std::fmt::Display for LockError {
             LockError::AlreadyRunning { pid } => write!(
                 f,
                 "une autre instance d'Apex Supervision utilise déjà ce répertoire de données{}",
-                pid.as_deref().map(|p| format!(" (PID {p})")).unwrap_or_default()
+                pid.as_deref()
+                    .map(|p| format!(" (PID {p})"))
+                    .unwrap_or_default()
             ),
             LockError::Io(e) => write!(f, "verrou d'instance impossible : {e}"),
         }
@@ -70,11 +72,16 @@ mod tests {
         let path = std::env::temp_dir().join(format!("apex-lock-test-{}.lock", std::process::id()));
         let first = InstanceLock::acquire(&path).expect("premier verrou");
         match InstanceLock::acquire(&path) {
-            Err(LockError::AlreadyRunning { pid }) => assert_eq!(pid, Some(std::process::id().to_string())),
+            Err(LockError::AlreadyRunning { pid }) => {
+                assert_eq!(pid, Some(std::process::id().to_string()))
+            }
             other => panic!("refus attendu, obtenu {other:?}"),
         }
         drop(first);
-        assert!(InstanceLock::acquire(&path).is_ok(), "libéré à la fermeture");
+        assert!(
+            InstanceLock::acquire(&path).is_ok(),
+            "libéré à la fermeture"
+        );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("pid"));
     }

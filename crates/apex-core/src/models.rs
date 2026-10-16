@@ -134,18 +134,24 @@ impl TagValue {
             (TagValue::Text(s), TagDataType::Text) => Ok(TagValue::Text(s.clone())),
             (TagValue::Int(i), TagDataType::Float) => Ok(TagValue::Float(*i as f64)),
             (TagValue::Float(f), TagDataType::Int) => Ok(TagValue::Int(f.round() as i64)),
-            (other, TagDataType::Bool) => other.as_bool().map(TagValue::Bool).ok_or_else(|| {
-                ScadaError::TypeMismatch {
-                    expected: "Bool".to_string(),
-                    actual: format!("{:?}", other),
-                }
-            }),
-            (other, TagDataType::Float) => other.as_f64().map(TagValue::Float).ok_or_else(|| {
-                ScadaError::TypeMismatch {
-                    expected: "Float".to_string(),
-                    actual: format!("{:?}", other),
-                }
-            }),
+            (other, TagDataType::Bool) => {
+                other
+                    .as_bool()
+                    .map(TagValue::Bool)
+                    .ok_or_else(|| ScadaError::TypeMismatch {
+                        expected: "Bool".to_string(),
+                        actual: format!("{:?}", other),
+                    })
+            }
+            (other, TagDataType::Float) => {
+                other
+                    .as_f64()
+                    .map(TagValue::Float)
+                    .ok_or_else(|| ScadaError::TypeMismatch {
+                        expected: "Float".to_string(),
+                        actual: format!("{:?}", other),
+                    })
+            }
             (other, TagDataType::Int) => other
                 .as_f64()
                 .map(|v| TagValue::Int(v.round() as i64))
@@ -342,7 +348,10 @@ impl ProtocolType {
     pub fn is_simulated(&self) -> bool {
         matches!(
             self,
-            ProtocolType::Simulator | ProtocolType::OpcUa | ProtocolType::BacnetIp | ProtocolType::SiemensS7
+            ProtocolType::Simulator
+                | ProtocolType::OpcUa
+                | ProtocolType::BacnetIp
+                | ProtocolType::SiemensS7
         )
     }
 }
@@ -983,12 +992,33 @@ mod tests {
 
     #[test]
     fn tag_value_coercion() {
-        assert_eq!(TagValue::Int(3).coerce_to(TagDataType::Float).unwrap(), TagValue::Float(3.0));
-        assert_eq!(TagValue::Float(2.6).coerce_to(TagDataType::Int).unwrap(), TagValue::Int(3));
-        assert_eq!(TagValue::Text("marche".into()).coerce_to(TagDataType::Bool).unwrap(), TagValue::Bool(true));
-        assert_eq!(TagValue::Text(" 21.5 ".into()).coerce_to(TagDataType::Float).unwrap(), TagValue::Float(21.5));
-        assert_eq!(TagValue::Bool(true).coerce_to(TagDataType::Text).unwrap(), TagValue::Text("true".into()));
-        assert!(TagValue::Text("abc".into()).coerce_to(TagDataType::Float).is_err());
+        assert_eq!(
+            TagValue::Int(3).coerce_to(TagDataType::Float).unwrap(),
+            TagValue::Float(3.0)
+        );
+        assert_eq!(
+            TagValue::Float(2.6).coerce_to(TagDataType::Int).unwrap(),
+            TagValue::Int(3)
+        );
+        assert_eq!(
+            TagValue::Text("marche".into())
+                .coerce_to(TagDataType::Bool)
+                .unwrap(),
+            TagValue::Bool(true)
+        );
+        assert_eq!(
+            TagValue::Text(" 21.5 ".into())
+                .coerce_to(TagDataType::Float)
+                .unwrap(),
+            TagValue::Float(21.5)
+        );
+        assert_eq!(
+            TagValue::Bool(true).coerce_to(TagDataType::Text).unwrap(),
+            TagValue::Text("true".into())
+        );
+        assert!(TagValue::Text("abc".into())
+            .coerce_to(TagDataType::Float)
+            .is_err());
     }
 
     #[test]
@@ -1055,7 +1085,8 @@ mod tests {
         let d = SystemSettings::default();
         assert!(d.alarm_shelving_enabled);
         assert_eq!(d.alarm_shelve_max_minutes, 480);
-        let partial: SystemSettings = serde_json::from_str(r#"{"alarm_shelving_enabled":false}"#).unwrap();
+        let partial: SystemSettings =
+            serde_json::from_str(r#"{"alarm_shelving_enabled":false}"#).unwrap();
         assert!(!partial.alarm_shelving_enabled);
         assert_eq!(partial.alarm_shelve_max_minutes, 480);
     }

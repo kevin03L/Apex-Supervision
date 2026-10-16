@@ -134,13 +134,19 @@ mod tests {
     #[test]
     fn default_is_run() {
         assert_eq!(p("").unwrap().command, Command::Run);
-        assert_eq!(p("run --config /etc/x.toml").unwrap().config, Some(PathBuf::from("/etc/x.toml")));
+        assert_eq!(
+            p("run --config /etc/x.toml").unwrap().config,
+            Some(PathBuf::from("/etc/x.toml"))
+        );
     }
 
     #[test]
     fn config_init_options() {
-        let cli = p("config init --portable --port 8080 --bind 0.0.0.0 --simulation --force").unwrap();
-        let Command::ConfigInit(o) = cli.command else { panic!() };
+        let cli =
+            p("config init --portable --port 8080 --bind 0.0.0.0 --simulation --force").unwrap();
+        let Command::ConfigInit(o) = cli.command else {
+            panic!()
+        };
         assert!(o.portable && o.simulation && o.force);
         assert_eq!(o.port, Some(8080));
         assert_eq!(o.bind.as_deref(), Some("0.0.0.0"));
@@ -148,7 +154,9 @@ mod tests {
 
     #[test]
     fn errors_are_explicit() {
-        assert!(p("config init --port abc").unwrap_err().contains("port invalide"));
+        assert!(p("config init --port abc")
+            .unwrap_err()
+            .contains("port invalide"));
         assert!(p("--inconnue").unwrap_err().contains("option inconnue"));
         assert!(p("migrate-legacy").unwrap_err().contains("--from"));
         assert!(p("demarrer").unwrap_err().contains("commande inconnue"));
@@ -156,7 +164,10 @@ mod tests {
 
     #[test]
     fn service_and_version() {
-        assert_eq!(p("service install").unwrap().command, Command::Service("install".into()));
+        assert_eq!(
+            p("service install").unwrap().command,
+            Command::Service("install".into())
+        );
         assert_eq!(p("--version").unwrap().command, Command::Version);
     }
 }

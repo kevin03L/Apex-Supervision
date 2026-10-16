@@ -59,7 +59,14 @@ enum Tab {
 }
 
 impl Tab {
-    const ALL: [Tab; 6] = [Tab::Status, Tab::Config, Tab::Logs, Tab::Diagnostics, Tab::Backups, Tab::About];
+    const ALL: [Tab; 6] = [
+        Tab::Status,
+        Tab::Config,
+        Tab::Logs,
+        Tab::Diagnostics,
+        Tab::Backups,
+        Tab::About,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -82,7 +89,10 @@ struct Snapshot {
 
 enum Msg {
     Status(Box<Snapshot>),
-    Done { what: String, result: Result<String, String> },
+    Done {
+        what: String,
+        result: Result<String, String>,
+    },
     Diag(Vec<diag::Check>),
     EngineVersion(Result<String, String>),
 }
@@ -174,7 +184,6 @@ struct BackupsView {
     preview: Option<Result<(String, Vec<String>), String>>,
 }
 
-
 pub struct AdminApp {
     args: Args,
     /// Emplacements résolus (fichier de configuration, sauvegardes).
@@ -249,7 +258,11 @@ impl AdminApp {
                 format!(
                     "Aucune installation détectée (« {} » absent) : installez Apex Supervision, \
                      ou administrez une instance portable avec --config <fichier>.",
-                    app.base_layout.config_file.parent().map(|d| d.display().to_string()).unwrap_or_default()
+                    app.base_layout
+                        .config_file
+                        .parent()
+                        .map(|d| d.display().to_string())
+                        .unwrap_or_default()
                 ),
             );
             app.alert = app.notices.last().cloned();
@@ -257,7 +270,9 @@ impl AdminApp {
             app.open_wizard();
         }
         let ctx = cc.egui_ctx.clone();
-        app.spawn(&ctx, || Msg::EngineVersion(control::engine_version(&control::engine_path())));
+        app.spawn(&ctx, || {
+            Msg::EngineVersion(control::engine_version(&control::engine_path()))
+        });
         app.refresh_backups();
         app
     }
@@ -265,7 +280,11 @@ impl AdminApp {
     /// Instance installée (mode portable, ou dossier de configuration système présent).
     fn installed(&self) -> bool {
         self.base_layout.kind == LayoutKind::Portable
-            || self.base_layout.config_file.parent().is_some_and(|d| d.is_dir())
+            || self
+                .base_layout
+                .config_file
+                .parent()
+                .is_some_and(|d| d.is_dir())
     }
 
     // ------------------------------------------------------------------------
@@ -281,13 +300,21 @@ impl AdminApp {
         });
     }
 
-    fn action(&mut self, ctx: &egui::Context, what: &str, job: impl FnOnce() -> Result<String, String> + Send + 'static) {
+    fn action(
+        &mut self,
+        ctx: &egui::Context,
+        what: &str,
+        job: impl FnOnce() -> Result<String, String> + Send + 'static,
+    ) {
         if self.busy.is_some() {
             return;
         }
         self.busy = Some(what.to_string());
         let what = what.to_string();
-        self.spawn(ctx, move || Msg::Done { what, result: job() });
+        self.spawn(ctx, move || Msg::Done {
+            what,
+            result: job(),
+        });
     }
 
     fn probe(&mut self, ctx: &egui::Context) {
@@ -318,7 +345,9 @@ impl AdminApp {
                 Msg::Done { what, result } => {
                     self.busy = None;
                     match result {
-                        Ok(text) => self.notify(Kind::Ok, if text.is_empty() { what } else { text }),
+                        Ok(text) => {
+                            self.notify(Kind::Ok, if text.is_empty() { what } else { text })
+                        }
                         Err(e) => self.notify(Kind::Error, format!("{what} : {e}")),
                     }
                     // État rafraîchi tout de suite après une action
@@ -336,7 +365,13 @@ impl AdminApp {
         if due {
             self.probe(ctx);
         }
-        if self.tab == Tab::Logs && self.logs.follow && self.logs.loaded_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
+        if self.tab == Tab::Logs
+            && self.logs.follow
+            && self
+                .logs
+                .loaded_at
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(2))
+        {
             self.reload_logs();
         }
     }
@@ -382,7 +417,10 @@ impl AdminApp {
     /// Le moteur est-il piloté par le service système (sinon : lancement manuel) ?
     fn uses_service(&self) -> bool {
         self.layout.kind == LayoutKind::System
-            && self.snapshot.as_ref().is_some_and(|s| s.service.state.is_installed())
+            && self
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.service.state.is_installed())
     }
 
     fn health(&self) -> Option<&Health> {
@@ -398,12 +436,19 @@ impl AdminApp {
 
     fn start_engine(&mut self, ctx: &egui::Context) {
         if self.uses_service() {
-            self.action(ctx, "Démarrage du service", || control::service_action("start"));
+            self.action(ctx, "Démarrage du service", || {
+                control::service_action("start")
+            });
         } else if !self.disk.exists {
-            self.notify(Kind::Warn, "Enregistrez d'abord la configuration (onglet Configuration ou assistant).");
+            self.notify(
+                Kind::Warn,
+                "Enregistrez d'abord la configuration (onglet Configuration ou assistant).",
+            );
         } else {
             let file = self.base_layout.config_file.clone();
-            self.action(ctx, "Démarrage du moteur", move || control::start_manual(&file));
+            self.action(ctx, "Démarrage du moteur", move || {
+                control::start_manual(&file)
+            });
         }
     }
 
@@ -421,7 +466,9 @@ impl AdminApp {
 
     fn restart_engine(&mut self, ctx: &egui::Context) {
         if self.uses_service() {
-            self.action(ctx, "Redémarrage du service", || control::service_action("restart"));
+            self.action(ctx, "Redémarrage du service", || {
+                control::service_action("restart")
+            });
         } else {
             let (layout, cfg) = (self.layout.clone(), self.disk.config.clone());
             let file = self.base_layout.config_file.clone();
@@ -453,9 +500,15 @@ impl AdminApp {
                 let changed = before.changed_fields(config);
                 self.reload_disk();
                 self.refresh_backups();
-                let mut text = format!("Configuration enregistrée dans « {} ».", self.base_layout.config_file.display());
+                let mut text = format!(
+                    "Configuration enregistrée dans « {} ».",
+                    self.base_layout.config_file.display()
+                );
                 if let Some(b) = report.backup {
-                    text.push_str(&format!(" Version précédente sauvegardée ({}).", file_label(&b)));
+                    text.push_str(&format!(
+                        " Version précédente sauvegardée ({}).",
+                        file_label(&b)
+                    ));
                 }
                 self.notify(Kind::Ok, text);
                 if self.engine_state() == EngineState::Online && !changed.is_empty() {
@@ -476,7 +529,8 @@ impl AdminApp {
 
     fn open_wizard(&mut self) {
         let service = control::service_query();
-        let has_service = self.base_layout.kind == LayoutKind::System && service.state.is_installed();
+        let has_service =
+            self.base_layout.kind == LayoutKind::System && service.state.is_installed();
         let legacy = diag::find_legacy_db(&self.layout).filter(|_| {
             // Proposée seulement si la base actuelle n'existe pas encore
             !self.layout.database_file(&self.disk.config).exists()
@@ -494,7 +548,8 @@ impl AdminApp {
         }
         self.wizard = None;
         self.tab = Tab::Status;
-        let uses_service = self.base_layout.kind == LayoutKind::System && control::service_query().state.is_installed();
+        let uses_service = self.base_layout.kind == LayoutKind::System
+            && control::service_query().state.is_installed();
         let layout = self.layout.clone();
         let cfg = self.disk.config.clone();
         let file = self.base_layout.config_file.clone();
@@ -513,7 +568,14 @@ impl AdminApp {
                 }
                 let src = src.display().to_string();
                 let file_s = file.display().to_string();
-                let args = ["migrate-legacy", "--from", &src, "--force", "--config", &file_s];
+                let args = [
+                    "migrate-legacy",
+                    "--from",
+                    &src,
+                    "--force",
+                    "--config",
+                    &file_s,
+                ];
                 let (code, out) = if privileged {
                     control::run_privileged(&control::engine_path(), &args)?
                 } else {
@@ -523,14 +585,25 @@ impl AdminApp {
                     return Err(format!(
                         "reprise des données impossible (code {code} : {}){}",
                         apex_config::exit::describe(code),
-                        if out.is_empty() { String::new() } else { format!("\n{out}") }
+                        if out.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n{out}")
+                        }
                     ));
                 }
                 done.push("Données de la version antérieure copiées.".into());
             }
             if let Some(auto) = plan.autostart {
                 control::service_action(if auto { "enable" } else { "disable" })?;
-                done.push(if auto { "Démarrage automatique activé." } else { "Démarrage automatique désactivé." }.into());
+                done.push(
+                    if auto {
+                        "Démarrage automatique activé."
+                    } else {
+                        "Démarrage automatique désactivé."
+                    }
+                    .into(),
+                );
             }
             if plan.start_engine {
                 if uses_service {
@@ -562,7 +635,9 @@ impl AdminApp {
                     .as_ref()
                     .is_some_and(|s| files.iter().any(|f| &f.path == s));
                 if !still_there {
-                    self.logs.selected = logs::latest_daily(&files).or(files.first()).map(|f| f.path.clone());
+                    self.logs.selected = logs::latest_daily(&files)
+                        .or(files.first())
+                        .map(|f| f.path.clone());
                 }
                 self.logs.files = files;
             }
@@ -637,7 +712,10 @@ impl AdminApp {
                 self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            Err(e) => self.notify(Kind::Error, format!("Relance en administrateur impossible : {e}")),
+            Err(e) => self.notify(
+                Kind::Error,
+                format!("Relance en administrateur impossible : {e}"),
+            ),
         }
         #[cfg(not(windows))]
         {
@@ -698,7 +776,8 @@ impl eframe::App for AdminApp {
 impl AdminApp {
     fn handle_close(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|i| i.viewport().close_requested());
-        if requested && !self.allow_close && self.edit != self.disk.config && self.wizard.is_none() {
+        if requested && !self.allow_close && self.edit != self.disk.config && self.wizard.is_none()
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm = Some(Confirm::QuitUnsaved);
         }
@@ -731,20 +810,28 @@ impl AdminApp {
                             self.relaunch_elevated(ctx, wizard);
                         }
                         ui.label(RichText::new("Lecture seule").color(form::warn_color(ui)))
-                            .on_hover_text("Votre compte ne peut pas modifier le fichier de configuration.");
+                            .on_hover_text(
+                                "Votre compte ne peut pas modifier le fichier de configuration.",
+                            );
                     } else if self.elevated {
                         ui.label(RichText::new("Administrateur").weak());
                     }
                 });
             });
             ui.horizontal(|ui| {
-                ui.label(RichText::new(match self.base_layout.kind {
-                    LayoutKind::System => "Installation système",
-                    LayoutKind::Portable => "Mode portable",
-                }).small());
+                ui.label(
+                    RichText::new(match self.base_layout.kind {
+                        LayoutKind::System => "Installation système",
+                        LayoutKind::Portable => "Mode portable",
+                    })
+                    .small(),
+                );
                 form::truncated(
                     ui,
-                    RichText::new(self.base_layout.config_file.display().to_string()).small().monospace().weak(),
+                    RichText::new(self.base_layout.config_file.display().to_string())
+                        .small()
+                        .monospace()
+                        .weak(),
                 );
             });
             ui.add_space(4.0);
@@ -752,26 +839,29 @@ impl AdminApp {
     }
 
     fn navigation(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::left("nav").resizable(false).exact_size(180.0).show(ui, |ui| {
-            ui.add_space(8.0);
-            for tab in Tab::ALL {
-                let mut text = RichText::new(tab.label());
-                if tab == Tab::Config && self.edit != self.disk.config {
-                    text = RichText::new(format!("{} •", tab.label()));
-                }
-                if ui.selectable_label(self.tab == tab, text).clicked() {
-                    self.tab = tab;
-                    if tab == Tab::Logs {
-                        self.reload_logs();
+        egui::Panel::left("nav")
+            .resizable(false)
+            .exact_size(180.0)
+            .show(ui, |ui| {
+                ui.add_space(8.0);
+                for tab in Tab::ALL {
+                    let mut text = RichText::new(tab.label());
+                    if tab == Tab::Config && self.edit != self.disk.config {
+                        text = RichText::new(format!("{} •", tab.label()));
+                    }
+                    if ui.selectable_label(self.tab == tab, text).clicked() {
+                        self.tab = tab;
+                        if tab == Tab::Logs {
+                            self.reload_logs();
+                        }
                     }
                 }
-            }
-            ui.add_space(16.0);
-            ui.separator();
-            if ui.button("Assistant de configuration…").clicked() {
-                self.open_wizard();
-            }
-        });
+                ui.add_space(16.0);
+                ui.separator();
+                if ui.button("Assistant de configuration…").clicked() {
+                    self.open_wizard();
+                }
+            });
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -784,14 +874,25 @@ impl AdminApp {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(s) = &self.snapshot {
-                        ui.label(RichText::new(format!("État actualisé il y a {} s", s.at.elapsed().as_secs())).small().weak());
+                        ui.label(
+                            RichText::new(format!(
+                                "État actualisé il y a {} s",
+                                s.at.elapsed().as_secs()
+                            ))
+                            .small()
+                            .weak(),
+                        );
                     }
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         if let Some(n) = self.notices.last() {
                             let color = kind_color(ui, n.kind);
                             // Première ligne seulement : le détail est dans le bandeau ou l'historique
                             let first = n.text.lines().next().unwrap_or_default();
-                            form::truncated(ui, RichText::new(format!("{} {first}", n.at.format("%H:%M:%S"))).color(color));
+                            form::truncated(
+                                ui,
+                                RichText::new(format!("{} {first}", n.at.format("%H:%M:%S")))
+                                    .color(color),
+                            );
                         }
                     });
                 });
@@ -1027,7 +1128,8 @@ impl AdminApp {
         let issues = self.edit.validate();
         let changed = self.disk.config.changed_fields(&self.edit);
         let has_errors = apex_config::has_errors(&issues);
-        let needs_write = !self.disk.exists || self.disk.migrated_from.is_some() || self.disk.error.is_some();
+        let needs_write =
+            !self.disk.exists || self.disk.migrated_from.is_some() || self.disk.error.is_some();
 
         if let Some(e) = &self.disk.error {
             form::banner(
@@ -1069,24 +1171,42 @@ impl AdminApp {
 
         ui.horizontal(|ui| {
             let can_save = self.writable && !has_errors && (!changed.is_empty() || needs_write);
-            if ui.add_enabled(can_save, egui::Button::new(RichText::new("Enregistrer").strong())).clicked() {
+            if ui
+                .add_enabled(
+                    can_save,
+                    egui::Button::new(RichText::new("Enregistrer").strong()),
+                )
+                .clicked()
+            {
                 let cfg = self.edit.clone();
                 self.save(&cfg);
             }
-            if ui.add_enabled(!changed.is_empty(), egui::Button::new("Annuler les modifications")).clicked() {
+            if ui
+                .add_enabled(
+                    !changed.is_empty(),
+                    egui::Button::new("Annuler les modifications"),
+                )
+                .clicked()
+            {
                 self.edit = self.disk.config.clone();
             }
             if ui.button("Recharger depuis le disque").clicked() {
                 self.reload_disk();
                 self.notify(Kind::Info, "Configuration rechargée depuis le disque.");
             }
-            if self.engine_state() == EngineState::Online && self.restart_needed() && ui.button("Redémarrer le moteur…").clicked() {
+            if self.engine_state() == EngineState::Online
+                && self.restart_needed()
+                && ui.button("Redémarrer le moteur…").clicked()
+            {
                 self.confirm = Some(Confirm::Restart);
             }
             let _ = ctx;
         });
         if has_errors {
-            ui.colored_label(form::error_color(ui), "Corrigez les erreurs signalées pour pouvoir enregistrer.");
+            ui.colored_label(
+                form::error_color(ui),
+                "Corrigez les erreurs signalées pour pouvoir enregistrer.",
+            );
         } else if !changed.is_empty() {
             form::hint(
                 ui,
@@ -1096,7 +1216,10 @@ impl AdminApp {
                 ),
             );
         } else {
-            form::hint(ui, "Tous les paramètres de ce fichier sont lus au démarrage du moteur.");
+            form::hint(
+                ui,
+                "Tous les paramètres de ce fichier sont lus au démarrage du moteur.",
+            );
         }
         ui.add_space(6.0);
 
@@ -1251,7 +1374,10 @@ impl AdminApp {
                 .show_ui(ui, |ui| {
                     for f in &self.logs.files {
                         let label = format!("{} ({})", f.name, diag::human_size(f.size));
-                        if ui.selectable_label(self.logs.selected.as_ref() == Some(&f.path), label).clicked() {
+                        if ui
+                            .selectable_label(self.logs.selected.as_ref() == Some(&f.path), label)
+                            .clicked()
+                        {
                             self.logs.selected = Some(f.path.clone());
                             reload = true;
                         }
@@ -1260,7 +1386,10 @@ impl AdminApp {
             if ui.button("Actualiser").clicked() {
                 reload = true;
             }
-            if ui.checkbox(&mut self.logs.problems_only, "Erreurs et avertissements").changed() {
+            if ui
+                .checkbox(&mut self.logs.problems_only, "Erreurs et avertissements")
+                .changed()
+            {
                 reload = true;
             }
             ui.checkbox(&mut self.logs.follow, "Suivre");
@@ -1301,7 +1430,10 @@ impl AdminApp {
     fn diag_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!self.diag_running, egui::Button::new(RichText::new("Lancer les diagnostics").strong()))
+                .add_enabled(
+                    !self.diag_running,
+                    egui::Button::new(RichText::new("Lancer les diagnostics").strong()),
+                )
                 .clicked()
             {
                 self.diag_running = true;
@@ -1315,7 +1447,10 @@ impl AdminApp {
             if let Some(checks) = &self.diag {
                 if ui.button("Copier le rapport").clicked() {
                     ui.ctx().copy_text(diag::report(checks, &self.base_layout));
-                    self.notify(Kind::Info, "Rapport de diagnostic copié dans le presse-papiers.");
+                    self.notify(
+                        Kind::Info,
+                        "Rapport de diagnostic copié dans le presse-papiers.",
+                    );
                 }
             }
         });
@@ -1327,24 +1462,26 @@ impl AdminApp {
         let Some(checks) = &self.diag else {
             return;
         };
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for c in checks {
-                let color = match c.level {
-                    diag::Level::Ok => form::ok_color(ui),
-                    diag::Level::Info => form::info_color(ui),
-                    diag::Level::Warning => form::warn_color(ui),
-                    diag::Level::Error => form::error_color(ui),
-                };
-                ui.horizontal_top(|ui| {
-                    form::dot(ui, color);
-                    ui.vertical(|ui| {
-                        ui.strong(&c.title);
-                        ui.label(&c.detail);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for c in checks {
+                    let color = match c.level {
+                        diag::Level::Ok => form::ok_color(ui),
+                        diag::Level::Info => form::info_color(ui),
+                        diag::Level::Warning => form::warn_color(ui),
+                        diag::Level::Error => form::error_color(ui),
+                    };
+                    ui.horizontal_top(|ui| {
+                        form::dot(ui, color);
+                        ui.vertical(|ui| {
+                            ui.strong(&c.title);
+                            ui.label(&c.detail);
+                        });
                     });
-                });
-                ui.add_space(4.0);
-            }
-        });
+                    ui.add_space(4.0);
+                }
+            });
     }
 
     // ------------------------------------------------------------------------
@@ -1366,31 +1503,44 @@ impl AdminApp {
             return;
         }
         let mut select = None;
-        egui::Panel::left("backup_list").resizable(true).default_size(240.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                for b in &self.backups.list {
-                    if ui
-                        .selectable_label(self.backups.selected.as_ref() == Some(b), file_label(b))
-                        .clicked()
-                    {
-                        select = Some(b.clone());
-                    }
-                }
+        egui::Panel::left("backup_list")
+            .resizable(true)
+            .default_size(240.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for b in &self.backups.list {
+                            if ui
+                                .selectable_label(
+                                    self.backups.selected.as_ref() == Some(b),
+                                    file_label(b),
+                                )
+                                .clicked()
+                            {
+                                select = Some(b.clone());
+                            }
+                        }
+                    });
             });
-        });
         if let Some(b) = select {
             self.select_backup(b);
         }
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let Some(sel) = self.backups.selected.clone() else {
-                ui.label("Sélectionnez une sauvegarde pour la comparer à la configuration actuelle.");
+                ui.label(
+                    "Sélectionnez une sauvegarde pour la comparer à la configuration actuelle.",
+                );
                 return;
             };
             match &self.backups.preview {
                 Some(Ok((raw, diff))) => {
                     ui.horizontal(|ui| {
                         if ui
-                            .add_enabled(self.writable, egui::Button::new("Restaurer cette version…"))
+                            .add_enabled(
+                                self.writable,
+                                egui::Button::new("Restaurer cette version…"),
+                            )
                             .clicked()
                         {
                             self.confirm = Some(Confirm::Restore(sel.clone()));
@@ -1402,17 +1552,22 @@ impl AdminApp {
                         }
                     });
                     ui.add_space(4.0);
-                    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                        let mut text = raw.as_str();
-                        ui.add(
-                            egui::TextEdit::multiline(&mut text)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY),
-                        );
-                    });
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let mut text = raw.as_str();
+                            ui.add(
+                                egui::TextEdit::multiline(&mut text)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
                 }
                 Some(Err(e)) => {
-                    ui.colored_label(form::error_color(ui), format!("Sauvegarde inutilisable : {e}"));
+                    ui.colored_label(
+                        form::error_color(ui),
+                        format!("Sauvegarde inutilisable : {e}"),
+                    );
                 }
                 None => {}
             }
@@ -1425,7 +1580,10 @@ impl AdminApp {
 
     fn about_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading(version::PRODUCT_NAME);
-        ui.label(format!("Utilitaire d'administration {}", version::full_version()));
+        ui.label(format!(
+            "Utilitaire d'administration {}",
+            version::full_version()
+        ));
         if version::is_prerelease() {
             ui.colored_label(
                 form::warn_color(ui),
@@ -1435,31 +1593,42 @@ impl AdminApp {
         ui.add_space(10.0);
         let engine = control::engine_path();
         let mut open: Option<PathBuf> = None;
-        egui::Grid::new("about").num_columns(3).spacing([16.0, 6.0]).striped(true).show(ui, |ui| {
-            ui.label("Moteur");
-            ui.monospace(engine.display().to_string());
-            ui.label(match &self.engine_version {
-                Some(Ok(v)) => v.clone(),
-                Some(Err(e)) => e.clone(),
-                None => "…".into(),
-            });
-            ui.end_row();
-            let rows: [(&str, PathBuf); 5] = [
-                ("Configuration", self.base_layout.config_file.parent().map(|p| p.to_path_buf()).unwrap_or_default()),
-                ("Sauvegardes", self.base_layout.backup_dir.clone()),
-                ("Données", self.layout.data_dir.clone()),
-                ("Journaux", self.layout.log_dir.clone()),
-                ("IHM web", self.layout.web_dir(&self.disk.config)),
-            ];
-            for (label, path) in rows {
-                ui.label(label);
-                ui.monospace(path.display().to_string());
-                if ui.small_button("Ouvrir").clicked() {
-                    open = Some(path);
-                }
+        egui::Grid::new("about")
+            .num_columns(3)
+            .spacing([16.0, 6.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label("Moteur");
+                ui.monospace(engine.display().to_string());
+                ui.label(match &self.engine_version {
+                    Some(Ok(v)) => v.clone(),
+                    Some(Err(e)) => e.clone(),
+                    None => "…".into(),
+                });
                 ui.end_row();
-            }
-        });
+                let rows: [(&str, PathBuf); 5] = [
+                    (
+                        "Configuration",
+                        self.base_layout
+                            .config_file
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_default(),
+                    ),
+                    ("Sauvegardes", self.base_layout.backup_dir.clone()),
+                    ("Données", self.layout.data_dir.clone()),
+                    ("Journaux", self.layout.log_dir.clone()),
+                    ("IHM web", self.layout.web_dir(&self.disk.config)),
+                ];
+                for (label, path) in rows {
+                    ui.label(label);
+                    ui.monospace(path.display().to_string());
+                    if ui.small_button("Ouvrir").clicked() {
+                        open = Some(path);
+                    }
+                    ui.end_row();
+                }
+            });
         if let Some(p) = open {
             if let Err(e) = control::open_path(&p) {
                 self.notify(Kind::Error, e);
@@ -1468,7 +1637,10 @@ impl AdminApp {
         ui.add_space(10.0);
         ui.collapsing("Historique des messages", |ui| {
             for n in self.notices.iter().rev() {
-                ui.colored_label(kind_color(ui, n.kind), format!("{} {}", n.at.format("%H:%M:%S"), n.text));
+                ui.colored_label(
+                    kind_color(ui, n.kind),
+                    format!("{} {}", n.at.format("%H:%M:%S"), n.text),
+                );
             }
         });
     }
@@ -1594,7 +1766,11 @@ fn stop_manual_and_wait(layout: &Layout, cfg: &AppConfig) -> Result<(), String> 
 
 /// Le verrou d'instance est-il libre ? (fichier absent ou verrouillable)
 fn instance_lock_free(layout: &Layout) -> bool {
-    match std::fs::OpenOptions::new().read(true).write(true).open(layout.lock_file()) {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(layout.lock_file())
+    {
         Ok(f) => f.try_lock().is_ok(),
         Err(e) => e.kind() == std::io::ErrorKind::NotFound,
     }
@@ -1629,7 +1805,10 @@ fn run_engine(args: &[&str]) -> Result<(i32, String), String> {
         String::from_utf8_lossy(&out.stdout).trim(),
         String::from_utf8_lossy(&out.stderr).trim()
     );
-    Ok((out.status.code().unwrap_or(apex_config::exit::FAILURE), text))
+    Ok((
+        out.status.code().unwrap_or(apex_config::exit::FAILURE),
+        text,
+    ))
 }
 
 fn explain_save_error(e: &ConfigError) -> String {
@@ -1653,8 +1832,13 @@ fn explain_save_error(e: &ConfigError) -> String {
 
 /// Date lisible d'une sauvegarde `apex-scada-AAAAMMJJ-HHMMSS.mmm.toml`.
 fn file_label(path: &std::path::Path) -> String {
-    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let stamp = name.trim_start_matches("apex-scada-").trim_end_matches(".toml");
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let stamp = name
+        .trim_start_matches("apex-scada-")
+        .trim_end_matches(".toml");
     match chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d-%H%M%S%.3f") {
         Ok(dt) => dt.format("%d/%m/%Y à %H:%M:%S").to_string(),
         Err(_) => name,
@@ -1696,7 +1880,10 @@ mod tests {
             config: Some(PathBuf::from(r"C:\Sites\A b.toml")),
             wizard: false,
         };
-        assert_eq!(a.to_vec(true), vec!["--config", r"C:\Sites\A b.toml", "--wizard"]);
+        assert_eq!(
+            a.to_vec(true),
+            vec!["--config", r"C:\Sites\A b.toml", "--wizard"]
+        );
         assert!(Args::default().to_vec(false).is_empty());
     }
 

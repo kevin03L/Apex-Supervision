@@ -208,9 +208,9 @@ async fn evaluate_flows_for_tag(
 ) {
     // Seuls les flux qui lisent ce tag sont copiés (évite de cloner tous les graphes à chaque COV)
     let listens_to_tag = |f: &FlowGraph| {
-        f.nodes.iter().any(|n| {
-            matches!(&n.kind, FlowNodeKind::TagInput { tag_id } if tag_id == &tag_state.tag_id)
-        })
+        f.nodes.iter().any(
+            |n| matches!(&n.kind, FlowNodeKind::TagInput { tag_id } if tag_id == &tag_state.tag_id),
+        )
     };
     let active_flows: Vec<FlowGraph> = core
         .flows
@@ -622,18 +622,60 @@ mod tests {
     #[test]
     fn threshold_with_hysteresis() {
         // Seuil bas 1.8 bar avec hystérésis 0.3 : bascule à 1.79, retombe seulement au-dessus de 2.1
-        assert!(!eval_threshold(1.85, ComparisonOperator::Lt, 1.8, 0.3, false));
-        assert!(eval_threshold(1.79, ComparisonOperator::Lt, 1.8, 0.3, false));
+        assert!(!eval_threshold(
+            1.85,
+            ComparisonOperator::Lt,
+            1.8,
+            0.3,
+            false
+        ));
+        assert!(eval_threshold(
+            1.79,
+            ComparisonOperator::Lt,
+            1.8,
+            0.3,
+            false
+        ));
         assert!(eval_threshold(2.0, ComparisonOperator::Lt, 1.8, 0.3, true));
-        assert!(!eval_threshold(2.15, ComparisonOperator::Lt, 1.8, 0.3, true));
+        assert!(!eval_threshold(
+            2.15,
+            ComparisonOperator::Lt,
+            1.8,
+            0.3,
+            true
+        ));
     }
 
     #[test]
     fn threshold_greater_and_equality() {
-        assert!(eval_threshold(25.1, ComparisonOperator::Gt, 25.0, 0.5, false));
-        assert!(eval_threshold(24.7, ComparisonOperator::Gt, 25.0, 0.5, true));
-        assert!(!eval_threshold(24.4, ComparisonOperator::Gt, 25.0, 0.5, true));
+        assert!(eval_threshold(
+            25.1,
+            ComparisonOperator::Gt,
+            25.0,
+            0.5,
+            false
+        ));
+        assert!(eval_threshold(
+            24.7,
+            ComparisonOperator::Gt,
+            25.0,
+            0.5,
+            true
+        ));
+        assert!(!eval_threshold(
+            24.4,
+            ComparisonOperator::Gt,
+            25.0,
+            0.5,
+            true
+        ));
         assert!(eval_threshold(3.0, ComparisonOperator::Eq, 3.0, 0.0, false));
-        assert!(eval_threshold(3.1, ComparisonOperator::Neq, 3.0, 0.0, false));
+        assert!(eval_threshold(
+            3.1,
+            ComparisonOperator::Neq,
+            3.0,
+            0.0,
+            false
+        ));
     }
 }
