@@ -50,8 +50,28 @@ cargo test --workspace
 |---|---|---|
 | `apex-config` | 18 | Valeurs par défaut sûres, validation par champ, migrations (v0 → v1, format trop récent), écriture atomique, sauvegarde et restauration, conflit, verrou, erreurs lisibles, chemins système et portables |
 | `apex-core` | 37 | Moteur : alarmes, bande morte, mise en sommeil, historique, sécurité, compatibilité des données |
-| `apex-server` | 5 | Ligne de commande, instance unique |
+| `apex-server` | 5 + 9 | Unitaires : ligne de commande, instance unique. Intégration (boîte noire, tableau ci-dessous) |
 | `apex-admin` | 16 | Client HTTP (réponses simples et découpées, serveur injoignable), journaux, diagnostics, formulaires, verrou d'instance, libellés |
+
+**Tests d'intégration du serveur** (`crates/apex-server/tests/boite_noire.rs`, outillage dans `tests/common/mod.rs`). Chaque test lance le binaire `apex-scada` compilé (`CARGO_BIN_EXE_apex-scada`) :
+- dans un dossier neuf et unique sous `target/tmp/apex-it/`, en mode portable, avec un fichier `--config` écrit par le test ;
+- avec la simulation et le **mode sûr** actifs, sur des ports libres choisis dynamiquement (jamais 3000 ni 5502), le dossier de test comme dossier courant et un environnement nettoyé (`RUST_LOG`, `APEX_SCADA_CONFIG`, `SCADA_*`).
+
+Le dialogue passe uniquement par HTTP et WebSocket, avec un client minimal écrit sur `std::net` : **aucune dépendance ajoutée**. `serde_json` est déjà une dépendance du serveur, et la poignée de main WebSocket est vérifiée avec la clé d'exemple de la RFC 6455, ce qui évite d'avoir à implémenter SHA-1. Des gardes `Drop` tuent le processus puis suppriment le dossier, même quand une assertion échoue. Dans ce cas, les journaux du moteur sont recopiés sur la sortie d'erreur du test.
+
+| Test | Vérifie |
+|---|---|
+| `health_est_public_et_detaille_en_boucle_locale` | `GET /api/health` sans jeton ; en boucle locale, `runtime` (PID, mode `manual`, mode sûr, simulation, fichier de configuration, empreinte), `started_at` et `total_drivers` ; en-têtes de sécurité et `Cache-Control: no-store` |
+| `authentification_jeton_obligatoire` | 401 sans jeton ou avec un jeton inconnu ; échec de connexion (même message pour un mot de passe faux et un compte inconnu) ; connexion `admin`/`admin123`, rôle `Admin`, hachage non publié ; `X-Scada-Token` et `Authorization: Bearer` ; jeton invalidé par la déconnexion |
+| `rbac_visualisation_refuse_les_actions_admin` | Compte `visu` : lecture autorisée ; 403 sur `POST /api/system/shutdown`, sur la création d'utilisateur, sur `GET /api/users` et sur une consigne ; le serveur reste en marche et l'utilisateur n'est pas créé |
+| `mode_sur_refuse_les_consignes_vers_un_driver_reel` | Consigne sur `MODBUS.GF01.Consigne_Eau_Glacee` (driver `MODBUS_GF01`) : 403 « Mode sûr », y compris avec le jeton de contrôle local ; une consigne sur un driver simulé (`GTB.CTA01.Consigne_Temp`) reste acceptée ; avertissement présent dans le journal |
+| `websocket_exige_un_jeton_puis_diffuse_les_donnees` | `/ws/realtime` : 401 sans jeton ou avec un jeton inconnu ; avec jeton, `InitialSnapshot` puis au moins un `TagUpdateBatch` ; profil Visualisation : instantané sans drivers, flux ni plannings |
+| `code_3_configuration_invalide` | Port 0, TOML illisible, paramètre inconnu, format trop récent : code 3, sans base créée, et erreur consignée dans `logs/apex-scada-startup.log` |
+| `code_4_deuxieme_instance_meme_dossier` | Deuxième processus sur le même dossier : code 4, et la première instance continue de répondre |
+| `code_5_port_occupe` | Port web tenu par le test : code 5, détecté avant l'ouverture de la base |
+| `arret_propre_par_jeton_de_controle_local` | `POST /api/system/shutdown` : 401 sans jeton ; avec `run/control.token`, processus terminé avec le code 0, « arrêté proprement » dans la sortie et dans le journal fichier, jeton supprimé, port libéré |
+
+Ce que ces tests ne couvrent pas : l'absence des détails `runtime` pour un client distant (il faudrait une seconde interface réseau), le service Windows et l'unité systemd, ainsi que tout équipement réel.
 
 **Scénarios manuels**, sur une instance portable dans un dossier temporaire et sur un autre port, **jamais sur une base d'exploitation** :
 
