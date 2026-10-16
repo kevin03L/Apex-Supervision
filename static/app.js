@@ -1,5 +1,5 @@
 // ============================================================================
-// RustScadaFlow v1.3 — Moteur Applicatif Frontend (RBAC, Sécurité & Performance)
+// Apex Supervision — Moteur Applicatif Frontend (RBAC, Sécurité & Performance)
 // ============================================================================
 //
 // Règles de sécurité de ce fichier :
@@ -15,6 +15,8 @@ const WIDGET_TYPES = [
   'TankLevel', 'IndicatorLed', 'NumericDisplay', 'PipeSegment', 'CustomSvgSymbol'
 ];
 
+// Protocoles sans implémentation réelle (valeurs fictives) : signalés comme tels dans l'IHM
+const SIMULATED_PROTOCOLS = ['Simulator', 'OpcUa', 'BacnetIp', 'SiemensS7'];
 const WEEK_DAYS = [[1, 'Lun'], [2, 'Mar'], [3, 'Mer'], [4, 'Jeu'], [5, 'Ven'], [6, 'Sam'], [7, 'Dim']];
 
 const DEFAULT_SVG = '<svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="35" stroke="currentColor" stroke-width="3" fill="none"/></svg>';
@@ -299,13 +301,13 @@ async function toggleAcquisitionPause() {
 }
 
 async function confirmServerRestart() {
-  if (!confirm('Confirmer le REDÉMARRAGE du moteur RustScadaFlow ?\nLes drivers actifs seront réinitialisés à chaud (les drivers arrêtés volontairement restent arrêtés).')) {
+  if (!confirm('Confirmer le REDÉMARRAGE du moteur Apex Supervision ?\nLes drivers actifs seront réinitialisés à chaud (les drivers arrêtés volontairement restent arrêtés).')) {
     return;
   }
   const overlay = document.getElementById('powerOverlay');
   document.getElementById('powerOverlayIcon').textContent = '🔄';
   document.getElementById('powerOverlayTitle').style.color = '#38bdf8';
-  document.getElementById('powerOverlayTitle').textContent = 'Redémarrage de RustScadaFlow en cours...';
+  document.getElementById('powerOverlayTitle').textContent = 'Redémarrage de Apex Supervision en cours...';
   document.getElementById('powerOverlayMsg').textContent = 'Réinitialisation des drivers industriels actifs et rechargement des moteurs...';
   overlay.style.display = 'flex';
 
@@ -323,7 +325,7 @@ async function confirmServerRestart() {
 }
 
 async function confirmServerShutdown() {
-  if (!confirm('Confirmer la MISE HORS TENSION de l\'application RustScadaFlow ?\nTous les drivers industriels seront déconnectés proprement.')) {
+  if (!confirm('Confirmer la MISE HORS TENSION de l\'application Apex Supervision ?\nTous les drivers industriels seront déconnectés proprement.')) {
     return;
   }
   try {
@@ -338,7 +340,7 @@ function showPowerOffOverlay() {
   const overlay = document.getElementById('powerOverlay');
   document.getElementById('powerOverlayIcon').textContent = '⏻';
   document.getElementById('powerOverlayTitle').style.color = '#ef4444';
-  document.getElementById('powerOverlayTitle').textContent = 'Application RustScadaFlow Arrêtée (Hors Tension)';
+  document.getElementById('powerOverlayTitle').textContent = 'Application Apex Supervision Arrêtée (Hors Tension)';
   document.getElementById('powerOverlayMsg').innerHTML = `
     Tous les drivers industriels (Automate Modbus TCP, Simulateur GTB, MQTT) ont été arrêtés proprement.<br>
     L'acquisition temps réel est hors tension.<br><br>
@@ -354,7 +356,7 @@ async function powerOnFromStandby() {
   const overlay = document.getElementById('powerOverlay');
   document.getElementById('powerOverlayIcon').textContent = '⚡';
   document.getElementById('powerOverlayTitle').style.color = '#10b981';
-  document.getElementById('powerOverlayTitle').textContent = 'Démarrage de RustScadaFlow en cours...';
+  document.getElementById('powerOverlayTitle').textContent = 'Démarrage de Apex Supervision en cours...';
   document.getElementById('powerOverlayMsg').textContent = 'Remise sous tension des drivers industriels et synchronisation de la Tag Database...';
 
   try {
@@ -2141,6 +2143,9 @@ function renderDriversCardsOnly() {
             <b style="color:var(--accent);font-size:14px;">${esc(d.id)}</b>
             <span>${esc(d.name)}</span>
             ${statusBadge}
+            ${SIMULATED_PROTOCOLS.includes(d.protocol)
+              ? `<span class="badge-qual q-Uncertain" title="Aucune communication réelle : valeurs fictives (démonstration)">SIMULÉ</span>`
+              : ''}
             <span style="font-size:11px;color:#64748b;">${(d.tags || []).length} variable(s)</span>
           </div>
           <div style="font-size:11.5px;color:#94a3b8;margin-top:4px;">

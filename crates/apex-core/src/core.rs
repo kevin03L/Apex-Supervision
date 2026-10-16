@@ -1,6 +1,6 @@
 //! # Module `core` — Noyau Temps Réel (`ScadaCore`), Contrôle des Drivers, Alarmes, Planificateur & Audit
 //!
-//! Implémente l'ensemble des services centraux de **RustScadaFlow** :
+//! Implémente l'ensemble des services centraux de **Apex Supervision** :
 //! - Gestion temps réel des Tags (`DashMap`) + Filtrage COV + Mise à l'échelle linéaire.
 //! - Contrôle complet du cycle de vie des Drivers (`Start`, `Stop`, `Restart`, `Delete` via `AbortHandle`).
 //! - Pause / Reprise globale de l'acquisition.
@@ -26,7 +26,6 @@ use tokio::{
 use tracing::{error, info, warn};
 
 use crate::{
-    config::AppConfig,
     drivers::spawn_driver_task,
     flow_engine::FlowEngineRuntime,
     models::{
@@ -79,9 +78,40 @@ struct LoginFailure {
     last_at: DateTime<Utc>,
 }
 
+/// Options de fonctionnement du moteur, issues de la configuration de l'instance.
+#[derive(Debug, Clone)]
+pub struct EngineOptions {
+    /// Nom affiché de l'instance.
+    pub instance_name: String,
+    pub session_ttl_hours: u64,
+    pub history_retention_days: u32,
+    /// Mode sûr : aucune commande n'est envoyée aux équipements réels (Modbus TCP, MQTT).
+    pub safe_mode: bool,
+    /// Simulation : simulateur GTB, protocoles simulés (OPC-UA, BACnet/IP, S7), données de démo.
+    pub simulation_enabled: bool,
+    /// Port de l'automate Modbus embarqué (affiché dans l'état système).
+    pub modbus_slave_port: u16,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            instance_name: "Apex Supervision".to_string(),
+            session_ttl_hours: 12,
+            history_retention_days: 30,
+            safe_mode: false,
+            simulation_enabled: true,
+            modbus_slave_port: 5502,
+        }
+    }
+}
+
 pub struct ScadaCore {
     pub started_at: DateTime<Utc>,
     pub modbus_slave_port: u16,
+    pub instance_name: String,
+    pub safe_mode: bool,
+    pub simulation_enabled: bool,
     pub session_ttl_hours: u64,
     pub history_retention_days: u32,
     acquisition_paused: AtomicBool,
@@ -122,7 +152,7 @@ pub struct ScadaCore {
 }
 
 impl ScadaCore {
-    pub fn new(db_pool: Option<SqlitePool>, config: &AppConfig) -> Arc<Self> {
+    pub fn new(db_pool: Option<SqlitePool>, config: &EngineOptions) -> Arc<Self> {
         let (cov_tx, _) = broadcast::channel::<TagState>(4096);
         let (alarm_tx, _) = broadcast::channel::<Vec<AlarmInstance>>(512);
         let (driver_tx, _) = broadcast::channel::<Vec<DriverConfig>>(256);
@@ -135,6 +165,9 @@ impl ScadaCore {
         let core = Arc::new(Self {
             started_at: Utc::now(),
             modbus_slave_port: config.modbus_slave_port,
+            instance_name: config.instance_name.clone(),
+            safe_mode: config.safe_mode,
+            simulation_enabled: config.simulation_enabled,
             session_ttl_hours: config.session_ttl_hours,
             history_retention_days: config.history_retention_days,
             acquisition_paused: AtomicBool::new(false),
@@ -261,7 +294,7 @@ impl ScadaCore {
             .count();
 
         SystemStatus {
-            app_name: "RustScadaFlow Industrial Platform".to_string(),
+            app_name: self.instance_name.clone(),
             version: APP_VERSION.to_string(),
             pid: std::process::id(),
             started_at: self.started_at,
@@ -274,6 +307,8 @@ impl ScadaCore {
             active_alarms,
             cov_events_total: self.cov_counter.load(Ordering::Relaxed),
             modbus_slave_port: self.modbus_slave_port,
+            safe_mode: self.safe_mode,
+            simulation_enabled: self.simulation_enabled,
             history_dropped: self.history_dropped.load(Ordering::Relaxed),
             history_retention_days: self.history_retention_days,
             settings: self.get_settings(),
@@ -329,6 +364,17 @@ impl ScadaCore {
 
     /// Démarre la tâche d'acquisition et met à jour les statistiques de la configuration.
     async fn spawn_and_track(self: &Arc<Self>, config: &mut DriverConfig) -> Result<(), ScadaError> {
+        if config.protocol.is_simulated() && !self.simulation_enabled {
+            let err = format!(
+                "Protocole {:?} simulé : il ne fonctionne qu'avec la simulation active ([simulation] enabled = true)",
+                config.protocol
+            );
+            config.stats.running = false;
+            config.stats.connected = false;
+            config.stats.last_error = Some(err.clone());
+            warn!("Driver '{}' non démarré : {}", config.id, err);
+            return Err(ScadaError::DriverError(err));
+        }
         match spawn_driver_task(Arc::clone(self), config.clone()).await {
             Ok((abort_handle, writer_tx)) => {
                 self.driver_handles.insert(config.id.clone(), abort_handle);
@@ -598,6 +644,14 @@ impl ScadaCore {
         info!("Tous les drivers industriels ont été arrêtés proprement.");
     }
 
+    /// Arrêt du processus : suspend les automatismes (flux, planificateur) puis arrête les drivers,
+    /// pour qu'aucune commande ne parte vers un équipement en cours de déconnexion.
+    /// La suspension n'est pas journalisée ni persistée : elle ne survit pas au redémarrage.
+    pub fn shutdown(&self) {
+        self.acquisition_paused.store(true, Ordering::SeqCst);
+        self.stop_all_drivers();
+    }
+
     /// Met le moteur SCADA complet hors tension (arrêt de tous les drivers + pause acquisition) tout en gardant l'IHM disponible pour un rallumage à distance.
     pub fn power_off_all_systems(&self, actor: &str) {
         self.set_acquisition_paused(actor, true);
@@ -606,7 +660,7 @@ impl ScadaCore {
             actor,
             "SERVEUR",
             "POWER_OFF",
-            "RustScadaFlow",
+            "Apex Supervision",
             "Mise hors tension complète du moteur SCADA et arrêt des drivers",
         );
     }
@@ -631,7 +685,7 @@ impl ScadaCore {
             actor,
             "SERVEUR",
             "RESTART",
-            "RustScadaFlow",
+            "Apex Supervision",
             "Redémarrage du moteur SCADA et des drivers actifs",
         );
     }
@@ -1558,13 +1612,21 @@ impl ScadaCore {
         let driver_status = self
             .drivers_config
             .get(&tag_meta.module_source)
-            .map(|d| (d.stats.running, d.stats.connected));
+            .map(|d| (d.stats.running, d.stats.connected, d.protocol.is_simulated()));
 
-        let Some((running, connected)) = driver_status else {
+        let Some((running, connected, simulated)) = driver_status else {
             // Variable interne (mémoire) : pas d'équipement à piloter
             self.ingest_state(requested_state.clone(), false);
             return Ok(requested_state);
         };
+
+        // Mode sûr : aucune commande vers un équipement réel (les drivers simulés restent pilotables)
+        if self.safe_mode && !simulated {
+            return Err(ScadaError::Forbidden(format!(
+                "Mode sûr actif : aucune commande n'est envoyée à l'équipement '{}'",
+                tag_meta.module_source
+            )));
+        }
 
         if !running {
             return Err(ScadaError::DriverError(format!(
@@ -2400,7 +2462,12 @@ impl ScadaCore {
                 .await
                 .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
         }
-        for d in self.get_all_dashboards() {
+        // Données de démonstration (synoptiques, flux, plannings liés au simulateur) :
+        // uniquement si la simulation est active. Comptes et symboles sont toujours créés.
+        let demo_dashboards = if self.simulation_enabled { self.get_all_dashboards() } else { Vec::new() };
+        let demo_flows = if self.simulation_enabled { self.get_all_flows() } else { Vec::new() };
+        let demo_schedules = if self.simulation_enabled { self.get_all_schedules() } else { Vec::new() };
+        for d in demo_dashboards {
             let js = serde_json::to_string(&d).map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
             sqlx::query("INSERT OR IGNORE INTO dashboards (id, name, layout_json, updated_at) VALUES (?, ?, ?, ?)")
                 .bind(&d.id)
@@ -2411,7 +2478,7 @@ impl ScadaCore {
                 .await
                 .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
         }
-        for f in self.get_all_flows() {
+        for f in demo_flows {
             let js = serde_json::to_string(&f).map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
             sqlx::query("INSERT OR IGNORE INTO flows (id, name, flow_json, updated_at) VALUES (?, ?, ?, ?)")
                 .bind(&f.id)
@@ -2422,7 +2489,7 @@ impl ScadaCore {
                 .await
                 .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
         }
-        for s in self.get_all_schedules() {
+        for s in demo_schedules {
             let js = serde_json::to_string(&s).map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
             sqlx::query("INSERT OR IGNORE INTO schedules (id, rule_json, updated_at) VALUES (?, ?, ?)")
                 .bind(&s.id)

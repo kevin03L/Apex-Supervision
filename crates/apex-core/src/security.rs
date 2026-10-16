@@ -1,4 +1,4 @@
-//! # Module `security` — Primitives de sécurité de RustScadaFlow
+//! # Module `security` — Primitives de sécurité de Apex Supervision
 //!
 //! - Hachage des mots de passe **Argon2id** (format PHC `$argon2id$...`).
 //! - Génération de jetons de session aléatoires (256 bits, CSPRNG du système).

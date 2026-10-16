@@ -1,0 +1,34 @@
+[package]
+name = "apex-admin"
+description = "Apex Supervision — utilitaire desktop de configuration et d'administration"
+version.workspace = true
+edition.workspace = true
+# eframe 0.37 exige Rust 1.95 ; le moteur reste compatible 1.89.
+rust-version = "1.95"
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "apex-scada-admin"
+path = "src/main.rs"
+
+# Volontairement indépendant du moteur (ni SQLite, ni Tokio, ni Rhai) : l'utilitaire doit
+# fonctionner même si le moteur ne démarre pas.
+[dependencies]
+apex-config.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+# Rendu wgpu : DirectX 12 / Vulkan, avec repli logiciel (WARP) sur les postes sans GPU.
+eframe = { version = "0.37", default-features = false, features = [
+    "accesskit",
+    "clipboard",
+    "default_fonts",
+    "links",
+    "wgpu",
+    "wayland",
+    "x11",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"

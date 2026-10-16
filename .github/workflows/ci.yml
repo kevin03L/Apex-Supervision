@@ -1,0 +1,114 @@
+# Intégration continue d'Apex Supervision : Windows et Linux.
+#  - à chaque push / pull request : formatage, clippy (avertissements bloquants), tests ;
+#  - sur un tag v* (ou à la demande) : installateur Windows et paquet DEB, avec empreintes
+#    SHA-256 ; le paquet DEB est installé, démarré, interrogé puis purgé sur le runner.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Bibliothèques nécessaires à la compilation de l'utilitaire desktop (egui/winit) sous Linux
+  LINUX_GUI_DEPS: libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+jobs:
+  fmt:
+    name: Formatage
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  check:
+    name: Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Dépendances Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y $LINUX_GUI_DEPS
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  package-windows:
+    name: Installateur Windows
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: [fmt, check]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+      - name: Construction de l'installateur
+        shell: pwsh
+        run: ./packaging/windows/build-installer.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            dist/*.exe
+            dist/*.sha256
+
+  package-linux:
+    name: Paquet DEB (Ubuntu 22.04)
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: [fmt, check]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y $LINUX_GUI_DEPS
+      - run: cargo install cargo-deb --locked
+      - run: cargo build --release --locked -p apex-server -p apex-admin
+      - name: Paquet
+        run: |
+          cargo deb -p apex-server --no-build --output dist/
+          cd dist && for f in *.deb; do sha256sum "$f" > "$f.sha256"; done
+      - name: Test d'installation, de démarrage et de purge
+        run: |
+          set -eux
+          sudo apt-get install -y ./dist/*.deb
+          test -f /etc/apex-supervision/apex-scada.toml
+          getent passwd apex-scada
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:3000/api/health && break; sleep 1; done
+          curl -fsS http://127.0.0.1:3000/api/health | grep -q '"status":"ok"'
+          systemctl is-active apex-scada
+          sudo apex-scada config check --config /etc/apex-supervision/apex-scada.toml
+          # Arrêt propre (SIGTERM) consigné dans les journaux
+          sudo systemctl stop apex-scada
+          sudo journalctl -u apex-scada --no-pager | grep -q "arrêté proprement"
+          # remove conserve les données, purge les supprime
+          sudo apt-get remove -y apex-supervision
+          test -f /etc/apex-supervision/apex-scada.toml
+          sudo apt-get purge -y apex-supervision
+          test ! -e /etc/apex-supervision
+          test ! -e /var/lib/apex-supervision
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64-deb
+          path: |
+            dist/*.deb
+            dist/*.sha256

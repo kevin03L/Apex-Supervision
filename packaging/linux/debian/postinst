@@ -1,0 +1,37 @@
+#!/bin/sh
+# Installation / mise à jour du paquet apex-supervision.
+set -e
+
+CONF_DIR=/etc/apex-supervision
+CONF="$CONF_DIR/apex-scada.toml"
+
+case "$1" in
+    configure)
+        # Compte système dédié, sans shell ni connexion
+        if ! getent group apex-scada >/dev/null; then
+            addgroup --system apex-scada >/dev/null
+        fi
+        if ! getent passwd apex-scada >/dev/null; then
+            adduser --system --ingroup apex-scada --no-create-home \
+                --home /var/lib/apex-supervision --shell /usr/sbin/nologin \
+                --gecos "Apex Supervision" apex-scada >/dev/null
+        fi
+
+        # Configuration : modifiable par root et par le groupe apex-scada (utilitaire desktop)
+        install -d -m 2775 -o root -g apex-scada "$CONF_DIR"
+        install -d -m 2770 -o root -g apex-scada "$CONF_DIR/backups"
+        if [ ! -e "$CONF" ]; then
+            # Première installation : valeurs par défaut sûres (écoute locale, sans simulation)
+            /usr/bin/apex-scada config init --config "$CONF" >/dev/null
+        else
+            # Mise à jour : format courant, valeurs conservées, sauvegarde préalable
+            /usr/bin/apex-scada config migrate --config "$CONF" >/dev/null || true
+        fi
+        chgrp apex-scada "$CONF"
+        chmod 0660 "$CONF"
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

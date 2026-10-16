@@ -1,10 +1,22 @@
 # Build Rust
 /target/
 
+# Artefacts de distribution (installateurs, paquets, empreintes)
+/dist/
+
 # Base SQLite d'exploitation (configuration, historique, comptes) et fichiers WAL
 *.db
 *.db-wal
 *.db-shm
+*.db.bak-*
 
-# Jeton de contrôle local écrit par le serveur au démarrage (scripts .bat)
+# Instance portable de développement lancée depuis la racine du dépôt
+/apex-scada.toml
+/apex-scada.toml.lock
+/backups/
+/data/
+/logs/
+/run/
+
+# Jeton de contrôle local des versions 1.x
 .scada_local_token

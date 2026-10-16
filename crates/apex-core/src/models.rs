@@ -1,4 +1,4 @@
-//! # Module `models` — Modèles de Données Industriels Complets de RustScadaFlow
+//! # Module `models` — Modèles de données du moteur Apex Supervision
 //!
 //! Couvre l'intégralité des besoins d'une plateforme SCADA / GTB / GTC et Node-RED :
 //! - **Tag Database** : Métadonnées, mise à l'échelle linéaire, seuils d'alarmes analogiques (LL/L/H/HH) et TOR.
@@ -9,11 +9,6 @@
 //! - **Planificateur Horaire GTB (Scheduler)** : Programmation horaire hebdomadaire CVC.
 //! - **Traçabilité & Administration Système** : Journal d'audit (`AuditLogEntry`), sauvegarde/restauration JSON, Arrêt/Redémarrage.
 
-use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    Json,
-};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -61,26 +56,20 @@ pub enum ScadaError {
     Forbidden(String),
 }
 
-impl IntoResponse for ScadaError {
-    fn into_response(self) -> Response {
-        let status = match &self {
+impl ScadaError {
+    /// Code HTTP correspondant (le moteur ne dépend d'aucun framework web).
+    pub fn http_status(&self) -> u16 {
+        match self {
             ScadaError::TagNotFound(_)
             | ScadaError::DriverNotFound(_)
             | ScadaError::AlarmNotFound(_)
-            | ScadaError::FlowNotFound(_) => StatusCode::NOT_FOUND,
-            ScadaError::TagNotWritable(_) | ScadaError::Forbidden(_) => StatusCode::FORBIDDEN,
-            ScadaError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
-            ScadaError::TypeMismatch { .. } | ScadaError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            ScadaError::DriverError(_) | ScadaError::FlowError(_) => StatusCode::BAD_GATEWAY,
-            ScadaError::DatabaseError(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-
-        let body = serde_json::json!({
-            "error": true,
-            "message": self.to_string(),
-        });
-
-        (status, Json(body)).into_response()
+            | ScadaError::FlowNotFound(_) => 404,
+            ScadaError::TagNotWritable(_) | ScadaError::Forbidden(_) => 403,
+            ScadaError::Unauthorized(_) => 401,
+            ScadaError::TypeMismatch { .. } | ScadaError::BadRequest(_) => 400,
+            ScadaError::DriverError(_) | ScadaError::FlowError(_) => 502,
+            ScadaError::DatabaseError(_) => 500,
+        }
     }
 }
 
@@ -345,6 +334,17 @@ pub enum ProtocolType {
     OpcUa,
     SiemensS7,
     BacnetIp,
+}
+
+impl ProtocolType {
+    /// Protocoles sans implémentation réelle : simulateur GTB et drivers OPC-UA, BACnet/IP et
+    /// Siemens S7 (qui génèrent des valeurs fictives). Ils ne démarrent qu'avec la simulation active.
+    pub fn is_simulated(&self) -> bool {
+        matches!(
+            self,
+            ProtocolType::Simulator | ProtocolType::OpcUa | ProtocolType::BacnetIp | ProtocolType::SiemensS7
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -705,6 +705,12 @@ pub struct SystemStatus {
     pub active_alarms: usize,
     pub cov_events_total: u64,
     pub modbus_slave_port: u16,
+    /// Mode sûr : aucune commande vers les équipements réels.
+    #[serde(default)]
+    pub safe_mode: bool,
+    /// Simulation active (automate embarqué, simulateur, protocoles simulés).
+    #[serde(default)]
+    pub simulation_enabled: bool,
     /// Points d'historique écartés car la file d'écriture était saturée.
     #[serde(default)]
     pub history_dropped: u64,
@@ -715,7 +721,7 @@ pub struct SystemStatus {
     pub settings: SystemSettings,
 }
 
-/// Archive complète exportable/importable d'un projet RustScadaFlow.
+/// Archive complète exportable/importable d'un projet Apex Supervision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectBackupBundle {
     pub exported_at: DateTime<Utc>,

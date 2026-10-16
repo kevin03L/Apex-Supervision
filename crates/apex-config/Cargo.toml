@@ -1,0 +1,16 @@
+[package]
+name = "apex-config"
+description = "Configuration d'Apex Supervision : modèle versionné, validation, migrations, écriture atomique, sauvegardes et chemins système Windows/Linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Crate volontairement légère (sans Tokio ni SQLite) : partagée par le moteur et l'utilitaire desktop.
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+chrono.workspace = true

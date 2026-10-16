@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>RustScadaFlow v1.3 — Supervision SCADA/GTB, RBAC &amp; Studio Node-RED</title>
+  <title>Apex Supervision — Supervision GTC/SCADA</title>
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="/styles.css" />
 </head>
@@ -13,7 +13,7 @@
     <div id="powerOverlayIcon" style="font-size:48px;">🔄</div>
     <h2 id="powerOverlayTitle" style="font-size:24px;color:#38bdf8;">Redémarrage du serveur en cours...</h2>
     <p id="powerOverlayMsg" style="color:#94a3b8;max-width:520px;font-size:14px;">
-      Fermeture propre des drivers industriels et relance du moteur RustScadaFlow. Reconnexion automatique...
+      Fermeture propre des drivers industriels et relance du moteur Apex Supervision. Reconnexion automatique...
     </p>
   </div>
 
@@ -21,7 +21,7 @@
   <div id="authModal" class="auth-modal" style="display:none;">
     <div class="card-box" style="width:540px;max-width:100%;border:1px solid #38bdf8;box-shadow:0 20px 50px rgba(0,0,0,0.85);">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-        <h3 style="color:var(--accent);">🔐 Connexion RustScadaFlow</h3>
+        <h3 style="color:var(--accent);">🔐 Connexion Apex Supervision</h3>
         <button id="authModalClose" class="btn" onclick="closeAuthModal()">✕ Fermer</button>
       </div>
       <p id="authModalMsg" style="font-size:12px;color:#94a3b8;margin-bottom:12px;">
@@ -180,7 +180,7 @@
   <header>
     <div class="brand">
       <span class="brand-badge">SCADA / GTB</span>
-      <span>RustScadaFlow</span>
+      <span>Apex Supervision</span>
     </div>
 
     <nav class="nav-tabs" id="mainNavTabs">
@@ -214,7 +214,7 @@
       <!-- BOUTONS DE CONTRÔLE D'EXÉCUTION ET D'ALIMENTATION (RÉSERVÉS ADMIN) -->
       <div id="adminPowerControls" style="display:flex;gap:6px;">
         <button id="btnPauseAcq" class="btn" title="Mettre en pause ou reprendre l'acquisition" onclick="toggleAcquisitionPause()">⏸️ Pause</button>
-        <button class="btn" style="border-color:#f59e0b;color:#fbbf24;" title="Redémarrer complètement le serveur RustScadaFlow" onclick="confirmServerRestart()">🔄 Redémarrer</button>
+        <button class="btn" style="border-color:#f59e0b;color:#fbbf24;" title="Redémarrer complètement le serveur Apex Supervision" onclick="confirmServerRestart()">🔄 Redémarrer</button>
         <button class="btn btn-danger" title="Arrêter proprement les drivers et éteindre l'application" onclick="confirmServerShutdown()">⏻ Éteindre</button>
       </div>
     </div>
@@ -389,9 +389,12 @@
               <select id="drvProto">
                 <option value="ModbusTcp">Modbus TCP/IP</option>
                 <option value="Mqtt">MQTT (JSON / IoT)</option>
-                <option value="OpcUa">OPC-UA Server</option>
-                <option value="BacnetIp">BACnet/IP (GTB)</option>
-                <option value="SiemensS7">Siemens S7 Profinet</option>
+                <!-- Protocoles sans implémentation réelle : valeurs fictives, simulation requise -->
+                <optgroup label="Simulés (démonstration uniquement)">
+                  <option value="OpcUa">OPC-UA — SIMULÉ</option>
+                  <option value="BacnetIp">BACnet/IP — SIMULÉ</option>
+                  <option value="SiemensS7">Siemens S7 — SIMULÉ</option>
+                </optgroup>
               </select>
             </div>
             <div class="form-group">
@@ -516,7 +519,7 @@
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
             <div>
               <h3 style="color:var(--accent);">1. Paramètres Système, Sauvegarde Projet & Alimentation Serveur (Réservé Admin)</h3>
-              <p style="font-size:12px;color:#94a3b8;">Contrôle complet du processus RustScadaFlow, export/import d'archive JSON et maintenance SQLite.</p>
+              <p style="font-size:12px;color:#94a3b8;">Contrôle complet du processus Apex Supervision, export/import d'archive JSON et maintenance SQLite.</p>
             </div>
             <div style="display:flex;gap:8px;">
               <button class="btn" onclick="exportProjectBackup()">📦 Exporter Projet (.json)</button>

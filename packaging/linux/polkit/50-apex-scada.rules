@@ -1,0 +1,14 @@
+// Apex Supervision : les membres du groupe apex-scada peuvent démarrer, arrêter et redémarrer
+// le service apex-scada sans mot de passe administrateur (utilitaire desktop, systemctl).
+// L'activation au démarrage (enable / disable) reste soumise à authentification.
+// Nécessite polkit 0.106 ou plus récent (règles JavaScript) : Debian 12, Ubuntu 24.04.
+polkit.addRule(function (action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "apex-scada.service" &&
+        subject.isInGroup("apex-scada")) {
+        var verb = action.lookup("verb");
+        if (verb == "start" || verb == "stop" || verb == "restart") {
+            return polkit.Result.YES;
+        }
+    }
+});

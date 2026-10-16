@@ -1,0 +1,66 @@
+[package]
+name = "apex-server"
+description = "Apex Supervision — moteur GTC/SCADA et serveur web de supervision (service Windows / systemd)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+license = "LicenseRef-Proprietary"
+readme = "../../README.md"
+
+[[bin]]
+name = "apex-scada"
+path = "src/main.rs"
+
+[dependencies]
+apex-core.workspace = true
+apex-config.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+
+# Paquet Debian/Ubuntu (cargo deb -p apex-server) — voir packaging/linux/
+[package.metadata.deb]
+name = "apex-supervision"
+maintainer = "kevin03L <lerouxkevin043@gmail.com>"
+copyright = "2026, kevin03L"
+license-file = ["../../packaging/linux/copyright", "0"]
+extended-description = """\
+Supervision GTC/SCADA : base de variables temps réel, drivers Modbus TCP et MQTT, \
+alarmes ISA-18.2, synoptiques, flux logiques, planificateur horaire et historique. \
+Le moteur fonctionne comme service systemd ; l'IHM web est servie sur le port configuré."""
+section = "net"
+priority = "optional"
+depends = "$auto, adduser"
+recommends = "policykit-1 | polkitd"
+# Utilitaire desktop : bibliothèques graphiques chargées à l'exécution (absentes d'un serveur
+# sans interface, où seul le moteur est utilisé).
+suggests = "libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libvulkan1, mesa-vulkan-drivers"
+# La configuration n'est PAS un conffile : elle est générée par postinst (valeurs par défaut
+# du moteur installé) puis réécrite par l'utilitaire desktop ; apt purge la supprime.
+maintainer-scripts = "../../packaging/linux/debian/"
+# Les répertoires de données, journaux et exécution sont créés par l'unité (StateDirectory...)
+systemd-units = { unit-name = "apex-scada", unit-scripts = "../../packaging/linux/systemd/", enable = true, start = true, restart-after-upgrade = true }
+assets = [
+    ["target/release/apex-scada", "usr/bin/", "755"],
+    ["target/release/apex-scada-admin", "usr/bin/", "755"],
+    ["../../static/**/*", "usr/share/apex-supervision/web/", "644"],
+    ["../../bibliotheque_exemple_iso10628.json", "usr/share/apex-supervision/exemples/", "644"],
+    ["../../packaging/linux/polkit/50-apex-scada.rules", "usr/share/polkit-1/rules.d/", "644"],
+    ["../../packaging/linux/apex-scada-admin.desktop", "usr/share/applications/", "644"],
+    ["../../README.md", "usr/share/doc/apex-supervision/README.md", "644"],
+    ["../../docs/INSTALLATION.md", "usr/share/doc/apex-supervision/INSTALLATION.md", "644"],
+    ["../../docs/ADMINISTRATION.md", "usr/share/doc/apex-supervision/ADMINISTRATION.md", "644"],
+]

@@ -1,51 +1,51 @@
-[package]
-name = "rust-scada-flow"
-version = "1.3.0"
+[workspace]
+resolver = "2"
+members = [
+    "crates/apex-config",
+    "crates/apex-core",
+    "crates/apex-server",
+    "crates/apex-admin",
+]
+default-members = ["crates/apex-server", "crates/apex-admin"]
+
+# Version unique du produit : moteur, utilitaire desktop, installateurs et artefacts.
+# Convention : SemVer avec suffixe de phase (0.4.0-alpha.N → 0.5.0-beta.N → 1.0.0).
+[workspace.package]
+version = "0.4.0-alpha.1"
 edition = "2021"
-authors = ["Architecture SCADA / GTB"]
-description = "Plateforme hybride SCADA/GTB temps réel (esprit PcVue) et programmation par flux (esprit Node-RED) en Rust asynchrone"
+rust-version = "1.89"
+authors = ["kevin03L"]
+repository = "https://github.com/kevin03L/Apex-Supervision"
+publish = false
 
-[dependencies]
-# Runtime asynchrone
+[workspace.dependencies]
+apex-config = { path = "crates/apex-config" }
+apex-core = { path = "crates/apex-core" }
+
+# Runtime asynchrone & serveur web
 tokio = { version = "1.40", features = ["full"] }
-
-# Serveur Web REST & WebSockets temps réel
 axum = { version = "0.7", features = ["ws", "macros"] }
-tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.5", features = ["fs"] }
 
-# État concurrent en mémoire (Tag Database temps réel)
-dashmap = "6.1"
-
-# Sérialisation & Formats de données
+# Sérialisation
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.8"
 
-# Base de données embarquée (Configuration & Historian)
+# Base de données embarquée (configuration métier & historique)
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "chrono"] }
 
-# Moteur de script embarqué sécurisé pour les nœuds logiques personnalisés
-rhai = { version = "1.19", features = ["sync"] }
-
-# Protocoles industriels (MVP : Modbus TCP & MQTT)
-tokio-modbus = "0.14"
-rumqttc = "0.24"
-byteorder = "1.5"
-async-trait = "0.1"
-
-# Gestion des erreurs, dates, identifiants et journalisation
+# Utilitaires
 thiserror = "1.0"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.10", features = ["v4", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-futures-util = "0.3"
-rand = "0.8"
+tracing-appender = "0.2"
 
-# Sécurité : hachage des mots de passe (Argon2id) & assainissement des SVG importés
-argon2 = "0.5"
-regex = "1"
-
+[profile.release]
+lto = "thin"
+strip = "symbols"
 
 # Argon2 est très lent sans optimisation : on l'optimise même en build debug
 [profile.dev.package.argon2]

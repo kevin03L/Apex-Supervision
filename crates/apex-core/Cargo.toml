@@ -1,0 +1,35 @@
+[package]
+name = "apex-core"
+description = "Moteur GTC/SCADA d'Apex Supervision : tags, drivers industriels, alarmes ISA-18.2, flux logiques, planning et historique"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+# État concurrent en mémoire (Tag Database temps réel)
+dashmap = "6.1"
+
+# Moteur de script embarqué sécurisé pour les nœuds logiques personnalisés
+rhai = { version = "1.19", features = ["sync"] }
+
+# Protocoles industriels
+tokio-modbus = "0.14"
+rumqttc = "0.24"
+byteorder = "1.5"
+async-trait = "0.1"
+rand = "0.8"
+
+# Sécurité : hachage des mots de passe (Argon2id) & assainissement des SVG importés
+argon2 = "0.5"
+regex = "1"

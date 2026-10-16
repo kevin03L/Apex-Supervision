@@ -1,0 +1,21 @@
+#!/bin/sh
+# Désinstallation du paquet apex-supervision.
+#  - apt remove : programme supprimé ; configuration, données et journaux CONSERVÉS ;
+#  - apt purge  : suppression DÉFINITIVE de la configuration, des données et des journaux.
+set -e
+
+#DEBHELPER#
+
+case "$1" in
+    purge)
+        rm -rf /etc/apex-supervision /var/lib/apex-supervision /var/log/apex-supervision
+        if getent passwd apex-scada >/dev/null; then
+            deluser --system apex-scada >/dev/null 2>&1 || true
+        fi
+        if getent group apex-scada >/dev/null; then
+            delgroup --system apex-scada >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+exit 0
