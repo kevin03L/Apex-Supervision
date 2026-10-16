@@ -1,0 +1,24 @@
+{
+  "library_name": "Pack Externe ISO 10628 — Traitement d'Eau & Vapeur",
+  "category": "Traitement Eau & Vapeur",
+  "standard": "ISO 10628 / FUXA Pack",
+  "symbols": [
+    {
+      "id": "ext-iso-autoclave",
+      "name": "Autoclave Vapeur Sous Pression",
+      "category": "Traitement Eau & Vapeur",
+      "standard": "ISO 10628",
+      "animate_rotation": false,
+      "svg_content": "<svg viewBox=\"0 0 100 100\" width=\"84\" height=\"84\"><rect x=\"22\" y=\"16\" width=\"56\" height=\"68\" rx=\"16\" fill=\"#0b1120\" stroke=\"currentColor\" stroke-width=\"3.5\"/><line x1=\"22\" y1=\"34\" x2=\"78\" y2=\"34\" stroke=\"currentColor\" stroke-width=\"2.5\"/><text x=\"50\" y=\"58\" text-anchor=\"middle\" fill=\"currentColor\" font-size=\"12\" font-weight=\"bold\">VAPEUR</text></svg>"
+    },
+    {
+      "id": "ext-iso-centrifuge",
+      "name": "Centrifugeuse Décanteuse",
+      "category": "Traitement Eau & Vapeur",
+      "standard": "ISO 10628",
+      "animate_rotation": true,
+      "svg_content": "<svg viewBox=\"0 0 100 100\" width=\"84\" height=\"84\"><circle cx=\"50\" cy=\"50\" r=\"36\" fill=\"#0b1120\" stroke=\"currentColor\" stroke-width=\"3.5\"/><g class=\"sym-rotatable\" style=\"transform-origin:50px 50px;\"><polygon points=\"50,20 76,65 24,65\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"3\"/><circle cx=\"50\" cy=\"50\" r=\"6\" fill=\"currentColor\"/></g></svg>"
+    }
+  ]
+}
+

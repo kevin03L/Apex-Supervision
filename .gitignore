@@ -1,0 +1,10 @@
+# Build Rust
+/target/
+
+# Base SQLite d'exploitation (configuration, historique, comptes) et fichiers WAL
+*.db
+*.db-wal
+*.db-shm
+
+# Jeton de contrôle local écrit par le serveur au démarrage (scripts .bat)
+.scada_local_token

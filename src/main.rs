@@ -1,0 +1,1274 @@
+//! # `main` — Serveur Industriel RustScadaFlow avec Contrôle d'Exécution (Shutdown / Restart / Audit)
+//!
+//! Fonctionnalités serveur :
+//! - Démarre l'automate Modbus TCP Esclave embarqué (`127.0.0.1:5502` par défaut).
+//! - Démarre le noyau temps réel `ScadaCore` puis les drivers persistés en base
+//!   (simulateur GTB `SIM_GTB_01` et maître Modbus TCP `MODBUS_GF01` au premier lancement).
+//! - Protège toute l'API et le WebSocket par session authentifiée (RBAC Admin / Superviseur / Visualisation).
+//! - Gère l'extinction propre (`POST /api/system/shutdown`) et le redémarrage du moteur (`POST /api/system/restart`).
+//!
+//! Configuration par variables d'environnement : voir le module [`config`].
+
+pub mod config;
+pub mod core;
+pub mod drivers;
+pub mod flow_engine;
+pub mod models;
+pub mod security;
+
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    process::Command,
+    str::FromStr,
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
+
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        ConnectInfo, Path, Query, Request, State,
+    },
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{delete, get, post},
+    Extension, Json, Router,
+};
+use chrono::{DateTime, Utc};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+};
+use tower_http::services::ServeDir;
+use tracing::{error, info, warn};
+
+use crate::{
+    config::AppConfig,
+    core::{ScadaCore, APP_VERSION},
+    drivers::{
+        build_local_modbus_plc_config, discover_protocol_tags,
+        modbus_slave::spawn_embedded_modbus_plc, GtbSimulatorDriver,
+    },
+    flow_engine::trigger_flow_now,
+    models::{
+        AckAlarmRequest, AlarmInstance, AlarmJournalEntry, AuditLogEntry, ChangePasswordRequest,
+        DashboardLayout, DriverConfig, FlowGraph, HistoryResponse, ImportSymbolLibraryRequest,
+        LoginRequest, LoginResponse, ProjectBackupBundle, RegisteredTag, ScadaError, ScheduleRule,
+        SymbolLibraryItem, SystemStatus, TagFullView, TagState, UpsertUserRequest, UserAccount,
+        UserPublicView, UserRole, WriteTagRequest, WsServerMessage,
+    },
+};
+
+/// Fichier contenant le jeton de contrôle local utilisé par les scripts `.bat`.
+const LOCAL_TOKEN_FILE: &str = ".scada_local_token";
+
+#[derive(Clone)]
+pub struct AppState {
+    pub core: Arc<ScadaCore>,
+}
+
+/// Utilisateur authentifié, injecté dans la requête par le middleware d'authentification.
+#[derive(Clone)]
+struct CurrentUser(UserAccount);
+
+/// Jeton brut de la requête (utile pour la déconnexion et le changement de mot de passe).
+#[derive(Clone)]
+struct AuthToken(String);
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "rust_scada_flow=info,tower_http=info".into()),
+        )
+        .init();
+
+    let cfg = AppConfig::from_env();
+
+    info!("================================================================");
+    info!("   RustScadaFlow v{} — Supervision SCADA/GTB & Node-RED ", APP_VERSION);
+    info!("================================================================");
+
+    // 1. Initialisation SQLite embarquée (repli en mémoire si le fichier est inaccessible)
+    let db_pool = match init_sqlite_db(Some(&cfg.db_path)).await {
+        Ok(pool) => {
+            info!("Base SQLite initialisée ({}, mode WAL)", cfg.db_path);
+            Some(pool)
+        }
+        Err(err) => {
+            warn!("Bascule sur SQLite en mémoire ({}) : rien ne sera conservé à l'arrêt", err);
+            init_sqlite_db(None).await.ok()
+        }
+    };
+
+    // 2. Démarrage de l'automate Modbus TCP Esclave embarqué
+    spawn_embedded_modbus_plc(cfg.modbus_slave_port).await;
+
+    // 3. Création du noyau temps réel ScadaCore
+    let core = ScadaCore::new(db_pool, &cfg);
+
+    // 4. Chargement de l'état persisté (la démo et les drivers par défaut ne sont écrits qu'au 1er lancement)
+    let default_drivers = vec![
+        GtbSimulatorDriver::new_default("SIM_GTB_01", Arc::clone(&core)).config(),
+        build_local_modbus_plc_config(cfg.modbus_slave_port),
+    ];
+    if let Err(err) = core.load_persisted_state(default_drivers).await {
+        error!("Chargement de l'état SQLite impossible : {}", err);
+    }
+
+    // 5. Démarrage des drivers dont l'état voulu est « actif », puis des automatismes
+    core.start_persisted_drivers().await;
+    core.start_automation();
+
+    // 6. Jeton de contrôle local pour les scripts d'arrêt / redémarrage
+    if let Err(err) = std::fs::write(LOCAL_TOKEN_FILE, &core.local_control_token) {
+        warn!("Écriture du jeton local '{}' impossible : {}", LOCAL_TOKEN_FILE, err);
+    }
+
+    core.record_audit(
+        "Système",
+        "SERVEUR",
+        "STARTUP",
+        "RustScadaFlow",
+        &format!("Démarrage du serveur SCADA v{}", APP_VERSION),
+    );
+
+    let app_state = AppState {
+        core: Arc::clone(&core),
+    };
+
+    // Routes protégées : session obligatoire (contrôle des rôles dans chaque handler)
+    let protected = Router::new()
+        // --- AUTHENTIFICATION & UTILISATEURS ---
+        .route("/api/auth/logout", post(api_auth_logout))
+        .route("/api/auth/me", get(api_auth_me))
+        .route("/api/auth/password", post(api_auth_change_password))
+        .route("/api/users", get(api_get_users).post(api_upsert_user))
+        .route("/api/users/:username", delete(api_delete_user))
+        // --- BIBLIOTHÈQUES DE SYMBOLES ---
+        .route("/api/symbols", get(api_get_symbols))
+        .route("/api/symbols/import", post(api_import_symbols))
+        .route(
+            "/api/symbols/install-pack/:pack_id",
+            post(api_install_symbol_pack),
+        )
+        .route("/api/symbols/:id", delete(api_delete_symbol))
+        // --- CONTRÔLE SYSTÈME ---
+        .route("/api/system/status", get(api_system_status))
+        .route("/api/system/pause", post(api_system_pause))
+        .route("/api/system/standby", post(api_system_standby))
+        .route("/api/system/shutdown", post(api_system_shutdown))
+        .route("/api/system/restart", post(api_system_restart))
+        .route("/api/system/export", get(api_system_export))
+        .route("/api/system/import", post(api_system_import))
+        .route("/api/audit", get(api_get_audit_logs))
+        // --- TAG DATABASE ---
+        .route("/api/tags", get(api_get_tags).post(api_upsert_tag))
+        .route("/api/tags/:id", delete(api_delete_tag))
+        .route("/api/tags/:id/write", post(api_write_tag))
+        // --- DRIVERS ---
+        .route("/api/drivers", get(api_get_drivers).post(api_add_driver))
+        .route("/api/drivers/:id", delete(api_delete_driver).put(api_update_driver))
+        .route("/api/drivers/:id/start", post(api_start_driver))
+        .route("/api/drivers/:id/stop", post(api_stop_driver))
+        .route("/api/drivers/:id/restart", post(api_restart_driver))
+        .route("/api/drivers/:id/browse", post(api_browse_driver))
+        // --- SYNOPTIQUES ---
+        .route(
+            "/api/dashboards",
+            get(api_get_dashboards).post(api_save_dashboard),
+        )
+        .route("/api/dashboards/:id", delete(api_delete_dashboard))
+        // --- FLUX ---
+        .route("/api/flows", get(api_get_flows).post(api_save_flow))
+        .route("/api/flows/:id", delete(api_delete_flow))
+        .route("/api/flows/:id/trigger", post(api_trigger_flow))
+        // --- ALARMES ---
+        .route("/api/alarms", get(api_get_alarms))
+        .route("/api/alarms/journal", get(api_get_alarm_journal))
+        .route("/api/alarms/:id/ack", post(api_ack_alarm))
+        .route("/api/alarms/:id/shelve", post(api_shelve_alarm))
+        .route("/api/alarms/:id/unshelve", post(api_unshelve_alarm))
+        .route("/api/alarms/ack-all", post(api_ack_all_alarms))
+        .route("/api/alarms/clear-normal", post(api_clear_normal_alarms))
+        // --- PLANIFICATEUR ---
+        .route(
+            "/api/schedules",
+            get(api_get_schedules).post(api_save_schedule),
+        )
+        .route("/api/schedules/:id", delete(api_delete_schedule))
+        // --- HISTORIAN ---
+        .route("/api/history/purge", post(api_purge_history))
+        .route("/api/history/:tag_id", get(api_get_history))
+        .route("/api/history/:tag_id/csv", get(api_export_history_csv))
+        // --- WEBSOCKET TEMPS RÉEL ---
+        .route("/ws/realtime", get(ws_realtime_handler))
+        .route_layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            auth_middleware,
+        ));
+
+    let app = Router::new()
+        // Routes publiques
+        .route("/api/health", get(api_health))
+        .route("/api/auth/login", post(api_auth_login))
+        .merge(protected)
+        // IHM statique (même origine que l'API : aucun CORS nécessaire)
+        .fallback_service(ServeDir::new(&cfg.static_dir))
+        .layer(middleware::from_fn(security_headers_middleware))
+        .with_state(app_state);
+
+    if !cfg.static_dir.join("index.html").is_file() {
+        warn!(
+            "IHM introuvable dans '{}' : définissez SCADA_STATIC_DIR vers le dossier static/",
+            cfg.static_dir.display()
+        );
+    }
+    let addr = SocketAddr::new(cfg.bind, cfg.port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!("Interface SCADA Studio & Run -> http://localhost:{}", cfg.port);
+    info!("Écoute réseau               -> {}", addr);
+    info!("Automate Modbus TCP Local    -> 127.0.0.1:{}", cfg.modbus_slave_port);
+    if !cfg.bind.is_loopback() {
+        warn!(
+            "Le serveur est accessible depuis le réseau ({}) en HTTP non chiffré : placez-le derrière un proxy HTTPS ou définissez SCADA_BIND=127.0.0.1",
+            cfg.bind
+        );
+    }
+
+    let shutdown_notify = Arc::clone(&core.shutdown_notify);
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_notify.notified().await;
+        info!("Signal d'arrêt reçu : fermeture propre du serveur HTTP...");
+    })
+    .await?;
+
+    // Nettoyage des drivers et du jeton local
+    core.stop_all_drivers();
+    let _ = std::fs::remove_file(LOCAL_TOKEN_FILE);
+    // Laisse à l'écrivain d'historique le temps de vider son dernier lot
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    if core.restart_requested.load(Ordering::SeqCst) {
+        info!("Redémarrage de l'application RustScadaFlow en cours...");
+        if let Ok(exe_path) = std::env::current_exe() {
+            let _ = Command::new(exe_path).spawn();
+        }
+    } else {
+        info!("Application RustScadaFlow arrêtée proprement.");
+    }
+
+    Ok(())
+}
+
+/// Ouvre la base SQLite (fichier en mode WAL, ou base en mémoire si `path` est `None`)
+/// et crée le schéma.
+async fn init_sqlite_db(path: Option<&str>) -> Result<sqlx::SqlitePool, sqlx::Error> {
+    let pool = match path {
+        Some(p) => {
+            let opts = SqliteConnectOptions::from_str(&format!("sqlite:{}", p))?
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal)
+                .synchronous(SqliteSynchronous::Normal)
+                .busy_timeout(Duration::from_secs(5));
+            SqlitePoolOptions::new()
+                .max_connections(5)
+                .connect_with(opts)
+                .await?
+        }
+        None => {
+            // Une base en mémoire n'existe que sur sa connexion : pool à connexion unique et permanente
+            SqlitePoolOptions::new()
+                .max_connections(1)
+                .min_connections(1)
+                .idle_timeout(None)
+                .max_lifetime(None)
+                .connect("sqlite::memory:")
+                .await?
+        }
+    };
+
+    for ddl in [
+        "CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );",
+        "CREATE TABLE IF NOT EXISTS tags_catalog (
+            id TEXT PRIMARY KEY,
+            tag_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
+        "CREATE TABLE IF NOT EXISTS drivers_config (
+            id TEXT PRIMARY KEY,
+            config_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
+        "CREATE TABLE IF NOT EXISTS dashboards (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            layout_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
+        "CREATE TABLE IF NOT EXISTS flows (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            flow_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
+        "CREATE TABLE IF NOT EXISTS schedules (
+            id TEXT PRIMARY KEY,
+            rule_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
+        "CREATE TABLE IF NOT EXISTS tag_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tag_id TEXT NOT NULL,
+            value_json TEXT NOT NULL,
+            quality TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        );",
+        "CREATE INDEX IF NOT EXISTS idx_history_tag ON tag_history(tag_id, id DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_history_time ON tag_history(recorded_at);",
+        "CREATE TABLE IF NOT EXISTS alarms_journal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tag_id TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            message TEXT NOT NULL,
+            operator TEXT,
+            recorded_at TEXT NOT NULL
+        );",
+        "CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            category TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target TEXT NOT NULL,
+            details TEXT NOT NULL
+        );",
+        "CREATE TABLE IF NOT EXISTS users_accounts (
+            username TEXT PRIMARY KEY,
+            user_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
+        "CREATE TABLE IF NOT EXISTS symbol_libraries (
+            id TEXT PRIMARY KEY,
+            symbol_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
+    ] {
+        sqlx::query(ddl).execute(&pool).await?;
+    }
+
+    Ok(pool)
+}
+
+// ============================================================================
+// MIDDLEWARES : AUTHENTIFICATION & EN-TÊTES DE SÉCURITÉ
+// ============================================================================
+
+fn extract_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-scada-token")
+        .or_else(|| headers.get(header::AUTHORIZATION))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Le navigateur ne peut pas ajouter d'en-tête à une connexion WebSocket : le jeton y est
+/// accepté en paramètre `?token=` (et uniquement pour le WebSocket).
+fn query_token(req: &Request) -> Option<String> {
+    if !req.uri().path().starts_with("/ws/") {
+        return None;
+    }
+    req.uri().query().and_then(|q| {
+        q.split('&')
+            .find_map(|kv| kv.strip_prefix("token="))
+            .map(|t| t.to_string())
+    })
+}
+
+async fn auth_middleware(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, ScadaError> {
+    let token = extract_token(req.headers()).or_else(|| query_token(&req));
+    let user = state
+        .core
+        .resolve_user(token.as_deref(), peer.ip().is_loopback())
+        .ok_or_else(|| {
+            ScadaError::Unauthorized(
+                "Session absente ou expirée : veuillez vous reconnecter".to_string(),
+            )
+        })?;
+    req.extensions_mut().insert(CurrentUser(user));
+    req.extensions_mut()
+        .insert(AuthToken(token.unwrap_or_default()));
+    Ok(next.run(req).await)
+}
+
+/// En-têtes de durcissement : pas de sniffing MIME, pas d'intégration en iframe (anti-clickjacking),
+/// pas de fuite de référent, et pas de mise en cache des réponses API.
+async fn security_headers_middleware(req: Request, next: Next) -> Response {
+    let is_api = req.uri().path().starts_with("/api/");
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    h.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    if is_api {
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    } else {
+        // Politique de sécurité du contenu : aucune ressource ni connexion vers un site tiers.
+        // `unsafe-inline` reste nécessaire tant que l'IHM utilise des gestionnaires onclick en ligne.
+        h.insert(
+            "content-security-policy",
+            HeaderValue::from_static(
+                "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; \
+                 img-src 'self' data: blob:; connect-src 'self' ws: wss:; object-src 'none'; \
+                 base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+            ),
+        );
+    }
+    res
+}
+
+fn require_admin(user: &CurrentUser) -> Result<(), ScadaError> {
+    ScadaCore::require_admin(&user.0)
+}
+
+fn require_supervisor(user: &CurrentUser) -> Result<(), ScadaError> {
+    ScadaCore::require_supervisor_or_admin(&user.0)
+}
+
+fn is_viewer(user: &CurrentUser) -> bool {
+    user.0.role == UserRole::Viewer
+}
+
+// ============================================================================
+// HANDLERS PUBLICS : SANTÉ & CONNEXION
+// ============================================================================
+
+async fn api_health(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let st = state.core.get_system_status();
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": APP_VERSION,
+        "uptime_seconds": st.uptime_seconds,
+        "acquisition_paused": st.acquisition_paused,
+        "running_drivers": st.running_drivers,
+    }))
+}
+
+async fn api_auth_login(
+    State(state): State<AppState>,
+    Json(req): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, ScadaError> {
+    let resp = state.core.login(req).await?;
+    Ok(Json(resp))
+}
+
+// ============================================================================
+// HANDLERS REST : AUTHENTIFICATION & UTILISATEURS
+// ============================================================================
+
+async fn api_auth_logout(
+    State(state): State<AppState>,
+    Extension(token): Extension<AuthToken>,
+) -> Json<serde_json::Value> {
+    state.core.logout(&token.0);
+    Json(serde_json::json!({ "logged_out": true }))
+}
+
+async fn api_auth_me(Extension(user): Extension<CurrentUser>) -> Json<UserPublicView> {
+    Json(user.0.to_public_view())
+}
+
+async fn api_auth_change_password(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Extension(token): Extension<AuthToken>,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<Json<serde_json::Value>, ScadaError> {
+    state
+        .core
+        .change_own_password(&user.0, &token.0, &req.current_password, &req.new_password)
+        .await?;
+    Ok(Json(serde_json::json!({ "changed": true })))
+}
+
+async fn api_get_users(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<Vec<UserPublicView>>, ScadaError> {
+    require_admin(&user)?;
+    Ok(Json(state.core.get_all_users()))
+}
+
+async fn api_upsert_user(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(req): Json<UpsertUserRequest>,
+) -> Result<Json<UserPublicView>, ScadaError> {
+    require_admin(&user)?;
+    let view = state.core.upsert_user(&user.0.username, req).await?;
+    Ok(Json(view))
+}
+
+async fn api_delete_user(
+    Path(username): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, ScadaError> {
+    require_admin(&user)?;
+    state.core.delete_user(&user.0.username, &username).await?;
+    Ok(Json(serde_json::json!({ "deleted": username })))
+}
+
+// ============================================================================
+// HANDLERS REST : BIBLIOTHÈQUES DE SYMBOLES INDUSTRIELS
+// ============================================================================
+
+async fn api_get_symbols(State(state): State<AppState>) -> Json<Vec<SymbolLibraryItem>> {
+    Json(state.core.get_all_symbols())
+}
+
+async fn api_import_symbols(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(req): Json<ImportSymbolLibraryRequest>,
+) -> Result<Json<Vec<SymbolLibraryItem>>, ScadaError> {
+    require_supervisor(&user)?;
+    let imported = state
+        .core
+        .import_symbol_library(&user.0.username, req)
+        .await?;
+    Ok(Json(imported))
+}
+
+async fn api_install_symbol_pack(
+    Path(pack_id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<Vec<SymbolLibraryItem>>, ScadaError> {
+    require_supervisor(&user)?;
+    let items = state
+        .core
+        .install_builtin_symbol_pack(&user.0.username, &pack_id)
+        .await?;
+    Ok(Json(items))
+}
+
+async fn api_delete_symbol(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, ScadaError> {
+    require_supervisor(&user)?;
+    state.core.delete_symbol(&user.0.username, &id).await?;
+    Ok(Json(serde_json::json!({ "deleted": id })))
+}
+
+// ============================================================================
+// HANDLERS REST : SYSTÈME (RÉSERVÉS AU GROUPE ADMINISTRATEUR)
+// ============================================================================
+
+async fn api_system_status(State(state): State<AppState>) -> Json<SystemStatus> {
+    Json(state.core.get_system_status())
+}
+
+#[derive(serde::Deserialize)]
+struct PauseRequest {
+    paused: bool,
+}
+
+async fn api_system_pause(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(req): Json<PauseRequest>,
+) -> Result<Json<SystemStatus>, ScadaError> {
+    require_admin(&user)?;
+    state
+        .core
+        .set_acquisition_paused(&user.0.username, req.paused);
+    Ok(Json(state.core.get_system_status()))
+}
+
+/// Met le moteur SCADA hors tension (arrêt de tous les drivers + pause acquisition) tout en gardant l'IHM prête pour un rallumage.
+async fn api_system_standby(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<SystemStatus>, ScadaError> {
+    require_admin(&user)?;
+    state.core.power_off_all_systems(&user.0.username);
+    Ok(Json(state.core.get_system_status()))
+}
+
+/// Arrête complètement le processus serveur.
+async fn api_system_shutdown(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, ScadaError> {
+    require_admin(&user)?;
+    state.core.record_audit(
+        &user.0.username,
+        "SERVEUR",
+        "SHUTDOWN",
+        "RustScadaFlow",
+        "Extinction complète du processus serveur demandée",
+    );
+    state.core.restart_requested.store(false, Ordering::SeqCst);
+    let notify = Arc::clone(&state.core.shutdown_notify);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        notify.notify_waiters();
+    });
+    Ok(Json(serde_json::json!({
+        "status": "shutting_down",
+        "message": "Arrêt propre du serveur RustScadaFlow en cours..."
+    })))
+}
+
+/// Rallume le moteur SCADA et redémarre les drivers actifs.
+async fn api_system_restart(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<SystemStatus>, ScadaError> {
+    require_admin(&user)?;
+    info!("Redémarrage / Rallumage du moteur SCADA demandé par '{}'", user.0.username);
+    state.core.restart_all_systems(&user.0.username).await;
+    Ok(Json(state.core.get_system_status()))
+}
+
+async fn api_system_export(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ProjectBackupBundle>, ScadaError> {
+    require_admin(&user)?;
+    state.core.record_audit(
+        &user.0.username,
+        "SYSTÈME",
+        "EXPORT_PROJECT",
+        "Backup JSON",
+        "Export de l'archive projet",
+    );
+    Ok(Json(state.core.export_project_bundle()))
+}
+
+async fn api_system_import(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(bundle): Json<ProjectBackupBundle>,
+) -> Result<Json<serde_json::Value>, ScadaError> {
+    require_admin(&user)?;
+    let report = state
+        .core
+        .import_project_bundle(&user.0.username, bundle)
+        .await?;
+    Ok(Json(report))
+}
+
+async fn api_get_audit_logs(
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<Vec<AuditLogEntry>>, ScadaError> {
+    require_supervisor(&user)?;
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(100);
+    let logs = state.core.query_audit_logs(limit).await?;
+    Ok(Json(logs))
+}
+
+// ============================================================================
+// HANDLERS REST : TAGS & DRIVERS (ADMIN & SUPERVISEUR)
+// ============================================================================
+
+async fn api_get_tags(State(state): State<AppState>) -> Json<Vec<TagFullView>> {
+    Json(state.core.get_all_tags())
+}
+
+async fn api_upsert_tag(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(tag): Json<RegisteredTag>,
+) -> Result<Json<TagFullView>, ScadaError> {
+    require_supervisor(&user)?;
+    let view = state.core.upsert_tag(&user.0.username, tag).await?;
+    Ok(Json(view))
+}
+
+async fn api_delete_tag(
+    Path(tag_id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, ScadaError> {
+    require_supervisor(&user)?;
+    state.core.delete_tag(&user.0.username, &tag_id).await?;
+    Ok(Json(serde_json::json!({ "deleted": tag_id })))
+}
+
+async fn api_write_tag(
+    Path(tag_id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(payload): Json<WriteTagRequest>,
+) -> Result<Json<TagState>, ScadaError> {
+    require_supervisor(&user)?;
+    let val_str = serde_json::to_string(&payload.value).unwrap_or_default();
+    let updated = state.core.write_tag(&tag_id, payload.value).await?;
+    let note = payload
+        .operator_note
+        .as_deref()
+        .filter(|n| !n.trim().is_empty())
+        .map(|n| format!(" — note : {}", n.trim()))
+        .unwrap_or_default();
+    state.core.record_audit(
+        &user.0.username,
+        "CONSIGNE",
+        "WRITE_TAG",
+        &tag_id,
+        &format!("Nouvelle valeur commandée : {}{}", val_str, note),
+    );
+    Ok(Json(updated))
+}
+
+async fn api_get_drivers(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<Vec<DriverConfig>>, ScadaError> {
+    require_supervisor(&user)?;
+    Ok(Json(state.core.get_all_drivers()))
+}
+
+async fn api_add_driver(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(config): Json<DriverConfig>,
+) -> Result<Json<Vec<TagFullView>>, ScadaError> {
+    require_supervisor(&user)?;
+    if state.core.drivers_config.contains_key(&config.id) {
+        return Err(ScadaError::BadRequest(format!(
+            "Un driver '{}' existe déjà : supprimez-le ou choisissez un autre identifiant",
+            config.id
+        )));
+    }
+    let views = state
+        .core
+        .register_and_start_driver(&user.0.username, config)
+        .await?;
+    Ok(Json(views))
+}
+
+async fn api_update_driver(
+    Path(driver_id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(req): Json<crate::models::DriverUpdateRequest>,
+) -> Result<Json<DriverConfig>, ScadaError> {
+    require_supervisor(&user)?;
+    let cfg = state
+        .core
+        .update_driver(&user.0.username, &driver_id, req)
+        .await?;
+    Ok(Json(cfg))
+}
+
+async fn api_start_driver(
+    Path(driver_id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<DriverConfig>, ScadaError> {
+    require_supervisor(&user)?;
+    let cfg = state
+        .core
+        .start_or_restart_driver(&user.0.username, &driver_id)
+        .await?;
+    Ok(Json(cfg))
+}
+
+async fn api_stop_driver(
+    Path(driver_id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<DriverConfig>, ScadaError> {
+    require_supervisor(&user)?;
+    let cfg = state.core.stop_driver(&user.0.username, &driver_id).await?;
+    Ok(Json(cfg))
+}
+
+async fn api_restart_driver(
+    Path(driver_id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<DriverConfig>, ScadaError> {
+    require_supervisor(&user)?;
+    let cfg = state
+        .core
+        .start_or_restart_driver(&user.0.username, &driver_id)
+        .await?;
+    Ok(Json(cfg))
+}
+
+async fn api_delete_driver(
+    Path(driver_id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, ScadaError> {
+    require_supervisor(&user)?;
+    let removed_tags = state
+        .core
+        .delete_driver(&user.0.username, &driver_id)
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "deleted": driver_id, "deleted_tags": removed_tags }),
+    ))
+}
+
+async fn api_browse_driver(
+    Path(driver_id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<Vec<TagFullView>>, ScadaError> {
+    require_supervisor(&user)?;
+    let drv = state
+        .core
+        .drivers_config
+        .get(&driver_id)
+        .map(|d| d.clone())
+        .ok_or_else(|| ScadaError::DriverNotFound(driver_id.clone()))?;
+
+    let discovered = discover_protocol_tags(&drv.id, &drv.protocol);
+    let mut views = Vec::new();
+    for tag in discovered {
+        let v = state.core.upsert_tag(&user.0.username, tag).await?;
+        views.push(v);
+    }
+    Ok(Json(views))
+}
+
+// ============================================================================
+// HANDLERS REST : DASHBOARDS, FLUX, ALARMES, SCHEDULES & HISTORIAN
+// ============================================================================
+
+async fn api_get_dashboards(State(state): State<AppState>) -> Json<Vec<DashboardLayout>> {
+    Json(state.core.get_all_dashboards())
+}
+
+async fn api_save_dashboard(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(layout): Json<DashboardLayout>,
+) -> Result<Json<DashboardLayout>, ScadaError> {
+    require_supervisor(&user)?;
+    let saved = state.core.save_dashboard(&user.0.username, layout).await?;
+    Ok(Json(saved))
+}
+
+async fn api_delete_dashboard(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, ScadaError> {
+    require_supervisor(&user)?;
+    state.core.delete_dashboard(&user.0.username, &id).await?;
+    Ok(Json(serde_json::json!({ "deleted": id })))
+}
+
+async fn api_get_flows(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<Vec<FlowGraph>>, ScadaError> {
+    require_supervisor(&user)?;
+    Ok(Json(state.core.get_all_flows()))
+}
+
+async fn api_save_flow(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(flow): Json<FlowGraph>,
+) -> Result<Json<FlowGraph>, ScadaError> {
+    require_supervisor(&user)?;
+    let saved = state.core.save_flow(&user.0.username, flow).await?;
+    Ok(Json(saved))
+}
+
+async fn api_delete_flow(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, ScadaError> {
+    require_supervisor(&user)?;
+    state.core.delete_flow(&user.0.username, &id).await?;
+    Ok(Json(serde_json::json!({ "deleted": id })))
+}
+
+async fn api_trigger_flow(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, ScadaError> {
+    require_supervisor(&user)?;
+    let count = trigger_flow_now(&state.core, &id)
+        .await
+        .map_err(ScadaError::FlowError)?;
+    state.core.record_audit(
+        &user.0.username,
+        "FLOW_ENGINE",
+        "TRIGGER_FLOW",
+        &id,
+        &format!("Exécution manuelle ({} entrée(s))", count),
+    );
+    Ok(Json(serde_json::json!({ "triggered_nodes": count })))
+}
+
+async fn api_get_alarms(State(state): State<AppState>) -> Json<Vec<AlarmInstance>> {
+    Json(state.core.get_all_alarms())
+}
+
+async fn api_get_alarm_journal(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<Vec<AlarmJournalEntry>>, ScadaError> {
+    require_supervisor(&user)?;
+    let list = state.core.query_alarm_journal(150).await?;
+    Ok(Json(list))
+}
+
+async fn api_ack_alarm(
+    Path(alarm_id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(req): Json<AckAlarmRequest>,
+) -> Result<Json<AlarmInstance>, ScadaError> {
+    require_supervisor(&user)?;
+    // L'opérateur tracé est toujours l'utilisateur authentifié (traçabilité ISA-18.2)
+    let comment = req.comment.filter(|c| !c.trim().is_empty());
+    let updated = state
+        .core
+        .acknowledge_alarm(&alarm_id, &user.0.username, comment)?;
+    Ok(Json(updated))
+}
+
+async fn api_shelve_alarm(
+    Path(alarm_id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(req): Json<crate::models::ShelveAlarmRequest>,
+) -> Result<Json<AlarmInstance>, ScadaError> {
+    require_supervisor(&user)?;
+    let updated = state
+        .core
+        .shelve_alarm(&alarm_id, &user.0.username, req.minutes, req.comment)?;
+    Ok(Json(updated))
+}
+
+async fn api_unshelve_alarm(
+    Path(alarm_id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<AlarmInstance>, ScadaError> {
+    require_supervisor(&user)?;
+    Ok(Json(state.core.unshelve_alarm(&alarm_id, &user.0.username)?))
+}
+
+async fn api_ack_all_alarms(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<Vec<AlarmInstance>>, ScadaError> {
+    require_supervisor(&user)?;
+    Ok(Json(state.core.acknowledge_all_alarms(&user.0.username)))
+}
+
+async fn api_clear_normal_alarms(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<Vec<AlarmInstance>>, ScadaError> {
+    require_supervisor(&user)?;
+    Ok(Json(state.core.clear_normal_alarms(&user.0.username)))
+}
+
+async fn api_get_schedules(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<Vec<ScheduleRule>>, ScadaError> {
+    require_supervisor(&user)?;
+    Ok(Json(state.core.get_all_schedules()))
+}
+
+async fn api_save_schedule(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(rule): Json<ScheduleRule>,
+) -> Result<Json<ScheduleRule>, ScadaError> {
+    require_supervisor(&user)?;
+    let saved = state.core.save_schedule(&user.0.username, rule).await?;
+    Ok(Json(saved))
+}
+
+async fn api_delete_schedule(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, ScadaError> {
+    require_supervisor(&user)?;
+    state.core.delete_schedule(&user.0.username, &id).await?;
+    Ok(Json(serde_json::json!({ "deleted": id })))
+}
+
+/// Limite de points et période optionnelle `[from, to]` d'une lecture d'historique.
+type HistoryParams = (u32, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+/// Paramètres de lecture de l'historique : `limit`, `from` et `to` (ISO 8601 / RFC 3339).
+fn parse_history_params(
+    params: &HashMap<String, String>,
+    default_limit: u32,
+) -> Result<HistoryParams, ScadaError> {
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(default_limit);
+    let parse_date = |key: &str| -> Result<Option<DateTime<Utc>>, ScadaError> {
+        match params.get(key).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            None => Ok(None),
+            Some(raw) => DateTime::parse_from_rfc3339(raw)
+                .map(|d| Some(d.with_timezone(&Utc)))
+                .map_err(|_| {
+                    ScadaError::BadRequest(format!(
+                        "Date '{}' invalide (format attendu : 2026-10-16T08:00:00Z)",
+                        raw
+                    ))
+                }),
+        }
+    };
+    let from = parse_date("from")?;
+    let to = parse_date("to")?;
+    if let (Some(f), Some(t)) = (from, to) {
+        if f > t {
+            return Err(ScadaError::BadRequest(
+                "La date de début doit précéder la date de fin".to_string(),
+            ));
+        }
+    }
+    Ok((limit, from, to))
+}
+
+async fn api_get_history(
+    Path(tag_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<HistoryResponse>, ScadaError> {
+    require_supervisor(&user)?;
+    let (limit, from, to) = parse_history_params(&params, 200)?;
+    let res = state.core.query_tag_history(&tag_id, limit, from, to).await?;
+    Ok(Json(res))
+}
+
+async fn api_purge_history(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, ScadaError> {
+    require_admin(&user)?;
+    let deleted = state.core.purge_history(&user.0.username).await?;
+    Ok(Json(serde_json::json!({ "purged_rows": deleted })))
+}
+
+async fn api_export_history_csv(
+    Path(tag_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<impl IntoResponse, ScadaError> {
+    require_supervisor(&user)?;
+    let (limit, from, to) = parse_history_params(&params, 5000)?;
+    let hist = state.core.query_tag_history(&tag_id, limit, from, to).await?;
+    let mut csv = String::from("Timestamp_UTC;Tag_ID;Value;Quality\n");
+    for pt in hist.points {
+        let val_str = match pt.value {
+            crate::models::TagValue::Float(f) => format!("{:.3}", f),
+            crate::models::TagValue::Int(i) => i.to_string(),
+            crate::models::TagValue::Bool(b) => (if b { 1 } else { 0 }).to_string(),
+            // Neutralise l'injection de formules dans Excel (=, +, -, @)
+            crate::models::TagValue::Text(s) => {
+                let s = s.replace([';', '\n', '\r'], " ");
+                if s.starts_with(['=', '+', '-', '@']) {
+                    format!("'{}", s)
+                } else {
+                    s
+                }
+            }
+        };
+        csv.push_str(&format!(
+            "{};{};{};{}\n",
+            pt.timestamp, hist.tag_id, val_str, pt.quality
+        ));
+    }
+
+    let filename = format!(
+        "attachment; filename=\"historian_{}.csv\"",
+        crate::security::slugify_id(&tag_id)
+    );
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+            (header::CONTENT_DISPOSITION, filename),
+        ],
+        csv,
+    ))
+}
+
+// ============================================================================
+// WEBSOCKET TEMPS RÉEL (/ws/realtime?token=...)
+// ============================================================================
+
+async fn ws_realtime_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Extension(token): Extension<AuthToken>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| {
+        handle_realtime_socket(socket, state, user, token.0, peer.ip().is_loopback())
+    })
+}
+
+/// Instantané complet de l'état, filtré selon le rôle : le profil Visualisation ne reçoit ni
+/// la configuration des drivers, ni les flux, ni les plannings.
+fn build_snapshot(state: &AppState, viewer: bool) -> WsServerMessage {
+    WsServerMessage::InitialSnapshot {
+        tags: state.core.get_all_tags(),
+        flows: if viewer { vec![] } else { state.core.get_all_flows() },
+        alarms: state.core.get_all_alarms(),
+        drivers: if viewer { vec![] } else { state.core.get_all_drivers() },
+        schedules: if viewer { vec![] } else { state.core.get_all_schedules() },
+        status: state.core.get_system_status(),
+    }
+}
+
+async fn send_ws(socket: &mut WebSocket, msg: &WsServerMessage) -> bool {
+    match serde_json::to_string(msg) {
+        Ok(json) => socket.send(Message::Text(json)).await.is_ok(),
+        Err(_) => true,
+    }
+}
+
+async fn handle_realtime_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    user: CurrentUser,
+    token: String,
+    peer_is_loopback: bool,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let viewer = is_viewer(&user);
+    let mut cov_rx = state.core.subscribe_cov();
+    let mut alarm_rx = state.core.subscribe_alarms();
+    let mut drv_rx = state.core.subscribe_drivers();
+    let mut trace_rx = state.core.subscribe_flow_traces();
+    // Vérifie périodiquement que la session est toujours valide (déconnexion, compte désactivé)
+    let mut session_check = tokio::time::interval(Duration::from_secs(30));
+    session_check.tick().await;
+    // Regroupement des COV : dernière valeur par tag, envoyée en un seul message toutes les 100 ms
+    let mut pending: HashMap<String, TagState> = HashMap::new();
+    let mut flush = tokio::time::interval(Duration::from_millis(100));
+    flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    if !send_ws(&mut socket, &build_snapshot(&state, viewer)).await {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            cov_res = cov_rx.recv() => {
+                match cov_res {
+                    Ok(tag_state) => {
+                        pending.insert(tag_state.tag_id.clone(), tag_state);
+                    }
+                    // Client trop lent : des mises à jour ont été perdues, on resynchronise tout
+                    Err(RecvError::Lagged(_)) => {
+                        cov_rx = cov_rx.resubscribe();
+                        pending.clear();
+                        if !send_ws(&mut socket, &build_snapshot(&state, viewer)).await {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            _ = flush.tick(), if !pending.is_empty() => {
+                let batch: Vec<TagState> = pending.drain().map(|(_, st)| st).collect();
+                if !send_ws(&mut socket, &WsServerMessage::TagUpdateBatch(batch)).await {
+                    break;
+                }
+            }
+            alarm_res = alarm_rx.recv() => {
+                match alarm_res {
+                    Ok(alarms) => {
+                        if !send_ws(&mut socket, &WsServerMessage::AlarmUpdate(alarms)).await {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        if !send_ws(&mut socket, &WsServerMessage::AlarmUpdate(state.core.get_all_alarms())).await {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            drv_res = drv_rx.recv() => {
+                match drv_res {
+                    Ok(drivers) if !viewer => {
+                        if !send_ws(&mut socket, &WsServerMessage::DriverListUpdate(drivers)).await {
+                            break;
+                        }
+                    }
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            trace_res = trace_rx.recv() => {
+                match trace_res {
+                    Ok(trace) if !viewer => {
+                        if !send_ws(&mut socket, &WsServerMessage::FlowTrace(trace)).await {
+                            break;
+                        }
+                    }
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            _ = session_check.tick() => {
+                if state.core.resolve_user(Some(&token), peer_is_loopback).is_none() {
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+            }
+            client_msg = socket.recv() => {
+                match client_msg {
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+            _ = state.core.shutdown_notify.notified() => {
+                let _ = socket.send(Message::Close(None)).await;
+                break;
+            }
+        }
+    }
+}

@@ -1,0 +1,55 @@
+[package]
+name = "rust-scada-flow"
+version = "1.2.0"
+edition = "2021"
+authors = ["Architecture SCADA / GTB"]
+description = "Plateforme hybride SCADA/GTB temps réel (esprit PcVue) et programmation par flux (esprit Node-RED) en Rust asynchrone"
+
+[dependencies]
+# Runtime asynchrone
+tokio = { version = "1.40", features = ["full"] }
+
+# Serveur Web REST & WebSockets temps réel
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
+
+# État concurrent en mémoire (Tag Database temps réel)
+dashmap = "6.1"
+
+# Sérialisation & Formats de données
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Base de données embarquée (Configuration & Historian)
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "chrono"] }
+
+# Moteur de script embarqué sécurisé pour les nœuds logiques personnalisés
+rhai = { version = "1.19", features = ["sync"] }
+
+# Protocoles industriels (MVP : Modbus TCP & MQTT)
+tokio-modbus = "0.14"
+rumqttc = "0.24"
+byteorder = "1.5"
+async-trait = "0.1"
+
+# Gestion des erreurs, dates, identifiants et journalisation
+thiserror = "1.0"
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+rand = "0.8"
+
+# Sécurité : hachage des mots de passe (Argon2id) & assainissement des SVG importés
+argon2 = "0.5"
+regex = "1"
+
+
+# Argon2 est très lent sans optimisation : on l'optimise même en build debug
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

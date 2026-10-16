@@ -1,0 +1,6 @@
+{
+  "terminal.integrated.env.windows": {
+    "PATH": "${env:USERPROFILE}\\.cargo\\bin;${env:PATH}"
+  }
+}
+

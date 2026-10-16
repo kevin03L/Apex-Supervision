@@ -1,0 +1,793 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RustScadaFlow v1.2 — Supervision SCADA/GTB, RBAC &amp; Studio Node-RED</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!-- MODALE D'ÉTAT D'ALIMENTATION SERVEUR (REDÉMARRAGE / EXTINCTION) -->
+  <div id="powerOverlay" style="display:none;position:fixed;inset:0;background:rgba(5,9,17,0.92);z-index:9999;flex-direction:column;align-items:center;justify-content:center;gap:16px;text-align:center;">
+    <div id="powerOverlayIcon" style="font-size:48px;">🔄</div>
+    <h2 id="powerOverlayTitle" style="font-size:24px;color:#38bdf8;">Redémarrage du serveur en cours...</h2>
+    <p id="powerOverlayMsg" style="color:#94a3b8;max-width:520px;font-size:14px;">
+      Fermeture propre des drivers industriels et relance du moteur RustScadaFlow. Reconnexion automatique...
+    </p>
+  </div>
+
+  <!-- MODALE D'AUTHENTIFICATION, CHANGEMENT DE COMPTE & MOT DE PASSE -->
+  <div id="authModal" class="auth-modal" style="display:none;">
+    <div class="card-box" style="width:540px;max-width:100%;border:1px solid #38bdf8;box-shadow:0 20px 50px rgba(0,0,0,0.85);">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <h3 style="color:var(--accent);">🔐 Connexion RustScadaFlow</h3>
+        <button id="authModalClose" class="btn" onclick="closeAuthModal()">✕ Fermer</button>
+      </div>
+      <p id="authModalMsg" style="font-size:12px;color:#94a3b8;margin-bottom:12px;">
+        Identifiez-vous pour accéder à la supervision.
+      </p>
+
+      <form id="loginForm" onsubmit="event.preventDefault(); submitManualLogin();" autocomplete="on">
+        <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:8px;align-items:end;">
+          <div class="form-group">
+            <label for="loginUsername">Identifiant</label>
+            <input id="loginUsername" name="username" autocomplete="username" required />
+          </div>
+          <div class="form-group">
+            <label for="loginPassword">Mot de passe</label>
+            <input type="password" id="loginPassword" name="password" autocomplete="current-password" required />
+          </div>
+          <button type="submit" class="btn btn-primary" style="height:32px;">Se Connecter</button>
+        </div>
+      </form>
+
+      <!-- SECTION « MON COMPTE » (visible une fois connecté) -->
+      <div id="accountSection" style="display:none;border-top:1px solid var(--border);padding-top:12px;margin-top:14px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:8px;flex-wrap:wrap;">
+          <div style="font-size:12px;color:#94a3b8;">Connecté : <b id="accountUserLabel" style="color:#f8fafc;"></b></div>
+          <button class="btn btn-danger" onclick="logoutCurrentUser()">⏏ Se déconnecter</button>
+        </div>
+        <div style="font-size:11px;font-weight:700;color:#94a3b8;margin-bottom:8px;text-transform:uppercase;">Changer mon mot de passe</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;align-items:end;">
+          <div class="form-group"><label for="pwdCurrent">Actuel</label><input type="password" id="pwdCurrent" autocomplete="current-password" /></div>
+          <div class="form-group"><label for="pwdNew">Nouveau (6 car. min.)</label><input type="password" id="pwdNew" autocomplete="new-password" /></div>
+          <div class="form-group"><label for="pwdNew2">Confirmation</label><input type="password" id="pwdNew2" autocomplete="new-password" /></div>
+          <button class="btn btn-primary" style="height:32px;" onclick="changeOwnPassword()">Modifier</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODALE D'IMPORT DE BIBLIOTHÈQUES GÉNÉRIQUES DE SYMBOLES INDUSTRIELS -->
+  <div id="symbolLibraryModal" style="display:none;position:fixed;inset:0;background:rgba(5,9,17,0.88);z-index:9400;align-items:center;justify-content:center;padding:20px;">
+    <div class="card-box" style="width:780px;max-width:100%;max-height:90vh;overflow-y:auto;border:1px solid #38bdf8;box-shadow:0 20px 50px rgba(0,0,0,0.85);">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <h3 style="color:var(--accent);">📦 Gestionnaire & Importateur de Bibliothèques de Symboles Industriels</h3>
+        <button class="btn" onclick="closeSymbolLibraryModal()">✕ Fermer</button>
+      </div>
+
+      <!-- 1. PACKS OPEN-SOURCE GRATUITS PRÉ-INTÉGRÉS -->
+      <div style="background:#080f1e;border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:14px;">
+        <div style="font-weight:700;font-size:12.5px;color:#38bdf8;margin-bottom:6px;">
+          1. Installer un Pack Standard Gratuit Pré-intégré (1 Clic)
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+          <div style="background:#0f172a;border:1px solid var(--border);padding:10px;border-radius:6px;">
+            <div style="font-weight:700;font-size:12px;">⚙️ ISO 10628 / P&ID Process</div>
+            <div style="font-size:11px;color:#94a3b8;margin:4px 0 8px;">Cuve agitée, Séparateur cyclone, Soupape PSV, Pompe doseuse.</div>
+            <button class="btn btn-primary" style="width:100%;" onclick="installBuiltinPack('iso_10628_pid')">📥 Installer Pack ISO 10628</button>
+          </div>
+          <div style="background:#0f172a;border:1px solid var(--border);padding:10px;border-radius:6px;">
+            <div style="font-weight:700;font-size:12px;">🎯 ANSI/ISA-5.1 Instrumentation</div>
+            <div style="font-size:11px;color:#94a3b8;margin:4px 0 8px;">Transmetteur PIT, Vanne régulation pneumatique FCV, Radar LIT.</div>
+            <button class="btn btn-primary" style="width:100%;" onclick="installBuiltinPack('isa_5_1_instr')">📥 Installer Pack ISA-5.1</button>
+          </div>
+          <div style="background:#0f172a;border:1px solid var(--border);padding:10px;border-radius:6px;">
+            <div style="font-weight:700;font-size:12px;">⚡ IEC 60617 Énergie & CVC</div>
+            <div style="font-size:11px;color:#94a3b8;margin:4px 0 8px;">Groupe Électrogène GE, Onduleur UPS/ASI, Champ Solaire PV.</div>
+            <button class="btn btn-primary" style="width:100%;" onclick="installBuiltinPack('iec_60617_cvc')">📥 Installer Pack IEC 60617</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 2. IMPORT DEPUIS UN FICHIER OU CODE BRUT (.SVG / DRAW.IO .XML / FUXA .JSON) -->
+      <div style="background:#080f1e;border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:14px;">
+        <div style="font-weight:700;font-size:12.5px;color:#10b981;margin-bottom:8px;">
+          2. Importer une Bibliothèque Générique Externe (.svg, Sprite &lt;symbol&gt;, Draw.io .xml, Pack .json)
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;align-items:end;margin-bottom:10px;">
+          <div class="form-group">
+            <label>Nom du Symbole / Pack</label>
+            <input id="symImportName" value="Échangeur Spirale ISO" />
+          </div>
+          <div class="form-group">
+            <label>Catégorie</label>
+            <input id="symImportCat" value="ISO 10628 Externe" />
+          </div>
+          <div class="form-group">
+            <label>Format</label>
+            <select id="symImportFormat">
+              <option value="auto">Détection Automatique (.svg / .xml / .json)</option>
+              <option value="svg">SVG Vectoriel Standard ou Sprite &lt;symbol&gt;</option>
+              <option value="drawio_xml">Draw.io / Diagrams.net (&lt;mxlibrary&gt; .xml)</option>
+              <option value="scada_json">Pack JSON SCADA / FUXA (.json)</option>
+            </select>
+          </div>
+          <label class="btn" style="height:32px;display:flex;align-items:center;cursor:pointer;border-color:#38bdf8;color:#38bdf8;">
+            📂 Charger Fichier...
+            <input type="file" accept=".svg,.xml,.json" style="display:none;" onchange="handleSymbolFileUpload(event)" />
+          </label>
+        </div>
+        <div class="form-group" style="margin-bottom:8px;">
+          <label>Code Vectoriel SVG, Planche &lt;symbol&gt;, XML Draw.io ou JSON Pack :</label>
+          <textarea id="symImportRaw" rows="4" style="font-family:Consolas,monospace;font-size:11.5px;background:#050811;color:#38bdf8;border:1px solid var(--border);border-radius:5px;padding:8px;"><svg viewBox="0 0 100 100" width="84" height="84"><circle cx="50" cy="50" r="36" fill="#0b1120" stroke="currentColor" stroke-width="3.5"/><path d="M 24 50 L 42 30 L 58 70 L 76 50" fill="none" stroke="#38bdf8" stroke-width="3.5"/></svg></textarea>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <label style="font-size:12px;color:#94a3b8;display:flex;align-items:center;gap:6px;">
+            <input type="checkbox" id="symImportAnim" /> Activer la rotation dynamique lorsque le Tag lié est en marche (ex: turbine, agitateur)
+          </label>
+          <button class="btn btn-success" onclick="submitSymbolImport()">✅ Importer dans la Palette Studio</button>
+        </div>
+      </div>
+
+      <!-- 3. RÉFÉRENTIEL DES BIBLIOTHÈQUES GRATUITES OPEN-SOURCE & FORMATS -->
+      <div style="background:#080f1e;border:1px solid var(--border);border-radius:8px;padding:12px;">
+        <div style="font-weight:700;font-size:12px;color:#fbbf24;margin-bottom:6px;">
+          📚 Référentiel des Bibliothèques Industrielles Gratuites Compatibles & Formats Standards
+        </div>
+        <table class="scada-table" style="font-size:11.5px;">
+          <thead>
+            <tr>
+              <th>Bibliothèque Gratuite / Source</th>
+              <th>Licence</th>
+              <th>Normes Couvertes</th>
+              <th>Format d'Import Supporté</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>Wikimedia Commons — Category:P&ID Symbols</b></td>
+              <td>Domaine Public / CC0</td>
+              <td>ISO 10628, DIN 28004 (Pompes, Vannes, Colonnes)</td>
+              <td><code>.svg</code> unitaire ou Sprite <code>&lt;symbol&gt;</code></td>
+            </tr>
+            <tr>
+              <td><b>Equinor Engineering Symbols (GitHub)</b></td>
+              <td>MIT Open-Source</td>
+              <td>ISO 10628 / NORSOK P&ID & Process</td>
+              <td><code>.svg</code> vectoriel (<code>stroke="currentColor"</code>)</td>
+            </tr>
+            <tr>
+              <td><b>Draw.io / Diagrams.net Process & HVAC</b></td>
+              <td>Apache-2.0</td>
+              <td>P&ID, CVC/HVAC, IEC 60617 Électrique</td>
+              <td><code>.xml</code> (<code>&lt;mxlibrary&gt;[...]&lt;/mxlibrary&gt;</code>) ou <code>.svg</code></td>
+            </tr>
+            <tr>
+              <td><b>FUXA Web SCADA Widgets (GitHub)</b></td>
+              <td>MIT Open-Source</td>
+              <td>IHM / GTB / Automatisme Industriel</td>
+              <td><code>.svg</code> et Pack <code>.json</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- BARRE SUPÉRIEURE PRINCIPALE -->
+  <header>
+    <div class="brand">
+      <span class="brand-badge">SCADA / GTB</span>
+      <span>RustScadaFlow</span>
+    </div>
+
+    <nav class="nav-tabs" id="mainNavTabs">
+      <button class="tab-btn active" id="navBtn-synoptic" onclick="switchTab('synoptic', this)">🖥️ Synoptiques</button>
+      <button class="tab-btn" id="navBtn-flow" onclick="switchTab('flow', this)">⚡ Flux Node-RED</button>
+      <button class="tab-btn" id="navBtn-alarms" onclick="switchTab('alarms', this)">🚨 Alarmes (<span id="navAlarmCount">0</span>)</button>
+      <button class="tab-btn" id="navBtn-tagdb" onclick="switchTab('tagdb', this)">🔌 Drivers & Tags</button>
+      <button class="tab-btn" id="navBtn-schedules" onclick="switchTab('schedules', this)">🕒 Planning GTB</button>
+      <button class="tab-btn" id="navBtn-historian" onclick="switchTab('historian', this)">📈 Historian & Système</button>
+      <button class="tab-btn" id="navBtn-users" onclick="switchTab('users', this)">👥 Utilisateurs & Droits</button>
+    </nav>
+
+    <div class="toolbar-right">
+      <!-- BADGE PROFIL UTILISATEUR & BASCULE RBAC -->
+      <button id="userProfileBtn" class="btn" style="display:flex;align-items:center;gap:6px;border-color:#38bdf8;" onclick="openAuthModal()" title="Changer d'utilisateur ou de groupe de privilèges">
+        <span id="userRoleIcon">👑</span>
+        <span id="userDisplayName" style="font-weight:700;">admin</span>
+        <span id="userRoleBadge" class="badge-rw" style="background:rgba(239,68,68,0.2);color:#f87171;">ADMIN</span>
+      </button>
+
+      <div id="wsStatus" class="ws-pill">
+        <span class="dot"></span>
+        <span id="wsText">Connexion...</span>
+      </div>
+
+      <div class="mode-switch" id="modeSwitchContainer">
+        <button id="btnModeStudio" class="mode-btn active-studio" onclick="setMode('studio')">STUDIO</button>
+        <button id="btnModeRun" class="mode-btn" onclick="setMode('run')">RUN</button>
+      </div>
+
+      <!-- BOUTONS DE CONTRÔLE D'EXÉCUTION ET D'ALIMENTATION (RÉSERVÉS ADMIN) -->
+      <div id="adminPowerControls" style="display:flex;gap:6px;">
+        <button id="btnPauseAcq" class="btn" title="Mettre en pause ou reprendre l'acquisition" onclick="toggleAcquisitionPause()">⏸️ Pause</button>
+        <button class="btn" style="border-color:#f59e0b;color:#fbbf24;" title="Redémarrer complètement le serveur RustScadaFlow" onclick="confirmServerRestart()">🔄 Redémarrer</button>
+        <button class="btn btn-danger" title="Arrêter proprement les drivers et éteindre l'application" onclick="confirmServerShutdown()">⏻ Éteindre</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- BANDEAU PERMANENT D'ALARME TEMPS RÉEL (NORME ISA-18.2) -->
+  <div id="topAlarmBanner" class="alarm-banner-bar">
+    <div id="topAlarmText">✅ Aucune alarme active non acquittée — Système nominal</div>
+    <div style="display:flex;gap:10px;align-items:center;">
+      <span id="rbacHintPill" style="font-size:11px;color:#10b981;font-weight:700;">Accès Complet (Admin)</span>
+      <span id="sysInfoPill" style="font-size:11px;color:#38bdf8;font-family:Consolas,monospace;">PLC Modbus Local: 127.0.0.1:5502</span>
+      <span id="sysClock" style="font-family:Consolas,monospace;color:#94a3b8;"></span>
+      <button id="btnBannerAckAll" class="btn" style="padding:2px 8px;font-size:11px;" onclick="ackAllAlarms()">Acquitter Tout</button>
+    </div>
+  </div>
+
+  <!-- ESPACE DE TRAVAIL -->
+  <div class="workspace" id="mainWorkspace">
+    <!-- PANNEAU GAUCHE : ARBORESCENCE DES VARIABLES TEMPS RÉEL -->
+    <aside class="left-panel" id="leftTagPanel">
+      <div class="panel-header">
+        <span>Variables Temps Réel</span>
+        <span id="tagCountBadge">0</span>
+      </div>
+      <div class="search-box">
+        <input type="text" id="tagSearch" placeholder="Filtrer (CTA01, MODBUS, Pompe)..." oninput="renderTagTree()" />
+      </div>
+      <div id="tagTree" class="tag-tree"></div>
+    </aside>
+
+    <!-- ZONE CENTRALE MULTI-ATELIERS -->
+    <main class="center-stage">
+
+      <!-- ================================================================ -->
+      <!-- ATELIER 1 : SYNOPTIQUES MULTI-VUES DRAG & DROP                   -->
+      <!-- ================================================================ -->
+      <div id="tab-synoptic">
+        <div class="canvas-toolbar">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <label style="font-size:12px;color:#94a3b8;font-weight:700;">Synoptique :</label>
+            <select id="dashboardSelect" class="scada-select" style="width:320px;" onchange="selectDashboard(this.value)"></select>
+            <span id="synopticStudioActions" style="display:flex;gap:6px;">
+              <button class="btn" onclick="promptNewDashboard()">+ Nouvelle Vue</button>
+              <button class="btn" onclick="duplicateSelectedWidget()">📋 Dupliquer Widget</button>
+              <button class="btn" style="border-color:#38bdf8;color:#38bdf8;" onclick="openSymbolLibraryModal()">📦 Importer Bibliothèque SVG/P&ID</button>
+              <button class="btn btn-danger" onclick="deleteCurrentDashboard()">Supprimer Vue</button>
+            </span>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;" id="synopticSaveGroup">
+            <span id="studioHint" style="font-size:11.5px;color:#94a3b8;">
+              Glissez un équipement ou une variable sur le synoptique
+            </span>
+            <button id="btnSaveDashboard" class="btn btn-primary" onclick="saveCurrentDashboard()">💾 Enregistrer Synoptique</button>
+          </div>
+        </div>
+
+        <div class="canvas-surface" id="synopticSurface"
+             ondragover="event.preventDefault()"
+             ondrop="handleCanvasDrop(event)">
+          <div id="widgetsContainer"></div>
+        </div>
+      </div>
+
+      <!-- ================================================================ -->
+      <!-- ATELIER 2 : ÉDITEUR DE FLUX VISUEL NODE-RED COMPLET              -->
+      <!-- ================================================================ -->
+      <div id="tab-flow" style="display:none;">
+        <div class="canvas-toolbar">
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+            <select id="flowSelect" class="scada-select" style="width:260px;" onchange="selectFlow(this.value)"></select>
+            <button class="btn" onclick="promptNewFlow()">+ Flux</button>
+            <button class="btn" onclick="toggleCurrentFlowEnabled()" id="btnToggleFlow">🟢 Actif</button>
+            <button class="btn btn-danger" onclick="deleteCurrentFlow()">Suppr. Flux</button>
+            <span style="color:#475569;">|</span>
+            <button class="btn" onclick="addFlowNode('TagInput')">+ TagInput</button>
+            <button class="btn" onclick="addFlowNode('PidController')">+ PID</button>
+            <button class="btn" onclick="addFlowNode('Threshold')">+ Seuil</button>
+            <button class="btn" onclick="addFlowNode('Hysteresis')">+ Hystérésis</button>
+            <button class="btn" onclick="addFlowNode('LogicGate')">+ Porte Logique</button>
+            <button class="btn" onclick="addFlowNode('DelayTimer')">+ Tempo TON</button>
+            <button class="btn" onclick="addFlowNode('MathFormula')">+ Formule</button>
+            <button class="btn" onclick="addFlowNode('RhaiScript')">+ Script Rhai</button>
+            <button class="btn" onclick="addFlowNode('TagOutput')">+ TagOutput</button>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;">
+            <button class="btn" onclick="triggerCurrentFlowNow()">▶️ Exécuter Maintenant</button>
+            <button class="btn btn-primary" onclick="saveCurrentFlow()">⚡ Déployer à Chaud</button>
+          </div>
+        </div>
+        <div style="padding:5px 14px;background:#0b1324;border-bottom:1px solid var(--border);font-size:11.5px;color:#38bdf8;" id="wiringStatus">
+          Astuce Câblage : Cliquez sur un port "OUT ➡" d'un nœud puis sur le port "⬅ IN" d'un autre nœud pour créer une liaison. Cliquez sur un câble pour le supprimer.
+        </div>
+
+        <div class="canvas-surface" id="flowSurface">
+          <svg id="flowSvg" style="position:absolute;top:0;left:0;width:100%;height:100%;z-index:2;"></svg>
+          <div id="flowNodesContainer"></div>
+        </div>
+      </div>
+
+      <!-- ================================================================ -->
+      <!-- ATELIER 3 : CONSOLE D'ALARMES ISA-18.2 & JOURNAL SQLITE          -->
+      <!-- ================================================================ -->
+      <div id="tab-alarms" class="page-container" style="display:none;">
+        <div class="card-box">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+            <div>
+              <h3>1. Alarmes Temps Réel (Norme ISA-18.2)</h3>
+              <p style="font-size:12px;color:#94a3b8;">Cycle à 4 états : ActiveUnack, ActiveAck, ClearedUnack, Normal.</p>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;">
+              <input id="ackComment" placeholder="Commentaire d'acquittement (facultatif)" maxlength="200" style="background:#070b14;border:1px solid var(--border);color:#fff;padding:6px 10px;border-radius:5px;font-size:12px;width:260px;" />
+              <button class="btn btn-primary" onclick="ackAllAlarms()">✔ Acquitter Tout</button>
+              <button class="btn" onclick="clearNormalAlarms()">🧹 Effacer Alarmes Résolues</button>
+            </div>
+          </div>
+
+          <table class="scada-table">
+            <thead>
+              <tr>
+                <th>Apparition</th>
+                <th>Sévérité</th>
+                <th>État ISA-18.2</th>
+                <th>Variable</th>
+                <th>Description Alarme</th>
+                <th>Valeur</th>
+                <th>Acquitté Par</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="alarmsTableBody"></tbody>
+          </table>
+        </div>
+
+        <div class="card-box">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+            <h3>2. Journal Historique des Événements d'Alarmes (SQLite)</h3>
+            <button class="btn" onclick="loadAlarmJournal()">🔄 Actualiser Journal</button>
+          </div>
+          <table class="scada-table">
+            <thead>
+              <tr>
+                <th>Horodatage</th>
+                <th>Événement</th>
+                <th>Sévérité</th>
+                <th>Variable</th>
+                <th>Message</th>
+                <th>Opérateur</th>
+              </tr>
+            </thead>
+            <tbody id="alarmJournalTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ================================================================ -->
+      <!-- ATELIER 4 : DRIVERS (START/STOP/RESTART) & BASE DE TAGS          -->
+      <!-- ================================================================ -->
+      <div id="tab-tagdb" class="page-container" style="display:none;">
+        <div class="card-box">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+            <h3 style="color:var(--accent);">1. Supervision & Contrôle des Drivers Industriels (Marche / Arrêt / Redémarrage à chaud)</h3>
+            <button class="btn" onclick="renderDriversAndTagDb()">🔄 Actualiser État Drivers</button>
+          </div>
+
+          <div style="display:grid;grid-template-columns:1.1fr 1fr 1.2fr 0.6fr 0.7fr auto;gap:8px;align-items:end;margin-bottom:14px;">
+            <div class="form-group">
+              <label>ID Équipement</label>
+              <input id="drvId" value="MODBUS_SOUS_STATION_02" oninput="refreshDriverFormMode()" />
+            </div>
+            <div class="form-group">
+              <label>Protocole Industriel</label>
+              <select id="drvProto">
+                <option value="ModbusTcp">Modbus TCP/IP</option>
+                <option value="Mqtt">MQTT (JSON / IoT)</option>
+                <option value="OpcUa">OPC-UA Server</option>
+                <option value="BacnetIp">BACnet/IP (GTB)</option>
+                <option value="SiemensS7">Siemens S7 Profinet</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Endpoint Réseau (ex: 127.0.0.1:5502)</label>
+              <input id="drvEndpoint" value="127.0.0.1:5502" />
+            </div>
+            <div class="form-group">
+              <label>Unit / Slave ID</label>
+              <input type="number" id="drvUnitId" value="1" />
+            </div>
+            <div class="form-group">
+              <label>Scrutation (ms)</label>
+              <input type="number" id="drvPoll" value="1000" />
+            </div>
+            <button id="btnDriverSubmit" class="btn btn-primary" style="height:32px;" onclick="createNewDriver()">+ Déclarer & Démarrer</button>
+          </div>
+
+          <div id="driversCardsContainer"></div>
+        </div>
+
+        <div class="card-box">
+          <h3 style="margin-bottom:10px;color:var(--accent);">2. Éditeur CRUD de la Base de Données Temps Réel (Tag Database)</h3>
+          <div style="display:grid;grid-template-columns:1.2fr 1.2fr 0.8fr 1fr 0.6fr 0.5fr 0.6fr 0.6fr 0.6fr 0.6fr auto;gap:6px;align-items:end;margin-bottom:14px;">
+            <div class="form-group"><label>Tag ID</label><input id="tagFormId" value="GTB.CTA02.Temp_Soufflage" /></div>
+            <div class="form-group"><label>Libellé</label><input id="tagFormLabel" value="Température Soufflage CTA 02" /></div>
+            <div class="form-group"><label>Driver</label><input id="tagFormSource" value="SIM_GTB_01" /></div>
+            <div class="form-group"><label>Adresse</label><input id="tagFormAddr" value="HR:0:FLOAT32" /></div>
+            <div class="form-group">
+              <label>Type</label>
+              <select id="tagFormType">
+                <option value="Float">Float</option>
+                <option value="Bool">Bool</option>
+                <option value="Int">Int</option>
+                <option value="Text">Text</option>
+              </select>
+            </div>
+            <div class="form-group"><label>Unité</label><input id="tagFormUnit" value="°C" /></div>
+            <div class="form-group">
+              <label>Accès</label>
+              <select id="tagFormRw">
+                <option value="true">RW</option>
+                <option value="false">RO</option>
+              </select>
+            </div>
+            <div class="form-group"><label>Scale (×)</label><input type="number" step="0.1" id="tagFormScale" value="1.0" /></div>
+            <div class="form-group"><label>Seuil Bas</label><input type="number" step="0.5" id="tagFormLow" placeholder="Opt." /></div>
+            <div class="form-group"><label>Seuil Haut</label><input type="number" step="0.5" id="tagFormHigh" value="28.0" /></div>
+            <button class="btn btn-primary" style="height:32px;" onclick="saveTagFromForm()">💾 Enregistrer</button>
+          </div>
+
+          <table class="scada-table">
+            <thead>
+              <tr>
+                <th>Tag ID</th>
+                <th>Libellé</th>
+                <th>Driver</th>
+                <th>Adresse</th>
+                <th>Type</th>
+                <th>Valeur</th>
+                <th>Qualité</th>
+                <th>Alarmes (L / H)</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="tagCatalogTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ================================================================ -->
+      <!-- ATELIER 5 : PLANIFICATEUR HORAIRE GTB (CALENDRIER CVC)           -->
+      <!-- ================================================================ -->
+      <div id="tab-schedules" class="page-container" style="display:none;">
+        <div class="card-box">
+          <h3 style="margin-bottom:10px;color:var(--accent);">Planificateur Horaire GTB — Modes Confort Jour / Réduit Nuit</h3>
+          <div style="display:grid;grid-template-columns:1.5fr 1.3fr 0.7fr 0.7fr 0.7fr 0.7fr auto;gap:8px;align-items:end;margin-bottom:16px;">
+            <div class="form-group"><label>Nom du Programme</label><input id="schedName" value="Occupation Zone Bureaux" /></div>
+            <div class="form-group"><label>Variable Cible (Writable)</label><select id="schedTagSelect" class="scada-select"></select></div>
+            <div class="form-group"><label>Début Confort</label><input type="time" id="schedStart" value="07:00" /></div>
+            <div class="form-group"><label>Fin Confort</label><input type="time" id="schedEnd" value="19:00" /></div>
+            <div class="form-group"><label>Valeur Confort</label><input type="number" step="0.5" id="schedActiveVal" value="21.5" /></div>
+            <div class="form-group"><label>Valeur Réduit</label><input type="number" step="0.5" id="schedInactiveVal" value="17.5" /></div>
+            <button class="btn btn-primary" style="height:32px;" onclick="createScheduleRule()">+ Ajouter Planning</button>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;margin:-6px 0 16px;flex-wrap:wrap;">
+            <span style="font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;">Jours actifs :</span>
+            <div id="schedDaysBox" style="display:flex;gap:6px;flex-wrap:wrap;"></div>
+            <span style="font-size:11px;color:#64748b;">Une plage qui passe minuit (ex. 22:00 → 06:00) est rattachée à son jour de début.</span>
+          </div>
+
+          <table class="scada-table">
+            <thead>
+              <tr>
+                <th>Programme Horaire</th>
+                <th>Variable Commandée</th>
+                <th>Jours</th>
+                <th>Plage Horaire Jour</th>
+                <th>Consigne Confort</th>
+                <th>Consigne Réduit</th>
+                <th>Statut</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="schedulesTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ================================================================ -->
+      <!-- ATELIER 6 : HISTORIAN SQLITE, CONTRÔLE SYSTÈME & AUDIT TRAIL     -->
+      <!-- ================================================================ -->
+      <div id="tab-historian" class="page-container" style="display:none;">
+        <!-- SECTION CONTRÔLE SYSTÈME & MAINTENANCE (VISIBLE UNIQUEMENT POUR ADMIN) -->
+        <div class="card-box" id="systemAdminCard">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+            <div>
+              <h3 style="color:var(--accent);">1. Paramètres Système, Sauvegarde Projet & Alimentation Serveur (Réservé Admin)</h3>
+              <p style="font-size:12px;color:#94a3b8;">Contrôle complet du processus RustScadaFlow, export/import d'archive JSON et maintenance SQLite.</p>
+            </div>
+            <div style="display:flex;gap:8px;">
+              <button class="btn" onclick="exportProjectBackup()">📦 Exporter Projet (.json)</button>
+              <label class="btn" style="cursor:pointer;">
+                📂 Importer Projet (.json)
+                <input type="file" accept=".json" style="display:none;" onchange="importProjectBackup(event)" />
+              </label>
+              <button class="btn" style="border-color:#f59e0b;color:#fbbf24;" onclick="confirmServerRestart()">🔄 Redémarrer le Serveur</button>
+              <button class="btn btn-danger" onclick="confirmServerShutdown()">⏻ Éteindre l'Application</button>
+            </div>
+          </div>
+
+          <div class="kpi-grid">
+            <div class="kpi-card">
+              <div class="kpi-label">Processus & Uptime</div>
+              <div class="kpi-val" id="sysKpiUptime">--</div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-label">Drivers Actifs</div>
+              <div class="kpi-val" id="sysKpiDrivers">--</div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-label">Événements COV Traités</div>
+              <div class="kpi-val" id="sysKpiCov">--</div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-label">Flux Node-RED Actifs</div>
+              <div class="kpi-val" id="sysKpiFlows">--</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- SECTION HISTORIAN -->
+        <div class="card-box">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+            <div style="display:flex;align-items:center;gap:10px;">
+              <h3>2. Explorateur Historian SQLite</h3>
+              <select id="histTagSelect" class="scada-select" style="width:300px;" onchange="loadHistorianData()"></select>
+              <select id="histLimitSelect" class="scada-select" style="width:160px;" onchange="loadHistorianData()">
+                <option value="100">100 derniers points</option>
+                <option value="300" selected>300 derniers points</option>
+                <option value="1000">1000 derniers points</option>
+              </select>
+              <button class="btn" onclick="loadHistorianData()">🔄 Actualiser</button>
+            </div>
+            <div style="display:flex;gap:8px;">
+              <button class="btn btn-primary" onclick="downloadHistorianCsv()">📥 Exporter CSV (Excel)</button>
+              <button id="btnPurgeHistorian" class="btn btn-danger" onclick="purgeHistorianDb()">🗑️ Purger Historian</button>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;margin:-4px 0 14px;flex-wrap:wrap;font-size:12px;color:#94a3b8;">
+            <label for="histFrom">Période du</label>
+            <input type="datetime-local" id="histFrom" class="scada-select" style="width:200px;" onchange="loadHistorianData()" />
+            <label for="histTo">au</label>
+            <input type="datetime-local" id="histTo" class="scada-select" style="width:200px;" onchange="loadHistorianData()" />
+            <button class="btn" onclick="clearHistorianRange()">✕ Toute la période</button>
+            <span id="histRetentionInfo" style="margin-left:auto;color:#64748b;"></span>
+          </div>
+
+          <div class="kpi-grid">
+            <div class="kpi-card"><div class="kpi-label">Échantillons</div><div class="kpi-val" id="histCount">0</div></div>
+            <div class="kpi-card"><div class="kpi-label">Minimum</div><div class="kpi-val" id="histMin">--</div></div>
+            <div class="kpi-card"><div class="kpi-label">Maximum</div><div class="kpi-val" id="histMax">--</div></div>
+            <div class="kpi-card"><div class="kpi-label">Moyenne (± Écart-Type)</div><div class="kpi-val" id="histAvg">--</div></div>
+          </div>
+
+          <div id="historianChartBox" style="background:#060a12;border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px;"></div>
+
+          <table class="scada-table">
+            <thead>
+              <tr><th>Horodatage UTC</th><th>Variable</th><th>Valeur</th><th>Qualité OPC</th></tr>
+            </thead>
+            <tbody id="historianTableBody"></tbody>
+          </table>
+        </div>
+
+        <!-- SECTION AUDIT TRAIL -->
+        <div class="card-box">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+            <h3>3. Journal d'Audit & Traçabilité Opérateur (SQLite Audit Trail)</h3>
+            <div style="display:flex;gap:8px;align-items:center;">
+              <input id="auditFilter" class="scada-select" style="width:280px;" placeholder="Filtrer (acteur, action, cible...)" oninput="renderAuditTable()" />
+              <span id="auditCount" style="font-size:11px;color:#64748b;"></span>
+              <button class="btn" onclick="loadAuditLogs()">🔄 Actualiser Audit</button>
+            </div>
+          </div>
+          <table class="scada-table">
+            <thead>
+              <tr>
+                <th>Horodatage</th>
+                <th>Acteur</th>
+                <th>Catégorie</th>
+                <th>Action</th>
+                <th>Cible</th>
+                <th>Détails</th>
+              </tr>
+            </thead>
+            <tbody id="auditTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ================================================================ -->
+      <!-- ATELIER 7 : GESTION DES UTILISATEURS & GROUPES RBAC (ADMIN SEUL) -->
+      <!-- ================================================================ -->
+      <div id="tab-users" class="page-container" style="display:none;">
+        <div class="card-box">
+          <h3 style="margin-bottom:8px;color:var(--accent);">1. Matrice des Privilèges par Groupe Utilisateur (RBAC Industriel)</h3>
+          <table class="scada-table" style="margin-bottom:14px;">
+            <thead>
+              <tr>
+                <th>Groupe / Rôle</th>
+                <th>Dashboards (Visu)</th>
+                <th>Consignes & Commandes</th>
+                <th>Mode Studio & Symboles</th>
+                <th>Flux Node-RED & Drivers</th>
+                <th>Paramètres Système & Serveur</th>
+                <th>Gestion Utilisateurs</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="badge-rw" style="background:rgba(239,68,68,0.2);color:#f87171;">👑 Administrateur (Admin)</span></td>
+                <td>✅ Complet</td>
+                <td>✅ Autorisé</td>
+                <td>✅ Autorisé</td>
+                <td>✅ Autorisé</td>
+                <td>✅ Autorisé (Stop/Restart/Backup/Purge)</td>
+                <td>✅ Autorisé</td>
+              </tr>
+              <tr>
+                <td><span class="badge-rw" style="background:rgba(56,189,248,0.2);color:#38bdf8;">🛠️ Superviseur (Supervisor)</span></td>
+                <td>✅ Complet</td>
+                <td>✅ Autorisé</td>
+                <td>✅ Autorisé</td>
+                <td>✅ Autorisé</td>
+                <td>❌ Refusé (Masqué & Bloqué 403)</td>
+                <td>❌ Refusé</td>
+              </tr>
+              <tr>
+                <td><span class="badge-rw" style="background:rgba(16,185,129,0.2);color:#34d399;">👁️ Visualisation (Viewer)</span></td>
+                <td>✅ Lecture Seule</td>
+                <td>❌ Lecture Seule</td>
+                <td>❌ Masqué (Mode RUN verrouillé)</td>
+                <td>❌ Masqué</td>
+                <td>❌ Masqué</td>
+                <td>❌ Masqué</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card-box">
+          <h3 style="margin-bottom:10px;color:var(--accent);">2. Créer ou Modifier un Compte Utilisateur</h3>
+          <div style="display:grid;grid-template-columns:1fr 1.2fr 1fr 1.2fr 1fr 0.6fr auto;gap:8px;align-items:end;margin-bottom:16px;">
+            <div class="form-group">
+              <label>Identifiant (Login)</label>
+              <input id="usrFormLogin" value="operateur_nuit" />
+            </div>
+            <div class="form-group">
+              <label>Nom Complet</label>
+              <input id="usrFormName" value="Opérateur Ronde Nuit" />
+            </div>
+            <div class="form-group">
+              <label>Groupe de Privilèges</label>
+              <select id="usrFormRole">
+                <option value="Admin">👑 Administrateur (Tous droits)</option>
+                <option value="Supervisor">🛠️ Superviseur (Tout sauf Système)</option>
+                <option value="Viewer" selected>👁️ Visualisation (Dashboards seuls)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Service / Département</label>
+              <input id="usrFormDept" value="Poste de Garde CVC" />
+            </div>
+            <div class="form-group">
+              <label>Mot de Passe</label>
+              <input type="password" id="usrFormPass" autocomplete="new-password" placeholder="Obligatoire à la création · vide = inchangé" />
+            </div>
+            <div class="form-group">
+              <label>État</label>
+              <select id="usrFormEnabled">
+                <option value="true">Actif</option>
+                <option value="false">Désactivé</option>
+              </select>
+            </div>
+            <button class="btn btn-primary" style="height:32px;" onclick="saveUserAccount()">💾 Enregistrer</button>
+          </div>
+
+          <table class="scada-table">
+            <thead>
+              <tr>
+                <th>Identifiant</th>
+                <th>Nom Complet</th>
+                <th>Groupe / Privilèges</th>
+                <th>Service</th>
+                <th>Statut</th>
+                <th>Dernière Connexion</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="usersTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+    </main>
+
+    <!-- PANNEAU DROIT : PALETTE ENRICHIE D'ÉLÉMENTS INDUSTRIELS & INSPECTEUR -->
+    <aside class="right-panel" id="rightStudioPanel">
+      <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+        <span>Bibliothèque Industrielle (25+)</span>
+        <button class="btn" style="padding:2px 7px;font-size:10.5px;border-color:#38bdf8;color:#38bdf8;" onclick="openSymbolLibraryModal()">+ Importer SVG</button>
+      </div>
+
+      <div style="max-height:340px;overflow-y:auto;border-bottom:1px solid var(--border);padding-bottom:6px;">
+        <!-- CATÉGORIE 1 : HYDRAULIQUE & PROCESS P&ID (ISO 10628) -->
+        <div style="padding:6px 10px 2px;font-size:10px;font-weight:800;color:#38bdf8;text-transform:uppercase;">Hydraulique & Process P&ID</div>
+        <div class="palette-grid" style="border-bottom:none;padding-bottom:4px;">
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'Pump')">⚙️ Pompe Centrifuge</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'Valve')">🔧 Vanne 3 Voies</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'MotorValve2Way')">🚰 Vanne 2 Voies M</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'Compressor')">🌀 Compresseur ISO</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'HeatExchanger')">♨️ Échangeur Plaques</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'TankLevel')">🛢️ Bâche / Silo</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'FlowMeter')">🌊 Débitmètre FIT</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'PipeSegment')">📏 Tuyauterie Fluide</div>
+        </div>
+
+        <!-- CATÉGORIE 2 : CVC / GTB & PRODUCTION THERMIQUE -->
+        <div style="padding:6px 10px 2px;font-size:10px;font-weight:800;color:#10b981;text-transform:uppercase;">CVC / GTB & Thermique</div>
+        <div class="palette-grid" style="border-bottom:none;padding-bottom:4px;">
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'Fan')">💨 Ventilateur CTA</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'Damper')">🪟 Registre Air Neuf</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'Boiler')">🔥 Chaudière Gaz</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'Chiller')">❄️ Groupe Froid</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'CoolingTower')">🗼 Tour Aéroréfrig.</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'HeaterBattery')">🌡️ Batterie Chaude</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'FilterUnit')">🛡️ Caisson Filtre F7</div>
+        </div>
+
+        <!-- CATÉGORIE 3 : ÉLECTRICITÉ HTA/BT & MOTORISATION (IEC 60617) -->
+        <div style="padding:6px 10px 2px;font-size:10px;font-weight:800;color:#f59e0b;text-transform:uppercase;">Électricité HTA/BT (IEC 60617)</div>
+        <div class="palette-grid" style="border-bottom:none;padding-bottom:4px;">
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'CircuitBreaker')">⚡ Disjoncteur TGBT</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'Transformer')">🔌 Transfo HTA/BT</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'ElectricMotor')">🔄 Moteur Asynchr. 3~</div>
+        </div>
+
+        <!-- CATÉGORIE 4 : INSTRUMENTATION, COURBES & COMMANDES -->
+        <div style="padding:6px 10px 2px;font-size:10px;font-weight:800;color:#a855f7;text-transform:uppercase;">Instrumentation & Commandes</div>
+        <div class="palette-grid" style="border-bottom:none;padding-bottom:4px;">
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'Gauge')">🧭 Jauge Radiale</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'PressureGauge')">⏱️ Manomètre Bar</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'Thermometer')">🌡️ Thermomètre</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'TrendChart')">📈 Courbe Temps Réel</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'SetpointButton')">🎛️ Boîtier Consigne</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'SwitchButton')">🔘 Commutateur ON/OFF</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'PushButton')">👆 Bouton Impulsion</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'IndicatorLed')">🚨 Voyant Alarme</div>
+          <div class="palette-item" draggable="true" ondragstart="onPaletteDrag(event, 'NumericDisplay')">🔢 Afficheur Digital</div>
+        </div>
+
+        <!-- CATÉGORIE 5 : BIBLIOTHÈQUES GÉNÉRIQUES IMPORTÉES (SVG / P&ID / DRAW.IO) -->
+        <div style="padding:6px 10px 2px;display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:10px;font-weight:800;color:#38bdf8;text-transform:uppercase;">📦 Bibliothèques Importées</span>
+          <span id="customSymCount" style="font-size:10px;color:#94a3b8;">0</span>
+        </div>
+        <div id="customSymbolsPalette" class="palette-grid" style="border-bottom:none;"></div>
+      </div>
+
+      <div class="panel-header">Inspecteur & Télécommande</div>
+      <div id="inspectorContent" class="inspector-form">
+        <p style="color:#64748b;">Sélectionnez un widget sur le synoptique, un nœud de flux ou une variable pour configurer ses paramètres.</p>
+      </div>
+    </aside>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
