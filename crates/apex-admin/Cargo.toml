@@ -32,3 +32,7 @@ eframe = { version = "0.37", default-features = false, features = [
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
+
+# Icône et VERSIONINFO de l'exécutable Windows (build.rs ; rien pour Linux)
+[build-dependencies]
+apex-build.workspace = true

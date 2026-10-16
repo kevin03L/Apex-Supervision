@@ -64,6 +64,9 @@ OutputBaseFilename=apex-supervision-{#AppVersion}-windows-x64-setup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+; Icône du produit (packaging\icons\generer-icones.ps1) ; les raccourcis et l'entrée
+; « Applications installées » reprennent celle embarquée dans les exécutables.
+SetupIconFile={#SourceDir}\packaging\icons\apex-supervision.ico
 UninstallDisplayIcon={app}\{#AdminExe}
 UninstallDisplayName={#AppName}
 CloseApplications=yes

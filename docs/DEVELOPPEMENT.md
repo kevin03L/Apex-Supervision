@@ -15,8 +15,9 @@ apex-admin (bin apex-scada-admin) ──► apex-config ◄── apex-server (b
 | `crates/apex-core` | Moteur : tags, drivers, alarmes, flux et Rhai, planificateur, historique, audit, utilisateurs, sécurité | Indépendant d'Axum. `ScadaError::http_status()` donne le code HTTP, que le serveur applique. Le **mode sûr** est appliqué au point de passage unique des commandes (`write_tag`). |
 | `crates/apex-server` | `main.rs` (CLI), `app.rs` (cycle de vie : démarrage contrôlé, arrêt propre), `http.rs` (routes, WebSocket), `service.rs` (SCM Windows), `instance.rs` (instance unique), `logging.rs`, `legacy.rs` (variables `SCADA_*`, reprise des bases 1.x), `db.rs` | Ordre de démarrage documenté en tête de `app.rs` : tout échec survient **avant** toute communication industrielle. |
 | `crates/apex-admin` | Utilitaire desktop : `app.rs` (fenêtre, onglets), `wizard.rs` (assistant), `control.rs` (service, UAC, polkit, lancement manuel), `probe.rs` (client HTTP local minimal), `logs.rs`, `diag.rs`, `form.rs` | Ne dépend pas du moteur. Toute opération lente s'exécute dans un fil séparé. |
+| `crates/apex-build` | Dépendance de compilation (`build.rs`) des deux binaires : icône et `VERSIONINFO` Windows | Rien n'est lié aux exécutables ; sans effet pour une cible Linux. |
 | `static/` | IHM web (HTML / CSS / JavaScript, sans framework ni étape de compilation) | Servie à la même origine que l'API. |
-| `packaging/` | Installateur Windows (Inno Setup), paquet DEB (scripts de maintenance, unité systemd, règle polkit) | Les métadonnées `cargo-deb` sont dans `crates/apex-server/Cargo.toml`. |
+| `packaging/` | Installateur Windows (Inno Setup), paquet DEB (scripts de maintenance, unité systemd, règle polkit), icône (`icons/`) | Les métadonnées `cargo-deb` sont dans `crates/apex-server/Cargo.toml`. |
 
 Règles de conception :
 - Le moteur **ne réécrit jamais** le fichier de configuration : il n'a qu'un seul rédacteur, l'utilitaire ou la CLI.
@@ -33,10 +34,12 @@ cargo run -p apex-server -- help    # aide de la CLI du moteur
 ```
 
 - **Rust** : le moteur exige 1.89 (`File::try_lock`), l'utilitaire 1.95 (eframe 0.37).
-- **Windows** : les chaînes `x86_64-pc-windows-msvc` (référence pour la distribution, utilisée par la CI) et `x86_64-pc-windows-gnu` conviennent toutes les deux.
+- **Windows** : les chaînes `x86_64-pc-windows-msvc` (référence pour la distribution, utilisée par la CI) et `x86_64-pc-windows-gnu` conviennent toutes les deux. L'icône et la `VERSIONINFO` des `.exe` sont compilées par `rc.exe` (Windows SDK, chaîne MSVC) ou par `windres` (binutils MinGW, par exemple WinLibs, chaîne GNU). Sans compilateur de ressources, la compilation aboutit avec un avertissement, mais `build-installer.ps1` refuse ces binaires.
 - **Linux** : un compilateur C (`build-essential`), utilisé par SQLite et ring. Pour compiler l'utilitaire, voir la variable `LINUX_GUI_DEPS` dans `.github/workflows/ci.yml`.
 
-La version est définie **une seule fois** dans `[workspace.package]` du `Cargo.toml` racine. Elle est propagée à tous les binaires, à `/api/health`, à l'IHM, aux installateurs et aux noms des artefacts. `build.rs` d'`apex-config` ajoute le commit Git et la cible de compilation (`apex-scada version`).
+La version est définie **une seule fois** dans `[workspace.package]` du `Cargo.toml` racine. Elle est propagée à tous les binaires, à `/api/health`, à l'IHM, aux installateurs et aux noms des artefacts. `build.rs` d'`apex-config` ajoute le commit Git et la cible de compilation (`apex-scada version`). Sous Windows, les propriétés des `.exe` en dérivent : version de fichier numérique `0.4.0.1` pour `0.4.0-alpha.1` (même règle que l'installateur), version du produit `0.4.0-alpha.1`. Contrôle : `(Get-Item target\release\apex-scada.exe).VersionInfo`.
+
+**Icône** : `packaging/icons/generer-icones.ps1` (PowerShell 5.1, System.Drawing) dessine l'icône par code et produit `apex-supervision.svg`, `apex-supervision-256.png` (fenêtre de l'utilitaire, paquet Linux) et `apex-supervision.ico` (16 à 256 px : exécutables, installateur). Ces fichiers sont versionnés ; relancer le script après une modification du dessin, puis recompiler.
 
 ## 3. Tests
 

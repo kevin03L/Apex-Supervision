@@ -4,6 +4,7 @@ Name=Apex Supervision — Administration
 GenericName=Administration GTC/SCADA
 Comment=Configuration, état, journaux et diagnostics du moteur Apex Supervision
 Exec=apex-scada-admin
+Icon=apex-supervision
 Terminal=false
 Categories=System;Settings;
 Keywords=SCADA;GTC;GTB;supervision;configuration;

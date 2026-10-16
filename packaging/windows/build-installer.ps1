@@ -42,6 +42,12 @@ if (-not $SkipBuild) {
 foreach ($bin in 'apex-scada.exe', 'apex-scada-admin.exe') {
     $p = Join-Path $root "target\release\$bin"
     if (-not (Test-Path $p)) { throw "Binaire absent : $p" }
+    # Ressources Windows (icône, VERSIONINFO) : absentes si le compilateur de ressources
+    # manquait, ou binaire d'une autre version (-SkipBuild)
+    $info = (Get-Item $p).VersionInfo
+    if ($info.FileVersion -ne $numeric -or $info.ProductVersion -ne $version) {
+        throw "Version de fichier de $bin : « $($info.FileVersion) » / « $($info.ProductVersion) », attendu « $numeric » / « $version » (recompilez ; windres ou Windows SDK requis)"
+    }
 }
 
 if (-not $Iscc) {

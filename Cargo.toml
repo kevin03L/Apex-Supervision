@@ -5,6 +5,7 @@ members = [
     "crates/apex-core",
     "crates/apex-server",
     "crates/apex-admin",
+    "crates/apex-build",
 ]
 default-members = ["crates/apex-server", "crates/apex-admin"]
 
@@ -21,6 +22,7 @@ publish = false
 [workspace.dependencies]
 apex-config = { path = "crates/apex-config" }
 apex-core = { path = "crates/apex-core" }
+apex-build = { path = "crates/apex-build" }
 
 # Runtime asynchrone & serveur web
 tokio = { version = "1.40", features = ["full"] }
