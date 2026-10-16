@@ -156,7 +156,10 @@ Une solution plus sûre consiste à placer un proxy HTTPS (nginx, Caddy) devant 
 sudo apt install ./apex-supervision_<nouvelle-version>_amd64.deb
 ```
 
-Le service est arrêté, les programmes sont remplacés, la configuration est mise au format courant (valeurs conservées, sauvegarde dans `/etc/apex-supervision/backups/`), puis le service est redémarré.
+Les programmes sont remplacés (le moteur en marche continue de tourner pendant la copie des fichiers), la configuration est mise au format courant, puis le service est redémarré. Une configuration déjà au format courant n'est pas modifiée. Si une conversion a lieu, les valeurs sont conservées mais le fichier est réécrit : les commentaires ajoutés à la main disparaissent ; l'ancien fichier est sauvegardé dans `/etc/apex-supervision/backups/`.
+
+- Un service **activé** est redémarré, même s'il avait été arrêté avec `systemctl stop` : arrêtez-le de nouveau après la mise à jour si nécessaire.
+- Un service **désactivé** (`systemctl disable apex-scada`) reste arrêté.
 
 ### 2.5 Désinstallation
 

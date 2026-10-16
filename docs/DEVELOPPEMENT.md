@@ -92,7 +92,7 @@ L'utilitaire expose son interface à l'accessibilité (AccessKit). Il peut ainsi
 
 `.github/workflows/ci.yml` :
 - **à chaque push et pull request** : `fmt`, puis `clippy -D warnings` et `test` sous Windows et Ubuntu 22.04 ;
-- **sur un tag `v*`** (ou à la demande) : installateur Windows et paquet DEB, avec leurs empreintes SHA-256. Le paquet DEB est **installé, démarré, interrogé, arrêté et purgé** sur le runner.
+- **sur un tag `v*`** (ou à la demande) : installateur Windows et paquet DEB, avec leurs empreintes SHA-256. Le paquet DEB est **installé, démarré, interrogé, arrêté, redémarré, mis à jour (réinstallation), désinstallé puis purgé** sur le runner.
 
 ## 5. Publication d'une version
 
@@ -103,7 +103,9 @@ L'utilitaire expose son interface à l'accessibilité (AccessKit). Il peut ainsi
 
 Construction locale :
 - installateur Windows : `packaging\windows\build-installer.ps1` (Inno Setup 6 requis) ;
-- paquet DEB : `cargo deb -p apex-server` (après `cargo build --release`).
+- paquet DEB (sous Linux, `cargo install cargo-deb --locked`) : `cargo build --release --locked -p apex-server -p apex-admin`, puis `cargo deb -p apex-server --no-build --output dist/`. Le paquet contient les deux programmes : les deux doivent être compilés avant.
+
+Depuis un poste Windows, la compilation et le paquet se font dans un conteneur `ubuntu:22.04` (glibc 2.35, comme la CI) avec `build-essential`, `curl`, `pkg-config`, les paquets de `LINUX_GUI_DEPS` et rustup. Placez `CARGO_HOME` et `CARGO_TARGET_DIR` dans des volumes Docker nommés : un dossier Windows monté est très lent. Pour tester le paquet, il faut un conteneur avec systemd comme PID 1 (`--privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw`, commande `/sbin/init`). Supprimez `/usr/sbin/policy-rc.d` des images Ubuntu : ce script empêche `apt` de démarrer, d'arrêter et de redémarrer les services, ce qui fausse le test.
 
 **Signature** (prévue avant la bêta) : Authenticode pour les binaires et l'installateur (directive `SignTool` déjà préparée dans le script Inno Setup), et signature du paquet DEB ou d'un dépôt APT.
 

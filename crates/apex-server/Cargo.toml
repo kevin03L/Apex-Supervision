@@ -1,6 +1,7 @@
 [package]
 name = "apex-server"
-description = "Apex Supervision — moteur GTC/SCADA et serveur web de supervision (service Windows / systemd)"
+# Sert aussi de résumé au paquet DEB : 79 caractères au plus, sinon cargo-deb le coupe en deux lignes.
+description = "Apex Supervision — moteur GTC/SCADA et serveur web de supervision"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
