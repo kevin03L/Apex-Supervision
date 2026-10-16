@@ -97,14 +97,17 @@ impl Layout {
         if let Some(file) = explicit {
             return Self::for_config_file(&file);
         }
+        // Un fichier trouvé dans le dossier courant ou à côté de l'exécutable désigne une
+        // instance portable, sauf s'il s'agit du fichier système lui-même (commande lancée
+        // depuis le dossier de configuration système).
         if let Ok(cwd) = std::env::current_dir() {
             if cwd.join(CONFIG_FILE_NAME).is_file() {
-                return Self::portable(&cwd);
+                return Self::for_config_file(&cwd.join(CONFIG_FILE_NAME));
             }
         }
         if let Some(dir) = exe_dir() {
             if dir.join(CONFIG_FILE_NAME).is_file() {
-                return Self::portable(&dir);
+                return Self::for_config_file(&dir.join(CONFIG_FILE_NAME));
             }
         }
         Self::system()
@@ -114,7 +117,7 @@ impl Layout {
     pub fn for_config_file(file: &Path) -> Self {
         let system = Self::system();
         let file = absolutize(file);
-        if file == system.config_file {
+        if same_file(&file, &system.config_file) {
             return system;
         }
         let base = file
@@ -210,6 +213,20 @@ fn exe_dir() -> Option<PathBuf> {
         .and_then(|p| p.parent().map(Path::to_path_buf))
 }
 
+/// Deux chemins désignent-ils le même fichier ? Chemins canoniques quand ils existent (noms
+/// courts 8.3, liens), sinon comparaison textuelle, insensible à la casse sous Windows.
+fn same_file(a: &Path, b: &Path) -> bool {
+    if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
+        return ca == cb;
+    }
+    if cfg!(windows) {
+        let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").to_lowercase();
+        norm(a) == norm(b)
+    } else {
+        a == b
+    }
+}
+
 fn absolutize(p: &Path) -> PathBuf {
     if p.is_absolute() {
         p.to_path_buf()
@@ -256,6 +273,17 @@ mod tests {
         let l = Layout::for_config_file(&file);
         assert_eq!(l.config_file, file);
         assert_eq!(l.data_dir, file.parent().unwrap().join("data"));
+    }
+
+    #[test]
+    fn system_config_file_is_recognised_whatever_the_case() {
+        let sys = Layout::system().config_file;
+        assert_eq!(Layout::for_config_file(&sys).kind, LayoutKind::System);
+        #[cfg(windows)]
+        {
+            let lower = PathBuf::from(sys.to_string_lossy().to_lowercase());
+            assert_eq!(Layout::for_config_file(&lower).kind, LayoutKind::System);
+        }
     }
 
     #[test]

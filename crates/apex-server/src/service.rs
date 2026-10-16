@@ -147,9 +147,11 @@ pub fn manage(action: &str, config: Option<PathBuf>) -> Result<String, String> {
         "status" => status(),
         "enable" => set_start_type(true),
         "disable" => set_start_type(false),
+        "permissions" => prepare_directories(&Layout::system())
+            .map(|_| "Répertoires et permissions de %ProgramData%\\Apex Supervision appliqués.".into()),
         "run" => run_dispatcher(config).map(|_| String::new()),
         other => Err(format!(
-            "action de service inconnue « {other} » (install, uninstall, start, stop, restart, status, enable, disable)"
+            "action de service inconnue « {other} » (install, uninstall, start, stop, restart, status, enable, disable, permissions)"
         )),
     }
 }
@@ -222,13 +224,25 @@ fn install(config: Option<PathBuf>) -> Result<String, String> {
     ))
 }
 
-/// Crée les répertoires système et applique les permissions du service.
+/// Crée les répertoires système et applique leurs permissions (installation et mise à jour).
+///
+/// L'héritage de %ProgramData% (où les utilisateurs peuvent créer fichiers et dossiers) est
+/// coupé à la racine, le propriétaire de toute l'arborescence devient le groupe Administrateurs
+/// (un dossier créé à l'avance par un autre compte ne lui laisse donc aucun droit), puis :
+/// - racine, config, backups : lecture par les utilisateurs et le service, écriture réservée
+///   aux administrateurs ;
+/// - logs : écriture par le service, lecture par les utilisateurs (utilitaire desktop) ;
+/// - data, run : SYSTEM, administrateurs et service uniquement (base, jeton de contrôle).
 pub fn prepare_directories(layout: &Layout) -> Result<(), String> {
     let config_dir = layout
         .config_file
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_default();
+    let root = config_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| config_dir.clone());
     for dir in [
         &config_dir,
         &layout.backup_dir,
@@ -239,11 +253,26 @@ pub fn prepare_directories(layout: &Layout) -> Result<(), String> {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("création de « {} » impossible : {e}", dir.display()))?;
     }
-    let grant_service = format!("{SID_LOCAL_SERVICE}:(OI)(CI)M");
     let full = |sid: &str| format!("{sid}:(OI)(CI)F");
-    // Journaux : écriture par le service, lecture par les utilisateurs (utilitaire desktop)
-    icacls(&layout.log_dir, &["/grant", &grant_service])?;
-    // Données et jeton : réservés au système, aux administrateurs et au service
+    let read = |sid: &str| format!("{sid}:(OI)(CI)RX");
+    let modify_service = format!("{SID_LOCAL_SERVICE}:(OI)(CI)M");
+
+    icacls(&root, &["/setowner", SID_ADMINISTRATORS, "/T", "/Q"])?;
+    icacls(
+        &root,
+        &[
+            "/inheritance:r",
+            "/grant:r",
+            &full(SID_SYSTEM),
+            &full(SID_ADMINISTRATORS),
+            &read(SID_USERS),
+            &read(SID_LOCAL_SERVICE),
+        ],
+    )?;
+    // Les descendants ne gardent que les droits hérités de la racine (ACE ajoutées par un
+    // autre compte supprimées)
+    icacls(&root.join("*"), &["/reset", "/T", "/Q"])?;
+    icacls(&layout.log_dir, &["/grant", &modify_service])?;
     for dir in [&layout.data_dir, &layout.run_dir] {
         icacls(
             dir,
@@ -252,19 +281,10 @@ pub fn prepare_directories(layout: &Layout) -> Result<(), String> {
                 "/grant:r",
                 &full(SID_SYSTEM),
                 &full(SID_ADMINISTRATORS),
-                &grant_service,
+                &modify_service,
             ],
         )?;
     }
-    // Configuration : lecture par le service et les utilisateurs, écriture par les administrateurs
-    icacls(
-        &config_dir,
-        &[
-            "/grant",
-            &format!("{SID_USERS}:(OI)(CI)RX"),
-            &format!("{SID_LOCAL_SERVICE}:(OI)(CI)RX"),
-        ],
-    )?;
     Ok(())
 }
 

@@ -135,6 +135,7 @@ pub async fn migrate_database(
         .execute(&mut conn)
         .await
         .map_err(|e| format!("copie de la base impossible : {e}"))?;
+    align_owner_with_data_dir(&destination);
 
     let mut counts = Vec::new();
     for table in [
@@ -161,3 +162,26 @@ pub async fn migrate_database(
         counts,
     })
 }
+
+/// Linux : une reprise lancée en root (sudo) produirait une base appartenant à root, que le
+/// service (utilisateur apex-scada) ne pourrait plus écrire. La copie prend donc le
+/// propriétaire du répertoire des données.
+#[cfg(unix)]
+fn align_owner_with_data_dir(destination: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let Some(dir_meta) = destination.parent().and_then(|d| std::fs::metadata(d).ok()) else {
+        return;
+    };
+    for file in [
+        destination.to_path_buf(),
+        destination.with_extension("db-wal"),
+        destination.with_extension("db-shm"),
+    ] {
+        if file.exists() {
+            let _ = std::os::unix::fs::chown(&file, Some(dir_meta.uid()), Some(dir_meta.gid()));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn align_owner_with_data_dir(_destination: &Path) {}

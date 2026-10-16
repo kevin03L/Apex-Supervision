@@ -27,8 +27,13 @@ case "$1" in
             # Mise à jour : format courant, valeurs conservées, sauvegarde préalable
             /usr/bin/apex-scada config migrate --config "$CONF" >/dev/null || true
         fi
-        chgrp apex-scada "$CONF"
-        chmod 0660 "$CONF"
+        # Fichiers écrits par root ci-dessus (configuration, verrou d'écriture, sauvegardes) :
+        # modifiables par le groupe, sinon l'utilitaire des membres du groupe ne peut rien enregistrer
+        for f in "$CONF" "$CONF.lock" "$CONF_DIR"/backups/*.toml; do
+            [ -e "$f" ] || continue
+            chgrp apex-scada "$f"
+            chmod 0660 "$f"
+        done
         ;;
 esac
 

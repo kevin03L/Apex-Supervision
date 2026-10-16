@@ -345,6 +345,19 @@ impl AppConfig {
                 "database.file",
                 "le chemin de la base ne doit pas contenir « .. »",
             ));
+        } else if !Path::new(db).is_absolute()
+            && Path::new(db).components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::Prefix(_) | std::path::Component::RootDir
+                )
+            })
+        {
+            // Windows : « \apex.db » ou « C:apex.db » ne sont ni relatifs à data_dir ni absolus
+            issues.push(Issue::error(
+                "database.file",
+                "indiquez un nom relatif au répertoire des données, ou un chemin absolu complet",
+            ));
         }
 
         if self.history.retention_days > 3650 {
@@ -475,6 +488,23 @@ mod tests {
         assert!(!cfg.safety.safe_mode);
         assert!(!has_errors(&cfg.validate()), "{:?}", cfg.validate());
         assert!(AppConfig::portable_default().simulation.enabled);
+    }
+
+    #[test]
+    fn database_file_must_stay_relative_or_be_fully_absolute() {
+        let mut cfg = AppConfig::default();
+        for ok in ["apex-scada.db", "sous-dossier/base.db"] {
+            cfg.database.file = ok.into();
+            assert!(!has_errors(&cfg.validate()), "{ok} accepté");
+        }
+        #[cfg(windows)]
+        for bad in [r"\apex.db", "C:apex.db"] {
+            cfg.database.file = bad.into();
+            assert!(
+                cfg.validate().iter().any(|i| i.field == "database.file"),
+                "{bad} refusé"
+            );
+        }
     }
 
     #[test]

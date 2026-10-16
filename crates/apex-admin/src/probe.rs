@@ -31,6 +31,8 @@ pub struct Runtime {
     pub safe_mode: bool,
     pub simulation_enabled: bool,
     pub full_version: String,
+    /// Surcharges `SCADA_*` appliquées par le moteur (compatibilité 1.x).
+    pub env_overrides: Vec<String>,
 }
 
 /// Adresse à laquelle joindre le moteur depuis ce poste.
@@ -84,6 +86,15 @@ pub fn health(cfg: &AppConfig) -> Result<Health, String> {
             safe_mode: b("safe_mode"),
             simulation_enabled: b("simulation_enabled"),
             full_version: s("full_version"),
+            env_overrides: r
+                .get("env_overrides")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     });
     Ok(Health {

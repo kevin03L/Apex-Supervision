@@ -8,7 +8,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=exec
+# Le moteur signale « prêt » (sd_notify) une fois le serveur web ouvert
+Type=notify
+NotifyAccess=main
 User=apex-scada
 Group=apex-scada
 ExecStart=/usr/bin/apex-scada run --config /etc/apex-supervision/apex-scada.toml

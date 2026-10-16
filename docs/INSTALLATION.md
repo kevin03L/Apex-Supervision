@@ -49,12 +49,15 @@ Contenu installé :
 | Service | `ApexSupervision` (« Apex Supervision »), compte **LocalService**, redémarrage automatique après un échec |
 | Menu Démarrer | « Apex Supervision — Administration », « Assistant de configuration », « Documentation » |
 
-Permissions posées par l'installation :
-- `data` et `run` : SYSTEM, Administrateurs et le service uniquement ;
+Permissions posées par l'installation, et réappliquées à chaque mise à jour (`apex-scada service permissions`) :
+- toute l'arborescence `C:ProgramDataApex Supervision` appartient au groupe Administrateurs, et l'héritage des droits de `C:ProgramData` (où tout utilisateur peut créer des fichiers) est coupé ;
+- `config` et `backups` : lecture par les utilisateurs et le service, modification par les administrateurs seulement ;
 - `logs` : écriture par le service, lecture par les utilisateurs (utilitaire desktop) ;
-- `config` : lecture par les utilisateurs et le service, modification par les administrateurs.
+- `data` et `run` : SYSTEM, Administrateurs et le service uniquement.
 
-L'utilitaire s'exécute en utilisateur standard. Les actions sur le service et la modification de la configuration demandent une confirmation administrateur (UAC). Il propose aussi de **se relancer en administrateur**.
+L'utilitaire s'exécute en utilisateur standard, avec la configuration en lecture seule. Pour la modifier, utilisez le bouton **« Relancer en administrateur »**. Les actions sur le service (démarrer, arrêter, démarrage automatique) demandent une confirmation UAC au moment où elles sont lancées.
+
+> L'assistant lancé à la fin de l'installation hérite des droits administrateur de l'installateur (il doit écrire la configuration et régler le service). Fermez-le une fois la configuration terminée ; relancez ensuite l'utilitaire normalement depuis le menu Démarrer.
 
 ### 1.3 Installation silencieuse (déploiement)
 
@@ -70,11 +73,14 @@ Ces commandes s'exécutent dans une invite administrateur, depuis `C:\Program Fi
 
 Relancez l'installateur de la nouvelle version. Il effectue, dans l'ordre :
 1. l'arrêt propre du service s'il fonctionne ;
-2. le remplacement des programmes et de l'IHM web ;
-3. la mise au format courant de la configuration (`apex-scada config migrate` : valeurs conservées, ancienne version sauvegardée) ;
-4. le redémarrage du service s'il fonctionnait avant la mise à jour.
+2. le remplacement des programmes et de l'IHM web (l'ancienne IHM est supprimée en entier) ;
+3. la réapplication du propriétaire et des permissions de `C:\ProgramData\Apex Supervision` ;
+4. la mise au format courant de la configuration (`apex-scada config migrate` : valeurs conservées, ancienne version sauvegardée) ;
+5. le redémarrage du service s'il fonctionnait avant la mise à jour.
 
-**La configuration, la base et les journaux ne sont jamais écrasés.** La base est migrée par le moteur à son démarrage.
+Si la mise à jour est annulée ou échoue après l'arrêt du service, celui-ci est relancé avec les programmes restés en place. Une réinstallation après une désinstallation qui avait conservé la configuration redémarre aussi le service.
+
+**La configuration, la base et les journaux ne sont jamais écrasés.** Le moteur complète le schéma de la base à son démarrage (tables et colonnes ajoutées), sans sauvegarde automatique de la base : copiez-la avant une mise à jour importante ([ADMINISTRATION.md](ADMINISTRATION.md) §8).
 
 ### 1.5 Désinstallation
 
@@ -106,6 +112,8 @@ Le paquet effectue les opérations suivantes :
 - il génère `/etc/apex-supervision/apex-scada.toml` avec des valeurs par défaut sûres : écoute sur `127.0.0.1:3000`, simulation désactivée ;
 - il installe, active et démarre l'unité `apex-scada.service`.
 
+> **Différence avec Windows** : un paquet DEB ne pose pas de questions. Le moteur démarre aussitôt avec ces valeurs par défaut sûres (poste local uniquement, aucune simulation, aucun driver configuré). Réglez ensuite l'instance avec l'utilitaire (`apex-scada-admin --wizard`) ou en ligne de commande (ci-dessous), puis redémarrez le service.
+
 | Élément | Emplacement |
 |---|---|
 | Programmes | `/usr/bin/apex-scada`, `/usr/bin/apex-scada-admin` |
@@ -131,13 +139,28 @@ Configuration initiale sans interface graphique (serveur) :
 ```bash
 sudo apex-scada config init --force --config /etc/apex-supervision/apex-scada.toml \
      --name "Site A" --bind 0.0.0.0 --port 3000
-sudo chgrp apex-scada /etc/apex-supervision/apex-scada.toml && sudo chmod 0660 /etc/apex-supervision/apex-scada.toml
+# Fichiers écrits par root (configuration, verrou d'écriture) : modifiables par le groupe
+sudo chgrp apex-scada /etc/apex-supervision/apex-scada.toml* && sudo chmod 0660 /etc/apex-supervision/apex-scada.toml*
 sudo systemctl restart apex-scada
 ```
 
 Avec une session graphique, lancez « Apex Supervision — Administration » depuis le menu des applications, ou `apex-scada-admin --wizard`.
 
-### 2.3 Port inférieur à 1024
+### 2.3 Emplacements personnalisés
+
+L'unité est durcie (`ProtectSystem=strict`, `ProtectHome=yes`) : le moteur ne peut écrire que dans `/var/lib/apex-supervision`, `/var/log/apex-supervision` et `/run/apex-supervision`. Pour placer les données ou les journaux ailleurs (`paths.data_dir`, `paths.log_dir`), donnez le dossier à l'utilisateur du service **et** déclarez-le à systemd :
+
+```bash
+sudo install -d -o apex-scada -g apex-scada -m 0750 /srv/apex/data
+sudo systemctl edit apex-scada
+# [Service]
+# ReadWritePaths=/srv/apex/data
+sudo systemctl restart apex-scada
+```
+
+Sans cette déclaration, le service ne démarre pas (base ou journaux inaccessibles). Une IHM web placée sous `/home` exige en plus `ProtectHome=read-only`.
+
+### 2.4 Port inférieur à 1024
 
 Le service ne dispose d'aucune capacité système. Pour écouter sur le port 80 :
 
@@ -150,7 +173,7 @@ sudo systemctl edit apex-scada
 
 Une solution plus sûre consiste à placer un proxy HTTPS (nginx, Caddy) devant le port 3000.
 
-### 2.4 Mise à jour
+### 2.5 Mise à jour
 
 ```bash
 sudo apt install ./apex-supervision_<nouvelle-version>_amd64.deb
@@ -161,7 +184,7 @@ Les programmes sont remplacés (le moteur en marche continue de tourner pendant 
 - Un service **activé** est redémarré, même s'il avait été arrêté avec `systemctl stop` : arrêtez-le de nouveau après la mise à jour si nécessaire.
 - Un service **désactivé** (`systemctl disable apex-scada`) reste arrêté.
 
-### 2.5 Désinstallation
+### 2.6 Désinstallation
 
 | Commande | Effet |
 |---|---|
@@ -180,7 +203,9 @@ apex-scada run                                    # Ctrl+C pour un arrêt propre
 apex-scada-admin --config ./apex-scada.toml       # utilitaire sur cette instance
 ```
 
-Le moteur utilise le mode portable dès qu'un fichier `apex-scada.toml` se trouve dans le dossier courant ou à côté de l'exécutable. Il l'utilise aussi lorsqu'un fichier est désigné par `--config` ou par la variable `APEX_SCADA_CONFIG`.
+Le moteur utilise le mode portable dès qu'un fichier `apex-scada.toml` se trouve dans le dossier courant ou à côté de l'exécutable, ou qu'un fichier est désigné par `--config` ou par la variable `APEX_SCADA_CONFIG`. Seule exception : le fichier de l'installation système lui-même, qui garde les emplacements système.
+
+En installation système, rien n'est créé dans les emplacements système tant que le logiciel n'est pas installé : `apex-scada run` et `config init` sans `--portable` ni `--config` répondent alors « logiciel non installé ».
 
 ---
 
@@ -192,7 +217,16 @@ Les versions 1.x enregistraient tout dans `rust_scada_flow.db`, dans le dossier 
 apex-scada migrate-legacy --from "<dossier ou fichier rust_scada_flow.db>"
 ```
 
-La base est **copiée** dans le répertoire des données, et la source n'est jamais modifiée. Si une base existe déjà à la destination, `--force` la remplace après l'avoir sauvegardée en `.bak-<date>`. L'assistant de configuration propose cette reprise lorsqu'il détecte une ancienne base.
+La base est **copiée** dans le répertoire des données, et la source n'est jamais modifiée. Si une base existe déjà à la destination, `--force` la remplace après l'avoir sauvegardée en `.bak-<date>`.
+
+- **Windows** : dans une invite administrateur, ou par l'assistant de configuration, qui propose la reprise lorsqu'il détecte une ancienne base (le service est arrêté pendant la copie puis relancé).
+- **Linux (paquet)** : la copie prend le propriétaire du répertoire des données, même lancée avec sudo :
+
+```bash
+sudo systemctl stop apex-scada
+sudo apex-scada migrate-legacy --from /chemin/rust_scada_flow.db --force      --config /etc/apex-supervision/apex-scada.toml
+sudo systemctl start apex-scada
+```
 
 ---
 

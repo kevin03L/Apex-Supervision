@@ -71,7 +71,8 @@ pub fn init(cfg: &AppConfig, log_dir: &Path) -> Result<Option<WorkerGuard>, Stri
 pub fn startup_error(log_dir: &Path, message: &str) {
     let line = format!(
         "{} ERREUR {}\n",
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        // Même format que les journaux quotidiens (RFC 3339, UTC) : tri chronologique commun
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
         message.replace('\n', " | ")
     );
     if std::fs::create_dir_all(log_dir).is_ok() {

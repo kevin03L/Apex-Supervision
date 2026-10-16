@@ -43,9 +43,12 @@ use tracing::info;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RuntimeInfo {
     pub instance_name: String,
-    /// Empreinte de la configuration chargée : l'utilitaire la compare au fichier sur disque
-    /// pour savoir si un redémarrage est nécessaire.
+    /// Empreinte de la configuration du fichier chargée au démarrage (avant les surcharges
+    /// d'environnement) : l'utilitaire la compare au fichier sur disque pour savoir si un
+    /// redémarrage est nécessaire.
     pub config_fingerprint: String,
+    /// Surcharges `SCADA_*` appliquées (compatibilité 1.x).
+    pub env_overrides: Vec<String>,
     pub config_file: String,
     pub data_dir: String,
     pub log_dir: String,

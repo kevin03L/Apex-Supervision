@@ -73,6 +73,9 @@ pub struct Wizard {
     step: Step,
     pub cfg: AppConfig,
     autostart: bool,
+    /// État du démarrage automatique à l'ouverture : il n'est modifié que si l'utilisateur
+    /// change la valeur (chaque modification demande une élévation).
+    initial_autostart: Option<bool>,
     start_engine: bool,
     legacy_db: Option<PathBuf>,
     migrate_legacy: bool,
@@ -94,6 +97,7 @@ impl Wizard {
             step: Step::Welcome,
             cfg: start,
             autostart: true,
+            initial_autostart: None,
             start_engine: true,
             migrate_legacy: legacy_db.is_some(),
             legacy_db,
@@ -107,6 +111,7 @@ impl Wizard {
     /// Valeur initiale du démarrage automatique (état actuel du service).
     pub fn set_autostart(&mut self, on: bool) {
         self.autostart = on;
+        self.initial_autostart = Some(on);
     }
 
     /// Affiche l'assistant. `can_write` : la configuration peut-elle être enregistrée ?
@@ -196,7 +201,8 @@ impl Wizard {
         }
         Plan {
             config,
-            autostart: self.has_service.then_some(self.autostart),
+            autostart: (self.has_service && self.initial_autostart != Some(self.autostart))
+                .then_some(self.autostart),
             migrate_legacy: if self.migrate_legacy {
                 self.legacy_db.clone()
             } else {
@@ -434,8 +440,16 @@ impl Wizard {
             if self.kind == LayoutKind::System {
                 form::hint(
                     ui,
-                    "Le compte du service doit pouvoir écrire dans ces dossiers : accordez-lui les droits si vous \
-                     choisissez un emplacement hors des dossiers standard.",
+                    if cfg!(windows) {
+                        "Le compte du service (LocalService) doit pouvoir écrire dans ces dossiers : \
+                         accordez-lui le droit Modification si vous choisissez un emplacement hors des \
+                         dossiers standard."
+                    } else {
+                        "Le service systemd ne peut écrire que dans ses dossiers standard : pour un autre \
+                         emplacement, donnez-le à l'utilisateur apex-scada ET déclarez-le avec \
+                         « systemctl edit apex-scada » → [Service] ReadWritePaths=<dossier> \
+                         (voir INSTALLATION.md)."
+                    },
                 );
             }
         }

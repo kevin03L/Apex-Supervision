@@ -33,19 +33,14 @@ pub struct Args {
     pub wizard: bool,
 }
 
-impl Args {
-    /// Arguments à transmettre lors d'une relance avec élévation.
-    fn to_vec(&self, wizard: bool) -> Vec<String> {
-        let mut v = Vec::new();
-        if let Some(c) = &self.config {
-            v.push("--config".into());
-            v.push(c.display().to_string());
-        }
-        if wizard {
-            v.push("--wizard".into());
-        }
-        v
+/// Arguments d'une relance avec élévation : toujours le chemin ABSOLU du fichier administré
+/// (un processus élevé démarre en général dans System32).
+fn relaunch_args(config_file: &std::path::Path, wizard: bool) -> Vec<String> {
+    let mut v = vec!["--config".to_string(), config_file.display().to_string()];
+    if wizard {
+        v.push("--wizard".into());
     }
+    v
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +77,9 @@ impl Tab {
 
 struct Snapshot {
     health: Result<Health, String>,
+    /// Configuration et emplacements sur lesquels le moteur a répondu (adresse réellement
+    /// utilisée par le moteur en marche, qui peut différer du fichier après une modification).
+    target: Option<(AppConfig, Layout)>,
     service: ServiceInfo,
     problems: Vec<String>,
     at: Instant,
@@ -164,6 +162,8 @@ enum Confirm {
     Restart,
     Restore(PathBuf),
     QuitUnsaved,
+    /// Fermeture demandée pendant une action (arrêt, redémarrage...) encore en cours.
+    QuitBusy(String),
 }
 
 #[derive(Default)]
@@ -199,6 +199,8 @@ pub struct AdminApp {
     rx: mpsc::Receiver<Msg>,
     snapshot: Option<Snapshot>,
     probing: bool,
+    /// Dernière cible sur laquelle le moteur a répondu (voir `Snapshot::target`).
+    running: Option<(AppConfig, Layout)>,
     last_probe: Option<Instant>,
     busy: Option<String>,
     notices: Vec<Notice>,
@@ -234,6 +236,7 @@ impl AdminApp {
             rx,
             snapshot: None,
             probing: false,
+            running: None,
             last_probe: None,
             busy: None,
             notices: Vec::new(),
@@ -323,13 +326,38 @@ impl AdminApp {
         }
         self.probing = true;
         self.last_probe = Some(Instant::now());
-        let cfg = self.disk.config.clone();
-        let log_dir = self.layout.log_dir.clone();
+        // Adresse du moteur en marche d'abord, puis celle du fichier (moteur redémarré)
+        let mut candidates: Vec<(AppConfig, Layout)> = self.running.iter().cloned().collect();
+        candidates.push((self.disk.config.clone(), self.layout.clone()));
+        let file_log_dir = self.layout.log_dir.clone();
         self.spawn(ctx, move || {
+            let mut health = Err(String::new());
+            let mut target = None;
+            let mut tried = Vec::new();
+            for (cfg, layout) in candidates {
+                let addr = probe::target(&cfg).ok();
+                if tried.contains(&addr) {
+                    continue;
+                }
+                tried.push(addr);
+                match probe::health(&cfg) {
+                    Ok(h) => {
+                        health = Ok(h);
+                        target = Some((cfg, layout));
+                        break;
+                    }
+                    Err(e) => health = Err(e),
+                }
+            }
+            let log_dir = target
+                .as_ref()
+                .map(|(_, l): &(AppConfig, Layout)| l.log_dir.clone())
+                .unwrap_or(file_log_dir);
             Msg::Status(Box::new(Snapshot {
-                health: probe::health(&cfg),
-                service: control::service_query(),
+                health,
                 problems: logs::recent_problems(&log_dir, 8),
+                target,
+                service: control::service_query(),
                 at: Instant::now(),
             }))
         });
@@ -339,6 +367,7 @@ impl AdminApp {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Status(s) => {
+                    self.running = s.target.clone();
                     self.snapshot = Some(*s);
                     self.probing = false;
                 }
@@ -423,6 +452,14 @@ impl AdminApp {
                 .is_some_and(|s| s.service.state.is_installed())
     }
 
+    /// Configuration et emplacements du moteur en marche (adresse réelle, verrou, jeton), ou
+    /// ceux du fichier si le moteur ne répond pas.
+    fn running_target(&self) -> (AppConfig, Layout) {
+        self.running
+            .clone()
+            .unwrap_or_else(|| (self.disk.config.clone(), self.layout.clone()))
+    }
+
     fn health(&self) -> Option<&Health> {
         self.snapshot.as_ref().and_then(|s| s.health.as_ref().ok())
     }
@@ -456,7 +493,7 @@ impl AdminApp {
         if self.uses_service() {
             self.action(ctx, "Arrêt du service", || control::service_action("stop"));
         } else {
-            let (layout, cfg) = (self.layout.clone(), self.disk.config.clone());
+            let (cfg, layout) = self.running_target();
             self.action(ctx, "Arrêt du moteur", move || {
                 stop_manual_and_wait(&layout, &cfg)?;
                 Ok("Moteur arrêté proprement.".into())
@@ -470,7 +507,7 @@ impl AdminApp {
                 control::service_action("restart")
             });
         } else {
-            let (layout, cfg) = (self.layout.clone(), self.disk.config.clone());
+            let (cfg, layout) = self.running_target();
             let file = self.base_layout.config_file.clone();
             self.action(ctx, "Redémarrage du moteur", move || {
                 if probe::health(&cfg).is_ok() {
@@ -531,11 +568,14 @@ impl AdminApp {
         let service = control::service_query();
         let has_service =
             self.base_layout.kind == LayoutKind::System && service.state.is_installed();
-        let legacy = diag::find_legacy_db(&self.layout).filter(|_| {
-            // Proposée seulement si la base actuelle n'existe pas encore
-            !self.layout.database_file(&self.disk.config).exists()
-        });
-        let mut w = Wizard::new(self.disk.config.clone(), &self.layout, has_service, legacy);
+        // Reprise proposée seulement si la base actuelle n'existe pas encore. Sous Linux, en
+        // installation système, elle exige root puis l'utilisateur apex-scada : elle passe par
+        // la procédure documentée et non par l'utilitaire.
+        let legacy_possible = cfg!(windows) || self.base_layout.kind == LayoutKind::Portable;
+        let legacy = diag::find_legacy_db(&self.layout)
+            .filter(|_| legacy_possible && !self.layout.database_file(&self.disk.config).exists());
+        // L'assistant part des valeurs en cours d'édition : rien n'est perdu
+        let mut w = Wizard::new(self.edit.clone(), &self.base_layout, has_service, legacy);
         if let (true, Some(auto)) = (has_service, service.automatic) {
             w.set_autostart(auto);
         }
@@ -543,6 +583,8 @@ impl AdminApp {
     }
 
     fn finish_wizard(&mut self, ctx: &egui::Context, plan: wizard::Plan) {
+        // Moteur en marche AVANT l'enregistrement (son adresse peut changer avec le fichier)
+        let (running_cfg, running_layout) = self.running_target();
         if self.save(&plan.config).is_none() {
             return; // l'assistant reste ouvert, l'erreur est affichée
         }
@@ -550,73 +592,111 @@ impl AdminApp {
         self.tab = Tab::Status;
         let uses_service = self.base_layout.kind == LayoutKind::System
             && control::service_query().state.is_installed();
-        let layout = self.layout.clone();
-        let cfg = self.disk.config.clone();
         let file = self.base_layout.config_file.clone();
-        let privileged = layout.kind == LayoutKind::System;
+        let privileged = self.base_layout.kind == LayoutKind::System;
         self.action(ctx, "Configuration initiale", move || {
+            // Étapes indépendantes : un échec est signalé sans empêcher les suivantes,
+            // et le moteur est toujours relancé s'il a été arrêté ici.
             let mut done = vec!["Configuration enregistrée.".to_string()];
+            let mut errors: Vec<String> = Vec::new();
+            let mut stopped_service = false;
             if let Some(src) = &plan.migrate_legacy {
                 // La copie exige le moteur arrêté (verrou d'instance)
-                if uses_service {
+                let stopped = if uses_service {
                     if control::service_query().state != ServiceState::Stopped {
-                        control::service_action("stop")?;
-                        wait_service_stopped()?;
+                        let r =
+                            control::service_action("stop").and_then(|_| wait_service_stopped());
+                        stopped_service = r.is_ok();
+                        r
+                    } else {
+                        Ok(())
                     }
-                } else if probe::health(&cfg).is_ok() {
-                    stop_manual_and_wait(&layout, &cfg)?;
-                }
-                let src = src.display().to_string();
-                let file_s = file.display().to_string();
-                let args = [
-                    "migrate-legacy",
-                    "--from",
-                    &src,
-                    "--force",
-                    "--config",
-                    &file_s,
-                ];
-                let (code, out) = if privileged {
-                    control::run_privileged(&control::engine_path(), &args)?
+                } else if probe::health(&running_cfg).is_ok() {
+                    stop_manual_and_wait(&running_layout, &running_cfg)
                 } else {
-                    run_engine(&args)?
+                    Ok(())
                 };
-                if code != 0 {
-                    return Err(format!(
-                        "reprise des données impossible (code {code} : {}){}",
-                        apex_config::exit::describe(code),
-                        if out.is_empty() {
-                            String::new()
+                match stopped {
+                    Err(e) => errors.push(format!("reprise des données impossible : {e}")),
+                    Ok(()) => {
+                        let src = src.display().to_string();
+                        let file_s = file.display().to_string();
+                        let args = [
+                            "migrate-legacy",
+                            "--from",
+                            &src,
+                            "--force",
+                            "--config",
+                            &file_s,
+                        ];
+                        let result = if privileged {
+                            control::run_privileged(&control::engine_path(), &args)
                         } else {
-                            format!("\n{out}")
+                            run_engine(&args)
+                        };
+                        match result {
+                            Ok((0, _)) => {
+                                done.push("Données de la version antérieure copiées.".into())
+                            }
+                            Ok((code, out)) => errors.push(format!(
+                                "reprise des données impossible (code {code} : {}){}",
+                                apex_config::exit::describe(code),
+                                if out.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        "
+{out}"
+                                    )
+                                }
+                            )),
+                            Err(e) => errors.push(format!("reprise des données impossible : {e}")),
                         }
-                    ));
+                    }
                 }
-                done.push("Données de la version antérieure copiées.".into());
             }
             if let Some(auto) = plan.autostart {
-                control::service_action(if auto { "enable" } else { "disable" })?;
-                done.push(
-                    if auto {
-                        "Démarrage automatique activé."
-                    } else {
-                        "Démarrage automatique désactivé."
-                    }
-                    .into(),
-                );
-            }
-            if plan.start_engine {
-                if uses_service {
-                    control::service_action("restart")?;
-                    done.push("Service démarré.".into());
-                } else {
-                    if probe::health(&cfg).is_ok() {
-                        stop_manual_and_wait(&layout, &cfg)?;
-                    }
-                    done.push(control::start_manual(&file)?);
+                match control::service_action(if auto { "enable" } else { "disable" }) {
+                    Ok(_) => done.push(
+                        if auto {
+                            "Démarrage automatique activé."
+                        } else {
+                            "Démarrage automatique désactivé."
+                        }
+                        .into(),
+                    ),
+                    Err(e) => errors.push(format!("démarrage automatique non modifié : {e}")),
                 }
             }
-            Ok(done.join(" "))
+            if plan.start_engine || stopped_service {
+                let started = if uses_service {
+                    control::service_action("restart").map(|_| "Service démarré.".to_string())
+                } else {
+                    let stop = if probe::health(&running_cfg).is_ok() {
+                        stop_manual_and_wait(&running_layout, &running_cfg)
+                    } else {
+                        Ok(())
+                    };
+                    stop.and_then(|_| control::start_manual(&file))
+                };
+                match started {
+                    Ok(m) => done.push(m),
+                    Err(e) => errors.push(format!("démarrage du moteur impossible : {e}")),
+                }
+            }
+            if errors.is_empty() {
+                Ok(done.join(" "))
+            } else {
+                Err(format!(
+                    "{}
+{}",
+                    done.join(" "),
+                    errors.join(
+                        "
+"
+                    )
+                ))
+            }
         });
     }
 
@@ -705,7 +785,7 @@ impl AdminApp {
     }
 
     fn relaunch_elevated(&mut self, ctx: &egui::Context, wizard: bool) {
-        let args = self.args.to_vec(wizard);
+        let args = relaunch_args(&self.base_layout.config_file, wizard);
         #[cfg(windows)]
         match control::relaunch_elevated(&args) {
             Ok(()) => {
@@ -737,7 +817,7 @@ impl eframe::App for AdminApp {
         self.header(ui, &ctx);
 
         if let Some(mut w) = self.wizard.take() {
-            match w.ui(ui, &self.layout, self.writable) {
+            match w.ui(ui, &self.base_layout, self.writable) {
                 wizard::Outcome::Continue => self.wizard = Some(w),
                 wizard::Outcome::Cancel => {
                     if !self.disk.exists {
@@ -776,8 +856,14 @@ impl eframe::App for AdminApp {
 impl AdminApp {
     fn handle_close(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|i| i.viewport().close_requested());
-        if requested && !self.allow_close && self.edit != self.disk.config && self.wizard.is_none()
-        {
+        if !requested || self.allow_close {
+            return;
+        }
+        if let Some(what) = &self.busy {
+            // Fermer interromprait l'action (moteur arrêté mais jamais relancé, par exemple)
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(Confirm::QuitBusy(what.clone()));
+        } else if self.edit != self.disk.config && self.wizard.is_none() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm = Some(Confirm::QuitUnsaved);
         }
@@ -972,7 +1058,7 @@ impl AdminApp {
                     self.confirm = Some(Confirm::Restart);
                 }
                 ui.separator();
-                let url = probe::web_url(&self.disk.config);
+                let url = probe::web_url(&self.running_target().0);
                 if ui
                     .add_enabled(state == EngineState::Online, egui::Button::new("Ouvrir l'IHM web"))
                     .on_hover_text(&url)
@@ -984,8 +1070,8 @@ impl AdminApp {
                     self.last_probe = None;
                 }
             });
-            if uses_service && self.layout.kind == LayoutKind::System && !self.elevated {
-                form::hint(ui, "Les actions sur le service demandent une confirmation administrateur (UAC sous Windows).");
+            if cfg!(windows) && uses_service && !self.elevated {
+                form::hint(ui, "Les actions sur le service demandent une confirmation administrateur (UAC).");
             }
             ui.add_space(8.0);
 
@@ -1001,7 +1087,7 @@ impl AdminApp {
             let mut autostart_toggle: Option<&'static str> = None;
             egui::Grid::new("status_grid").num_columns(2).spacing([24.0, 6.0]).striped(true).show(ui, |ui| {
                 ui.label("Adresse de l'IHM");
-                ui.monospace(probe::web_url(&self.disk.config));
+                ui.monospace(probe::web_url(&self.running_target().0));
                 ui.end_row();
 
                 ui.label("Lancement");
@@ -1078,6 +1164,17 @@ impl AdminApp {
                         if rt.safe_mode {
                             ui.label("Mode sûr");
                             ui.colored_label(form::warn_color(ui), "actif : aucune commande vers les équipements réels");
+                            ui.end_row();
+                        }
+                        if !rt.env_overrides.is_empty() {
+                            ui.label("Surcharges");
+                            ui.colored_label(
+                                form::warn_color(ui),
+                                format!(
+                                    "variables d'environnement actives : {}",
+                                    rt.env_overrides.join(", ")
+                                ),
+                            );
                             ui.end_row();
                         }
                         if rt.simulation_enabled {
@@ -1667,8 +1764,15 @@ impl AdminApp {
             Confirm::Restore(p) => (
                 "Restaurer cette configuration ?",
                 format!(
-                    "La configuration du {} remplacera l'actuelle (qui sera sauvegardée). Elle s'appliquera au prochain démarrage du moteur.",
-                    file_label(p)
+                    "La configuration du {} remplacera l'actuelle (qui sera sauvegardée). Elle s'appliquera au prochain démarrage du moteur.{}",
+                    file_label(p),
+                    if self.edit != self.disk.config {
+                        "
+
+Attention : les modifications non enregistrées de l'onglet Configuration seront perdues."
+                    } else {
+                        ""
+                    }
                 ),
                 "Restaurer",
             ),
@@ -1676,6 +1780,13 @@ impl AdminApp {
                 "Quitter sans enregistrer ?",
                 "Des modifications de configuration n'ont pas été enregistrées. Le moteur continue de fonctionner après la fermeture de l'utilitaire.".into(),
                 "Quitter sans enregistrer",
+            ),
+            Confirm::QuitBusy(what) => (
+                "Une action est en cours",
+                format!(
+                    "« {what} » n'est pas terminée. Fermer maintenant peut l'interrompre à mi-parcours (par exemple, moteur arrêté mais pas relancé). Attendez la fin de l'action de préférence."
+                ),
+                "Fermer quand même",
             ),
         };
         let mut decision: Option<bool> = None;
@@ -1708,7 +1819,7 @@ impl AdminApp {
             Some(Confirm::Stop) => self.stop_engine(ctx),
             Some(Confirm::Restart) => self.restart_engine(ctx),
             Some(Confirm::Restore(p)) => self.restore(&p),
-            Some(Confirm::QuitUnsaved) => {
+            Some(Confirm::QuitUnsaved) | Some(Confirm::QuitBusy(_)) => {
                 self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -1747,7 +1858,16 @@ fn kind_color(ui: &egui::Ui, kind: Kind) -> egui::Color32 {
 fn can_write_config(layout: &Layout) -> bool {
     let installed = layout.kind == LayoutKind::Portable
         || layout.config_file.parent().is_some_and(|d| d.is_dir());
-    installed && control::config_dir_writable(&layout.config_file)
+    if !installed {
+        return false;
+    }
+    // Windows, installation système : réservé aux administrateurs, quelles que soient les
+    // permissions effectives du dossier (une installation antérieure à la correction des
+    // permissions pouvait laisser les utilisateurs y créer des fichiers).
+    if cfg!(windows) && layout.kind == LayoutKind::System {
+        return control::is_elevated();
+    }
+    control::config_dir_writable(&layout.config_file)
 }
 
 /// Arrêt propre en mode manuel, puis attente de la libération du verrou d'instance (la base
@@ -1876,15 +1996,12 @@ mod tests {
 
     #[test]
     fn relaunch_arguments_keep_config_and_wizard() {
-        let a = Args {
-            config: Some(PathBuf::from(r"C:\Sites\A b.toml")),
-            wizard: false,
-        };
+        let file = std::path::Path::new(r"C:\Sites\A b.toml");
         assert_eq!(
-            a.to_vec(true),
+            relaunch_args(file, true),
             vec!["--config", r"C:\Sites\A b.toml", "--wizard"]
         );
-        assert!(Args::default().to_vec(false).is_empty());
+        assert_eq!(relaunch_args(file, false).len(), 2);
     }
 
     #[test]

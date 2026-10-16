@@ -58,11 +58,13 @@ Le fichier ne contient **aucun secret**. Les comptes sont en base, avec des mots
 | **Sauvegardes** | Liste les 20 dernières versions de la configuration, compare chacune à la version actuelle et permet de la restaurer (la version remplacée est elle-même sauvegardée). |
 | **À propos** | Versions de l'utilitaire et du moteur, emplacements, historique des messages. |
 
-L'utilitaire ne dépend pas du moteur. Il reste utilisable quand le moteur est arrêté, quand son port est incorrect ou quand la configuration est invalide. Il interroge le moteur uniquement en boucle locale (`/api/health`).
+L'utilitaire ne dépend pas du moteur. Il reste utilisable quand le moteur est arrêté, quand son port est incorrect ou quand la configuration est invalide. Il interroge le moteur sur son adresse d'écoute (`/api/health`), en boucle locale quand l'écoute est `127.0.0.1` ou `0.0.0.0`. Après une modification de l'adresse ou du port, il continue de suivre le moteur en marche sur son ancienne adresse jusqu'à son redémarrage.
+
+> Avec une **adresse d'écoute précise** (ex. `192.168.1.10`), le moteur n'est pas joignable en boucle locale : l'utilitaire voit son état, mais pas ses détails d'exécution. Il ne peut alors ni détecter qu'un redémarrage est nécessaire, ni arrêter un moteur lancé manuellement (le jeton local n'est accepté qu'en boucle locale). Le service, lui, reste pilotable.
 
 **Droits** : l'utilitaire s'exécute en utilisateur standard, et la configuration est alors en lecture seule sur une installation système.
 - Sous Windows, le bouton « Relancer en administrateur » donne les droits nécessaires. Les actions sur le service demandent une confirmation UAC.
-- Sous Linux, l'appartenance au groupe `apex-scada` suffit.
+- Sous Linux, l'appartenance au groupe `apex-scada` suffit pour modifier la configuration et pour démarrer, arrêter ou redémarrer le service (règle polkit, ignorée par Ubuntu 22.04). Activer ou désactiver le démarrage automatique demande le mot de passe administrateur.
 
 Options : `--config <fichier>` pour administrer une instance précise, `--wizard` pour ouvrir l'assistant.
 
@@ -78,7 +80,7 @@ Options : `--config <fichier>` pour administrer une instance précise, `--wizard
 | `apex-scada config init [--portable] [--force] [--name …] [--bind …] [--port …] [--simulation] [--safe-mode]` | Crée un fichier. Un fichier existant n'est remplacé qu'avec `--force`, et il est alors sauvegardé. |
 | `apex-scada config migrate` | Réécrit le fichier au format courant : valeurs conservées, sauvegarde préalable. |
 | `apex-scada migrate-legacy --from <dossier\|fichier.db> [--force]` | Copie la base d'une version 1.x. La source n'est jamais modifiée. |
-| `apex-scada service install\|uninstall\|start\|stop\|restart\|status\|enable\|disable` | Service Windows (administrateur). Sous Linux, utilisez `systemctl`. |
+| `apex-scada service install\|uninstall\|start\|stop\|restart\|status\|enable\|disable\|permissions` | Service Windows (administrateur). `permissions` réapplique le propriétaire et les droits de `C:\ProgramData\Apex Supervision`. Sous Linux, utilisez `systemctl`. |
 | `apex-scada version` | Version, commit et cible de compilation. |
 
 ### Codes de sortie
@@ -86,9 +88,9 @@ Options : `--config <fichier>` pour administrer une instance précise, `--wizard
 | Code | Signification | Action |
 |---|---|---|
 | 0 | Succès / arrêt normal | — |
-| 1 | Erreur | Consulter les journaux. |
+| 1 | Erreur | Consulter les journaux. Pour `migrate-legacy` : droits insuffisants sur le répertoire des données. |
 | 2 | Ligne de commande invalide | `apex-scada help`. |
-| 3 | Configuration invalide | `apex-scada config check`, ou onglet Configuration. |
+| 3 | Configuration invalide, ou logiciel non installé (emplacements système absents) | `apex-scada config check`, ou onglet Configuration ; sinon installer le logiciel ou utiliser `--config`. |
 | 4 | Une autre instance utilise déjà le répertoire de données | Arrêter l'autre instance (le PID est indiqué). |
 | 5 | Adresse ou port d'écoute indisponible | Changer le port, ou arrêter le programme qui l'occupe. |
 | 6 | Base de données inaccessible | Vérifier les droits du répertoire des données et l'espace disque. |

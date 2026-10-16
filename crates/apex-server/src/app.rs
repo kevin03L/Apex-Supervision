@@ -70,6 +70,18 @@ pub struct Effective {
     pub file_exists: bool,
     pub migrated_from: Option<u32>,
     pub env_overrides: Vec<String>,
+    /// Empreinte de la configuration du fichier, avant les surcharges d'environnement :
+    /// c'est elle que l'utilitaire compare au fichier pour détecter un redémarrage nécessaire.
+    pub file_fingerprint: String,
+}
+
+impl Effective {
+    /// Le logiciel est-il installé ? (mode portable, ou dossier de configuration système créé
+    /// par l'installateur). Sinon, rien ne doit être créé dans les emplacements système.
+    pub fn installed(&self) -> bool {
+        self.layout.kind == LayoutKind::Portable
+            || self.layout.config_file.parent().is_some_and(|d| d.is_dir())
+    }
 }
 
 /// Lit la configuration effective sans rien démarrer (utilisé aussi par `config check/show`).
@@ -83,6 +95,7 @@ pub fn load_effective(config_path: Option<&std::path::Path>) -> Result<Effective
     let loaded = store::load_or(&layout.config_file, default)
         .map_err(|e| StartupError::new(exit::CONFIG, e.to_string()))?;
     let mut config = loaded.config;
+    let file_fingerprint = config.fingerprint();
     let env_overrides = legacy::apply_env_overrides(&mut config);
     let layout = layout.with_overrides(&config);
     Ok(Effective {
@@ -91,6 +104,7 @@ pub fn load_effective(config_path: Option<&std::path::Path>) -> Result<Effective
         file_exists,
         migrated_from: loaded.migrated_from,
         env_overrides,
+        file_fingerprint,
     })
 }
 
@@ -108,10 +122,29 @@ pub async fn run(
     let eff = match load_effective(config_path.as_deref()) {
         Ok(e) => e,
         Err(e) => {
-            logging::startup_error(&Layout::resolve(config_path.as_deref()).log_dir, &e.message);
+            let layout = Layout::resolve(config_path.as_deref());
+            if layout.kind == LayoutKind::Portable
+                || layout.config_file.parent().is_some_and(|d| d.is_dir())
+            {
+                logging::startup_error(&layout.log_dir, &e.message);
+            }
             return Err(e);
         }
     };
+    if !eff.installed() {
+        // Aucun dossier système créé par un compte quelconque : l'installateur s'en charge
+        return Err(StartupError::new(
+            exit::CONFIG,
+            format!(
+                "logiciel non installé : « {} » n'existe pas. Installez Apex Supervision, ou lancez                  une instance portable avec --config <fichier>.",
+                eff.layout
+                    .config_file
+                    .parent()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_default()
+            ),
+        ));
+    }
     let issues = eff.config.validate();
     if has_errors(&issues) {
         let detail = issues
@@ -267,7 +300,8 @@ pub async fn run(
     }
     let runtime = RuntimeInfo {
         instance_name: cfg.instance.name.trim().to_string(),
-        config_fingerprint: cfg.fingerprint(),
+        config_fingerprint: eff.file_fingerprint.clone(),
+        env_overrides: eff.env_overrides.clone(),
         config_file: layout.config_file.display().to_string(),
         data_dir: layout.data_dir.display().to_string(),
         log_dir: layout.log_dir.display().to_string(),

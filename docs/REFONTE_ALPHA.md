@@ -215,7 +215,7 @@ Les données sont hors du dossier du programme : une mise à jour ou une désins
 
 | Opération | Windows | Linux |
 |---|---|---|
-| Exécution du moteur | Service sous `LocalService` (droits minimaux), ACL d'écriture sur `data`, `logs` et `run` | Utilisateur `apex-scada` sans shell, durcissement systemd (`ProtectSystem=strict`, `NoNewPrivileges`, `ReadWritePaths`) |
+| Exécution du moteur | Service sous `LocalService` (droits minimaux), ACL d'écriture sur `data`, `logs` et `run` | Utilisateur `apex-scada` sans shell, durcissement systemd (`ProtectSystem=strict`, `NoNewPrivileges`, écriture limitée aux `StateDirectory`/`LogsDirectory`/`RuntimeDirectory` ; tout autre emplacement exige un `ReadWritePaths` ajouté par `systemctl edit`) |
 | Lecture de la configuration et des journaux | Utilisateurs | Groupe `apex-scada` |
 | Modification de la configuration | Administrateurs (l'utilitaire demande l'élévation UAC) | `root` ou groupe `apex-scada` (fichier `0660`) |
 | Démarrer / arrêter le service | Administrateurs (élévation UAC à la demande) | Règle polkit pour le groupe `apex-scada` |
@@ -227,7 +227,7 @@ L'utilitaire s'exécute **en utilisateur normal**. Seules les actions qui le né
 
 ## 7. Mise à jour et désinstallation
 
-- **Mise à jour** : l'installateur remplace les binaires et l'IHM. Configuration et données ne sont jamais écrasées. Au démarrage, le moteur applique les migrations de configuration (avec sauvegarde préalable) et de base.
+- **Mise à jour** : l'installateur remplace les binaires et l'IHM. Configuration et données ne sont jamais écrasées. Le moteur lit un ancien format de configuration en le migrant en mémoire ; le fichier est réécrit, avec sauvegarde, par `apex-scada config migrate` (lancé par l'installateur et le paquet) ou par l'utilitaire. Le moteur complète le schéma de la base à son démarrage, sans sauvegarde automatique de la base.
 - **Données des versions précédentes** : une commande `apex-scada migrate-legacy --from <ancien dossier>` **copie** l'ancienne base `rust_scada_flow.db`, sans jamais la déplacer ni la supprimer. L'assistant la propose s'il en détecte une.
 - **Désinstallation** : supprime les binaires et le service. Elle **conserve** la configuration, les données et les journaux, sauf case explicite « supprimer aussi les données » (Windows) ou `apt purge` (Linux), toujours documentés.
 - **Mises à jour automatiques** : aucune en alpha. Les artefacts sont publiés avec leurs empreintes SHA-256. La signature Authenticode (Windows) et la signature des paquets (Linux) sont prévues avant la bêta.
@@ -351,6 +351,8 @@ Anomalies relevées, non corrigées :
 - `config migrate` a été ajoutée. L'ancienne consigne (`config init --force`) aurait remplacé la configuration par les valeurs par défaut.
 - Les scripts `Demarrer/Arreter/Redemarrer-SCADA.bat` sont supprimés : ils visaient le binaire `rust-scada-flow.exe`, qui n'existe plus. Ils sont remplacés par l'utilitaire, le service et la CLI.
 - Utilitaire : Rust 1.95 minimum (eframe 0.37) ; le moteur reste compatible avec Rust 1.89.
+- **Linux : aucune question pendant l'installation** (cahier §8 et §17 non tenus sous Linux). Un paquet DEB ne doit pas être interactif hors debconf : le moteur démarre avec des valeurs par défaut sûres (poste local, sans simulation ni driver), puis l'administrateur règle l'instance avec l'utilitaire ou la CLI. Des questions debconf sont envisageables avant la bêta.
+- **Windows : l'assistant lancé par l'installateur hérite de ses droits administrateur** (écart au cahier §11, qui veut des élévations isolées). Il doit écrire la configuration et régler le service au moment de l'installation ; la documentation invite à le fermer ensuite et à relancer l'utilitaire normalement.
 
 ### 12.4 Limites connues et travaux avant la bêta
 
@@ -359,4 +361,5 @@ En plus des critères du §11 :
 - le paquet DEB est validé en conteneur systemd sur Debian 12, Ubuntu 22.04 et 24.04 (§12.2). Restent à valider : des machines réelles, une mise à jour depuis une version antérieure du paquet, l'utilitaire sous Wayland et avec un GPU réel, et un premier passage de la CI sur GitHub. Sur Ubuntu 22.04, polkit 0.105 ignore la règle JavaScript : une authentification est demandée pour chaque action ;
 - licence du logiciel à définir (paquet marqué `LicenseRef-Proprietary`, aucune licence dans le dépôt) ;
 - l'utilitaire lance des actions élevées par PowerShell (`Start-Process -Verb RunAs`) : seul le code de sortie est connu, pas le message détaillé ;
-- tests d'intégration automatisés du serveur web (authentification, RBAC, WebSocket) et de l'utilitaire, encore manuels.
+- l'assistant permet d'ouvrir le serveur au réseau alors que les comptes d'usine (`admin/admin123`…) sont encore actifs : une étape « mot de passe administrateur » est à ajouter ;
+- tests automatisés de l'utilitaire desktop (les essais par UI Automation restent manuels) ; les tests d'intégration du serveur sont faits (`crates/apex-server/tests/`).

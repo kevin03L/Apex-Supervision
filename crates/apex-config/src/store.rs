@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use crate::{
     model::{fnv1a64, has_errors, AppConfig, Issue, CONFIG_VERSION},
-    paths::Layout,
+    paths::{Layout, LayoutKind},
 };
 
 /// Nombre de sauvegardes conservées.
@@ -47,6 +47,8 @@ pub enum ConfigError {
     Locked,
     #[error("le fichier de configuration a été modifié par ailleurs depuis sa lecture : rechargez-le avant d'enregistrer")]
     Conflict,
+    #[error("logiciel non installé : le dossier « {dir} » est créé par l'installateur (pour une instance portable, utilisez --portable ou --config <fichier>)")]
+    NotInstalled { dir: PathBuf },
 }
 
 /// Résultat d'une lecture.
@@ -137,26 +139,38 @@ pub fn save(
 
     let path = &layout.config_file;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    if layout.kind == LayoutKind::System && !dir.is_dir() {
+        // Le dossier système est créé par l'installateur avec ses permissions : un utilisateur
+        // qui le créerait lui-même en deviendrait propriétaire.
+        return Err(ConfigError::NotInstalled {
+            dir: dir.to_path_buf(),
+        });
+    }
     fs::create_dir_all(dir).map_err(|source| ConfigError::Write {
         path: dir.to_path_buf(),
         source,
     })?;
 
     let lock_path = layout.config_lock_file();
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|source| ConfigError::Write {
-            path: lock_path.clone(),
-            source,
-        })?;
+    let lock = open_lock(&lock_path).map_err(|source| ConfigError::Write {
+        path: lock_path.clone(),
+        source,
+    })?;
     lock.try_lock().map_err(|_| ConfigError::Locked)?;
 
-    // Détection des modifications concurrentes (dans la section protégée par le verrou)
-    let current_raw = fs::read_to_string(path).ok();
-    let current_hash = current_raw.as_deref().map(|r| fnv1a64(r.as_bytes()));
+    // Détection des modifications concurrentes (dans la section protégée par le verrou).
+    // Lecture en octets : un fichier non UTF-8 existe bel et bien et doit être sauvegardé.
+    let current_raw = match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(ConfigError::Read {
+                path: path.clone(),
+                source,
+            })
+        }
+    };
+    let current_hash = current_raw.as_deref().map(fnv1a64);
     if current_hash != expected_hash {
         return Err(ConfigError::Conflict);
     }
@@ -167,25 +181,30 @@ pub fn save(
     };
 
     let content = render(config);
-    let tmp = dir.join(format!(
-        ".{}.tmp-{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("config"),
-        std::process::id()
-    ));
-    let write_tmp = || -> std::io::Result<()> {
-        let mut f = File::create(&tmp)?;
+    let (tmp, mut file) = create_temp(dir, path).map_err(|source| ConfigError::Write {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    let write_tmp = |f: &mut File| -> std::io::Result<()> {
         f.write_all(content.as_bytes())?;
+        // Le nouveau fichier reprend le mode et le groupe de l'ancien (Linux : 0660 root:apex-scada)
+        #[cfg(unix)]
+        if let Ok(meta) = fs::metadata(path) {
+            use std::os::unix::fs::MetadataExt;
+            let _ = std::os::unix::fs::chown(&tmp, None, Some(meta.gid()));
+            let _ = fs::set_permissions(&tmp, meta.permissions());
+        }
         f.sync_all()
     };
-    if let Err(source) = write_tmp() {
+    if let Err(source) = write_tmp(&mut file) {
+        drop(file);
         let _ = fs::remove_file(&tmp);
         return Err(ConfigError::Write {
             path: tmp.clone(),
             source,
         });
     }
+    drop(file);
     fs::rename(&tmp, path).map_err(|source| {
         let _ = fs::remove_file(&tmp);
         ConfigError::Write {
@@ -193,7 +212,7 @@ pub fn save(
             source,
         }
     })?;
-    prune_backups(&layout.backup_dir);
+    prune_backups(&layout.backup_dir, backup.as_deref());
     drop(lock);
 
     Ok(SaveReport {
@@ -202,7 +221,54 @@ pub fn save(
     })
 }
 
-fn write_backup(backup_dir: &Path, raw: &str) -> Result<PathBuf, ConfigError> {
+/// Ouvre (ou crée) le fichier de verrou. Un verrou existant est ouvert en lecture seule :
+/// le verrouillage fonctionne sur un descripteur en lecture (flock, LockFileEx), et un verrou
+/// créé par root reste ainsi utilisable par les membres du groupe.
+fn open_lock(lock_path: &Path) -> std::io::Result<File> {
+    if let Ok(f) = OpenOptions::new().read(true).open(lock_path) {
+        return Ok(f);
+    }
+    let mut opts = OpenOptions::new();
+    opts.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o660);
+    }
+    opts.open(lock_path)
+}
+
+/// Crée un fichier temporaire au nom imprévisible, sans jamais réutiliser un fichier existant
+/// (qui pourrait avoir été déposé par un autre compte).
+fn create_temp(dir: &Path, target: &Path) -> std::io::Result<(PathBuf, File)> {
+    let base = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut last_err = None;
+    for attempt in 0..16u32 {
+        let seed = format!("{}-{}-{}", std::process::id(), nanos, attempt);
+        let tmp = dir.join(format!(".{base}.tmp-{:016x}", fnv1a64(seed.as_bytes())));
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o660);
+        }
+        match opts.open(&tmp) {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("fichier temporaire impossible")))
+}
+
+fn write_backup(backup_dir: &Path, raw: &[u8]) -> Result<PathBuf, ConfigError> {
     fs::create_dir_all(backup_dir).map_err(|source| ConfigError::Write {
         path: backup_dir.to_path_buf(),
         source,
@@ -234,8 +300,15 @@ pub fn list_backups(backup_dir: &Path) -> Vec<PathBuf> {
     list
 }
 
-fn prune_backups(backup_dir: &Path) {
-    for old in list_backups(backup_dir).into_iter().skip(MAX_BACKUPS) {
+/// Ne garde que les `MAX_BACKUPS` plus récentes, sans jamais supprimer celle qui vient d'être
+/// écrite (des noms datés dans le futur, horloge décalée, la feraient sinon disparaître).
+fn prune_backups(backup_dir: &Path, keep: Option<&Path>) {
+    let candidates: Vec<PathBuf> = list_backups(backup_dir)
+        .into_iter()
+        .filter(|p| Some(p.as_path()) != keep)
+        .collect();
+    let room = MAX_BACKUPS.saturating_sub(usize::from(keep.is_some()));
+    for old in candidates.into_iter().skip(room) {
         let _ = fs::remove_file(old);
     }
 }
@@ -251,9 +324,9 @@ pub fn restore_backup(
     save(layout, &loaded.config, expected_hash)
 }
 
-/// Empreinte du fichier sur disque (ou `None` s'il n'existe pas).
+/// Empreinte du contenu brut du fichier sur disque (ou `None` s'il n'existe pas ou ne se lit pas).
 pub fn file_hash(path: &Path) -> Option<u64> {
-    fs::read_to_string(path).ok().map(|r| fnv1a64(r.as_bytes()))
+    fs::read(path).ok().map(|r| fnv1a64(&r))
 }
 
 fn s(v: &str) -> String {
@@ -419,6 +492,64 @@ mod tests {
             "la version remplacée est sauvegardée"
         );
         let _ = fs::remove_dir_all(layout.config_file.parent().unwrap());
+    }
+
+    #[test]
+    fn non_utf8_file_is_backed_up_before_replacement() {
+        let layout = temp_layout("latin1");
+        fs::create_dir_all(layout.config_file.parent().unwrap()).unwrap();
+        // « Bâtiment » en Latin-1 (0xE2), port 4321 : fichier existant mais illisible en UTF-8
+        let original: &[u8] =
+            b"config_version = 1\n[instance]\nname = \"B\xe2timent\"\n[server]\nport = 4321\n";
+        fs::write(&layout.config_file, original).unwrap();
+        assert!(load(&layout.config_file).is_err());
+        let hash = file_hash(&layout.config_file);
+        assert!(hash.is_some(), "un fichier non UTF-8 existe bel et bien");
+        assert!(matches!(
+            save(&layout, &AppConfig::default(), None),
+            Err(ConfigError::Conflict)
+        ));
+        let report = save(&layout, &AppConfig::default(), hash).unwrap();
+        assert_eq!(fs::read(report.backup.unwrap()).unwrap(), original);
+        let _ = fs::remove_dir_all(layout.config_file.parent().unwrap());
+    }
+
+    #[test]
+    fn prune_never_removes_the_new_backup() {
+        let layout = temp_layout("prune");
+        fs::create_dir_all(&layout.backup_dir).unwrap();
+        for i in 0..MAX_BACKUPS {
+            fs::write(
+                layout
+                    .backup_dir
+                    .join(format!("apex-scada-2099{:04}-000000.000.toml", i + 101)),
+                "x",
+            )
+            .unwrap();
+        }
+        let first = save(&layout, &AppConfig::default(), None).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.server.port = 3100;
+        let report = save(&layout, &cfg, Some(first.file_hash)).unwrap();
+        assert!(
+            report.backup.unwrap().is_file(),
+            "la nouvelle sauvegarde est conservée"
+        );
+        assert_eq!(list_backups(&layout.backup_dir).len(), MAX_BACKUPS);
+        let _ = fs::remove_dir_all(layout.config_file.parent().unwrap());
+    }
+
+    #[test]
+    fn system_layout_is_never_created_by_save() {
+        let base = std::env::temp_dir().join(format!("apex-store-sys-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let mut layout = Layout::portable(&base.join("config"));
+        layout.kind = LayoutKind::System;
+        assert!(matches!(
+            save(&layout, &AppConfig::default(), None),
+            Err(ConfigError::NotInstalled { .. })
+        ));
+        assert!(!base.exists(), "aucun dossier créé");
     }
 
     #[test]

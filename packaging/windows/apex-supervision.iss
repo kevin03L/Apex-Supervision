@@ -99,13 +99,25 @@ Name: "{group}\Assistant de configuration"; Filename: "{app}\{#AdminExe}"; Param
 Name: "{group}\Documentation"; Filename: "{app}\docs"
 Name: "{autodesktop}\{#AppName} — Administration"; Filename: "{app}\{#AdminExe}"; Tasks: desktopicon
 
+[InstallDelete]
+; Mise à jour : l'IHM web, les exemples et la documentation sont remplacés en entier (aucun
+; fichier retiré par la nouvelle version ne reste servi)
+Type: filesandordirs; Name: "{app}\web"
+Type: filesandordirs; Name: "{app}\exemples"
+Type: filesandordirs; Name: "{app}\docs"
+
 [Run]
 ; Première installation : service (et répertoires de %ProgramData% avec leurs permissions)
 Filename: "{app}\{#EngineExe}"; Parameters: "service install"; StatusMsg: "Installation du service Windows..."; Flags: runhidden waituntilterminated; Check: not ServiceExists
+; Toute installation ou mise à jour : propriétaire et permissions de %ProgramData%\Apex Supervision
+; réappliqués (héritage coupé, écriture réservée aux administrateurs et au service)
+Filename: "{app}\{#EngineExe}"; Parameters: "service permissions"; StatusMsg: "Application des permissions..."; Flags: runhidden waituntilterminated
 ; Mise à jour : configuration réécrite au format courant (valeurs conservées, sauvegarde préalable)
 Filename: "{app}\{#EngineExe}"; Parameters: "config migrate --config ""{#ConfigFile}"""; StatusMsg: "Mise à jour de la configuration..."; Flags: runhidden waituntilterminated; Check: ConfigExists
 ; Mise à jour : le service est redémarré s'il fonctionnait avant
 Filename: "{app}\{#EngineExe}"; Parameters: "service start"; StatusMsg: "Redémarrage du service..."; Flags: runhidden waituntilterminated; Check: ServiceWasRunning
+; Réinstallation après une désinstallation qui a conservé la configuration : service démarré
+Filename: "{app}\{#EngineExe}"; Parameters: "service start"; StatusMsg: "Démarrage du service..."; Flags: runhidden waituntilterminated; Check: (not ServiceExisted) and ConfigExists
 ; Première installation : assistant de configuration (droits administrateur conservés pour
 ; écrire la configuration et régler le service)
 Filename: "{app}\{#AdminExe}"; Parameters: "--wizard"; Description: "Lancer l'assistant de configuration"; Flags: postinstall nowait skipifsilent runascurrentuser; Check: not ConfigExists
@@ -118,6 +130,8 @@ Filename: "{app}\{#EngineExe}"; Parameters: "service uninstall"; Flags: runhidde
 [Code]
 var
   WasRunning: Boolean;
+  ServiceExistedBefore: Boolean;
+  InstallDone: Boolean;
 
 function ServiceExists: Boolean;
 begin
@@ -134,6 +148,30 @@ begin
   Result := WasRunning;
 end;
 
+function ServiceExisted: Boolean;
+begin
+  Result := ServiceExistedBefore;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    InstallDone := True;
+end;
+
+{ Mise à jour annulée ou en échec après l'arrêt du service : la supervision est relancée
+  avec les programmes restés en place. }
+procedure DeinitializeSetup();
+var
+  Code: Integer;
+begin
+  if WasRunning and (not InstallDone) then
+  begin
+    Log('Installation non terminée : redémarrage du service {#ServiceName}');
+    Exec(ExpandConstant('{sys}\net.exe'), 'start {#ServiceName}', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  end;
+end;
+
 { Mise à jour : le service est arrêté proprement avant le remplacement des binaires.
   « net stop » attend la fin de l'arrêt et renvoie 0 seulement si le service tournait. }
 function PrepareToInstall(var NeedsRestart: Boolean): String;
@@ -141,6 +179,8 @@ var
   Code: Integer;
 begin
   WasRunning := False;
+  InstallDone := False;
+  ServiceExistedBefore := ServiceExists;
   Result := '';
   if ServiceExists then
   begin

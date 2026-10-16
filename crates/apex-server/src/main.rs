@@ -69,7 +69,7 @@ fn run_foreground(config: Option<&Path>) -> i32 {
         config.map(Path::to_path_buf),
         mode,
         stop_rx,
-        || {},
+        notify_ready,
     )) {
         Ok(()) => exit::OK,
         Err(e) => {
@@ -78,6 +78,37 @@ fn run_foreground(config: Option<&Path>) -> i32 {
         }
     }
 }
+
+/// systemd (`Type=notify`) : le service n'est déclaré démarré qu'une fois le serveur web
+/// prêt. Sans `NOTIFY_SOCKET` (lancement manuel), ne fait rien.
+#[cfg(unix)]
+fn notify_ready() {
+    use std::os::unix::net::UnixDatagram;
+    let Some(target) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let Ok(socket) = UnixDatagram::unbound() else {
+        return;
+    };
+    let bytes = target.as_encoded_bytes();
+    if let Some(name) = bytes.strip_prefix(b"@") {
+        // Socket abstrait (espace de noms Linux)
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::linux::net::SocketAddrExt;
+            if let Ok(addr) = std::os::unix::net::SocketAddr::from_abstract_name(name) {
+                let _ = socket.send_to_addr(b"READY=1", &addr);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = name;
+    } else {
+        let _ = socket.send_to(b"READY=1", Path::new(&target));
+    }
+}
+
+#[cfg(not(unix))]
+fn notify_ready() {}
 
 fn config_check(config: Option<&Path>) -> i32 {
     let eff = match app::load_effective(config) {
@@ -170,8 +201,9 @@ fn config_init(config: Option<&Path>, opts: InitOptions) -> i32 {
         (None, true) => Layout::portable(&std::env::current_dir().unwrap_or_else(|_| ".".into())),
         (None, false) => Layout::system(),
     };
+    // Existence testée sur le fichier lui-même : un fichier illisible ou non UTF-8 existe aussi
     let existing_hash = store::file_hash(&layout.config_file);
-    if existing_hash.is_some() && !opts.force {
+    if layout.config_file.exists() && !opts.force {
         eprintln!(
             "« {} » existe déjà : utilisez --force pour le remplacer (une sauvegarde sera faite).",
             layout.config_file.display()
@@ -268,9 +300,18 @@ fn migrate_legacy(config: Option<&Path>, from: &Path, force: bool) -> i32 {
     // Le moteur doit être arrêté : on prend le verrou d'instance le temps de la copie
     let _lock = match instance::InstanceLock::acquire(&eff.layout.lock_file()) {
         Ok(l) => l,
-        Err(e) => {
+        Err(e @ instance::LockError::AlreadyRunning { .. }) => {
             eprintln!("{e} : arrêtez le moteur avant la migration.");
             return exit::ALREADY_RUNNING;
+        }
+        // Droits insuffisants sur le répertoire des données : ce n'est pas une autre instance
+        Err(e) => {
+            eprintln!(
+                "{e}\nLancez la commande avec un compte autorisé à écrire dans « {} » \
+                 (Linux : sudo ; Windows : invite administrateur).",
+                eff.layout.data_dir.display()
+            );
+            return exit::FAILURE;
         }
     };
     match runtime().block_on(legacy::migrate_database(
