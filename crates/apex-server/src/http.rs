@@ -212,6 +212,56 @@ fn query_token(req: &Request) -> Option<String> {
     })
 }
 
+/// En-têtes ajoutés par un proxy inverse (nginx, Caddy, Apache, IIS/ARR...).
+const PROXY_HEADERS: &[&str] = &[
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+];
+
+/// Requête émise depuis le poste lui-même : pair en boucle locale **et** aucun en-tête de proxy
+/// inverse. Derrière un proxy installé sur le même poste, toutes les requêtes arrivent de
+/// 127.0.0.1 : l'adresse du pair ne suffit donc pas à prouver qu'elles sont locales.
+fn is_direct_local_peer(peer: &SocketAddr, headers: &HeaderMap) -> bool {
+    peer.ip().to_canonical().is_loopback()
+        && !PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
+}
+
+/// Seules routes ouvertes au jeton de contrôle local (utilitaire desktop) : arrêt propre et
+/// lecture de l'état du moteur.
+const LOCAL_TOKEN_ROUTES: &[(&str, &str)] = &[
+    ("POST", "/api/system/shutdown"),
+    ("GET", "/api/system/status"),
+];
+
+fn session_required() -> ScadaError {
+    ScadaError::Unauthorized("Session absente ou expirée : veuillez vous reconnecter".to_string())
+}
+
+/// Acteur d'une requête présentant le jeton de contrôle local. Le jeton n'est valable que
+/// depuis le poste lui-même (boucle locale, sans proxy) et pour [`LOCAL_TOKEN_ROUTES`] : il
+/// n'ouvre jamais l'administration, et l'acteur est l'utilisateur interne « Utilitaire local ».
+fn local_control_user(req: &Request, peer: &SocketAddr) -> Result<UserAccount, ScadaError> {
+    if !is_direct_local_peer(peer, req.headers()) {
+        // Même réponse qu'un jeton inconnu : rien n'indique qu'il s'agit du jeton local
+        return Err(session_required());
+    }
+    let method = req.method().as_str();
+    let path = req.uri().path();
+    if !LOCAL_TOKEN_ROUTES
+        .iter()
+        .any(|(m, p)| *m == method && *p == path)
+    {
+        return Err(ScadaError::Forbidden(
+            "Le jeton de contrôle local n'autorise que l'arrêt propre du moteur et la lecture de son état"
+                .to_string(),
+        ));
+    }
+    Ok(ScadaCore::local_utility_account())
+}
+
 async fn auth_middleware(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -219,14 +269,14 @@ async fn auth_middleware(
     next: Next,
 ) -> Result<Response, ApiError> {
     let token = extract_token(req.headers()).or_else(|| query_token(&req));
-    let user = state
-        .core
-        .resolve_user(token.as_deref(), peer.ip().is_loopback())
-        .ok_or_else(|| {
-            ScadaError::Unauthorized(
-                "Session absente ou expirée : veuillez vous reconnecter".to_string(),
-            )
-        })?;
+    let user = if state.core.is_local_control_token(token.as_deref()) {
+        local_control_user(&req, &peer)?
+    } else {
+        state
+            .core
+            .resolve_user(token.as_deref())
+            .ok_or_else(session_required)?
+    };
     req.extensions_mut().insert(CurrentUser(user));
     req.extensions_mut()
         .insert(AuthToken(token.unwrap_or_default()));
@@ -278,11 +328,13 @@ fn is_viewer(user: &CurrentUser) -> bool {
 // HANDLERS PUBLICS : SANTÉ & CONNEXION
 // ============================================================================
 
-/// État de santé (public). Depuis le poste local uniquement, les informations d'exécution
-/// (configuration chargée, répertoires, mode) sont ajoutées pour l'utilitaire desktop.
+/// État de santé (public). Depuis le poste local uniquement (boucle locale sans en-tête de
+/// proxy inverse), les informations d'exécution (configuration chargée, répertoires, mode) sont
+/// ajoutées pour l'utilitaire desktop.
 async fn api_health(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Json<serde_json::Value> {
     let st = state.core.get_system_status();
     let mut body = serde_json::json!({
@@ -292,7 +344,7 @@ async fn api_health(
         "acquisition_paused": st.acquisition_paused,
         "running_drivers": st.running_drivers,
     });
-    if peer.ip().is_loopback() {
+    if is_direct_local_peer(&peer, &headers) {
         body["runtime"] = serde_json::to_value(state.runtime.as_ref()).unwrap_or_default();
         body["started_at"] = serde_json::to_value(st.started_at).unwrap_or_default();
         body["total_drivers"] = st.total_drivers.into();
@@ -349,10 +401,14 @@ async fn api_get_users(
 async fn api_upsert_user(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
+    Extension(token): Extension<AuthToken>,
     Json(req): Json<UpsertUserRequest>,
 ) -> Result<Json<UserPublicView>, ApiError> {
     require_admin(&user)?;
-    let view = state.core.upsert_user(&user.0.username, req).await?;
+    let view = state
+        .core
+        .upsert_user(&user.0.username, req, Some(&token.0))
+        .await?;
     Ok(Json(view))
 }
 
@@ -1007,11 +1063,8 @@ async fn ws_realtime_handler(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
     Extension(token): Extension<AuthToken>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| {
-        handle_realtime_socket(socket, state, user, token.0, peer.ip().is_loopback())
-    })
+    ws.on_upgrade(move |socket| handle_realtime_socket(socket, state, user, token.0))
 }
 
 /// Instantané complet de l'état, filtré selon le rôle : le profil Visualisation ne reçoit ni
@@ -1051,7 +1104,6 @@ async fn handle_realtime_socket(
     state: AppState,
     user: CurrentUser,
     token: String,
-    peer_is_loopback: bool,
 ) {
     use tokio::sync::broadcast::error::RecvError;
 
@@ -1146,7 +1198,7 @@ async fn handle_realtime_socket(
                 }
             }
             _ = session_check.tick() => {
-                if state.core.resolve_user(Some(&token), peer_is_loopback).is_none() {
+                if state.core.resolve_user(Some(&token)).is_none() {
                     let _ = socket.send(Message::Close(None)).await;
                     break;
                 }

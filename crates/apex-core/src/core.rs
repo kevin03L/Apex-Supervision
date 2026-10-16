@@ -20,7 +20,7 @@ use chrono::{DateTime, Datelike, Local, Utc};
 use dashmap::DashMap;
 use sqlx::{Row, Sqlite, SqlitePool};
 use tokio::{
-    sync::{broadcast, mpsc, Notify},
+    sync::{broadcast, mpsc, Notify, Semaphore},
     task::AbortHandle,
 };
 use tracing::{error, info, warn};
@@ -50,6 +50,13 @@ const HISTORY_QUEUE_CAPACITY: usize = 20_000;
 /// Nombre d'échecs de connexion avant verrouillage temporaire d'un identifiant.
 const LOGIN_MAX_FAILURES: u32 = 5;
 const LOGIN_LOCK_SECONDS: i64 = 60;
+/// Vérifications Argon2 simultanées au plus, pour tout le moteur (environ 19 Mio de mémoire et
+/// un cœur chacune) : une rafale de connexions ne peut pas saturer le poste.
+const PASSWORD_CHECKS_MAX_CONCURRENT: usize = 4;
+
+/// Acteur interne des actions faites avec le jeton de contrôle local (utilitaire desktop).
+/// Son nom contient un espace : il ne peut correspondre à aucun compte réel.
+pub const LOCAL_UTILITY_ACTOR: &str = "Utilitaire local";
 
 /// Comptes d'usine et leur mot de passe initial (pour l'avertissement au démarrage).
 const FACTORY_ACCOUNTS: [(&str, &str); 3] = [
@@ -131,7 +138,10 @@ pub struct ScadaCore {
     pub users: DashMap<String, UserAccount>,
     pub sessions: DashMap<String, Session>,
     login_failures: DashMap<String, LoginFailure>,
-    /// Jeton de contrôle local (scripts `.bat`), accepté uniquement depuis la boucle locale.
+    /// Plafond global des vérifications Argon2 simultanées.
+    password_checks: Arc<Semaphore>,
+    /// Jeton de contrôle local de l'utilitaire desktop (arrêt propre uniquement), accepté
+    /// seulement depuis la boucle locale sans en-tête de proxy (contrôle fait par le serveur web).
     pub local_control_token: String,
     pub symbols_library: DashMap<String, SymbolLibraryItem>,
     pub flow_runtime: FlowEngineRuntime,
@@ -186,6 +196,7 @@ impl ScadaCore {
             users: DashMap::new(),
             sessions: DashMap::new(),
             login_failures: DashMap::new(),
+            password_checks: Arc::new(Semaphore::new(PASSWORD_CHECKS_MAX_CONCURRENT)),
             local_control_token: security::generate_token(),
             symbols_library: DashMap::new(),
             flow_runtime: FlowEngineRuntime::new(),
@@ -204,6 +215,8 @@ impl ScadaCore {
         });
 
         core.seed_industrial_defaults();
+        // Hachage factice des connexions sur identifiant inconnu (coût constant dès la première)
+        security::prepare_dummy_password_hash();
 
         Self::spawn_ingestion_worker(Arc::clone(&core), ingest_rx);
         Self::spawn_history_writer(Arc::clone(&core), history_rx);
@@ -2418,6 +2431,7 @@ impl ScadaCore {
         for js in load_json_column(&pool, "SELECT layout_json AS js FROM dashboards").await {
             match serde_json::from_str::<DashboardLayout>(&js) {
                 Ok(mut d) => {
+                    drop_invalid_widget_svgs(&mut d);
                     if let Err(e) = sanitize_dashboard(&mut d) {
                         warn!("Synoptique '{}' invalide ignoré : {}", d.id, e);
                         continue;
@@ -2457,10 +2471,13 @@ impl ScadaCore {
 
         for js in load_json_column(&pool, "SELECT symbol_json AS js FROM symbol_libraries").await {
             match serde_json::from_str::<SymbolLibraryItem>(&js) {
-                Ok(mut sym) => {
-                    sym.svg_content = security::sanitize_svg(&sym.svg_content);
-                    self.symbols_library.insert(sym.id.clone(), sym);
-                }
+                Ok(mut sym) => match security::sanitize_svg(&sym.svg_content) {
+                    Ok(clean) => {
+                        sym.svg_content = clean;
+                        self.symbols_library.insert(sym.id.clone(), sym);
+                    }
+                    Err(e) => warn!("Symbole '{}' ignoré : {}", sym.id, e),
+                },
                 Err(e) => warn!("Symbole illisible ignoré : {}", e),
             }
         }
@@ -3326,50 +3343,24 @@ impl ScadaCore {
     /// Authentifie un utilisateur et ouvre une session (jeton aléatoire de 256 bits).
     ///
     /// Les messages d'erreur sont volontairement identiques pour un identifiant inconnu et un
-    /// mot de passe faux (pas d'énumération des comptes). Après 5 échecs consécutifs,
-    /// l'identifiant est verrouillé 60 secondes.
+    /// mot de passe faux, et leur coût aussi (vérification Argon2 contre un hachage factice) :
+    /// ni la réponse ni son temps ne permettent d'énumérer les comptes. Au-delà de 5 tentatives
+    /// sans succès, l'identifiant est verrouillé 60 secondes, y compris face à des requêtes
+    /// concurrentes (réservation atomique de la tentative avant la vérification).
     pub async fn login(&self, req: LoginRequest) -> Result<LoginResponse, ScadaError> {
         let key = req.username.trim().to_lowercase();
         let now = Utc::now();
 
-        if let Some(f) = self.login_failures.get(&key) {
-            let elapsed = (now - f.last_at).num_seconds();
-            if f.count >= LOGIN_MAX_FAILURES && elapsed < LOGIN_LOCK_SECONDS {
-                return Err(ScadaError::Forbidden(format!(
-                    "Trop de tentatives échouées : réessayez dans {} s",
-                    LOGIN_LOCK_SECONDS - elapsed
-                )));
-            }
-        }
+        self.reserve_login_attempt(&key, now)?;
 
         let account = self.users.get(&key).map(|u| u.clone());
-        let stored_hash = account
-            .as_ref()
-            .map(|u| u.password_hash.clone())
-            .unwrap_or_default();
-        let password = req.password.clone();
-        let password_ok = !stored_hash.is_empty()
-            && tokio::task::spawn_blocking(move || {
-                security::verify_password(&password, &stored_hash)
-            })
-            .await
-            .unwrap_or(false);
+        let stored_hash = account.as_ref().map(|u| u.password_hash.clone());
+        let password_ok = self
+            .verify_password_bounded(req.password.clone(), stored_hash)
+            .await;
 
         let Some(account) = account.filter(|_| password_ok) else {
-            let mut entry = self
-                .login_failures
-                .entry(key.clone())
-                .or_insert(LoginFailure {
-                    count: 0,
-                    last_at: now,
-                });
-            // Le compteur repart de zéro une fois le verrouillage expiré
-            if (now - entry.last_at).num_seconds() >= LOGIN_LOCK_SECONDS {
-                entry.count = 0;
-            }
-            entry.count += 1;
-            entry.last_at = now;
-            drop(entry);
+            // La tentative a déjà été comptée par la réservation
             self.record_audit(
                 &key,
                 "AUTH",
@@ -3421,6 +3412,51 @@ impl ScadaCore {
         })
     }
 
+    /// Réserve une tentative de connexion pour `key`, **avant** toute vérification Argon2.
+    ///
+    /// Le compteur est lu et incrémenté sous le verrou de l'entrée (`DashMap::entry`) : des
+    /// requêtes concurrentes ne peuvent donc pas faire plus de `LOGIN_MAX_FAILURES`
+    /// vérifications par fenêtre de verrouillage. Seul un succès remet le compteur à zéro.
+    fn reserve_login_attempt(&self, key: &str, now: DateTime<Utc>) -> Result<(), ScadaError> {
+        let mut entry = self
+            .login_failures
+            .entry(key.to_string())
+            .or_insert(LoginFailure {
+                count: 0,
+                last_at: now,
+            });
+        let elapsed = (now - entry.last_at).num_seconds();
+        // Le compteur repart de zéro une fois la fenêtre de verrouillage écoulée
+        if elapsed >= LOGIN_LOCK_SECONDS {
+            entry.count = 0;
+        }
+        if entry.count >= LOGIN_MAX_FAILURES {
+            return Err(ScadaError::Forbidden(format!(
+                "Trop de tentatives échouées : réessayez dans {} s",
+                (LOGIN_LOCK_SECONDS - elapsed).max(1)
+            )));
+        }
+        entry.count += 1;
+        entry.last_at = now;
+        Ok(())
+    }
+
+    /// Vérifie un mot de passe à coût constant (hachage factice si `stored_hash` est absent),
+    /// avec au plus `PASSWORD_CHECKS_MAX_CONCURRENT` vérifications Argon2 simultanées pour tout
+    /// le moteur. Le jeton du sémaphore suit le calcul : il n'est libéré qu'à la fin de celui-ci,
+    /// même si la requête HTTP est abandonnée entre-temps.
+    async fn verify_password_bounded(&self, plain: String, stored_hash: Option<String>) -> bool {
+        let Ok(permit) = Arc::clone(&self.password_checks).acquire_owned().await else {
+            return false;
+        };
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            security::verify_password_constant_cost(&plain, stored_hash.as_deref())
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     pub fn logout(&self, token: &str) {
         let clean = token.strip_prefix("Bearer ").unwrap_or(token).trim();
         if let Some((_, session)) = self.sessions.remove(clean) {
@@ -3434,24 +3470,17 @@ impl ScadaCore {
         }
     }
 
-    /// Résout l'utilisateur d'un jeton (`X-Scada-Token`, `Authorization: Bearer` ou `?token=`).
+    /// Résout l'utilisateur d'un jeton de session (`X-Scada-Token`, `Authorization: Bearer` ou
+    /// `?token=`).
     ///
     /// Renvoie `None` si le jeton est absent, inconnu, expiré ou si le compte est désactivé.
-    /// Il n'existe **aucun** repli vers un compte par défaut. Le jeton de contrôle local
-    /// (scripts `.bat`) n'est accepté que depuis la boucle locale.
-    pub fn resolve_user(&self, token: Option<&str>, peer_is_loopback: bool) -> Option<UserAccount> {
+    /// Il n'existe **aucun** repli vers un compte par défaut. Le jeton de contrôle local n'ouvre
+    /// jamais de session utilisateur : voir [`Self::is_local_control_token`].
+    pub fn resolve_user(&self, token: Option<&str>) -> Option<UserAccount> {
         let raw = token?;
         let clean = raw.strip_prefix("Bearer ").unwrap_or(raw).trim();
         if clean.is_empty() {
             return None;
-        }
-
-        if peer_is_loopback && constant_time_eq(clean, &self.local_control_token) {
-            return self
-                .users
-                .get("admin")
-                .map(|u| u.clone())
-                .filter(|u| u.enabled);
         }
 
         let ttl = chrono::Duration::hours(self.session_ttl_hours as i64);
@@ -3470,6 +3499,36 @@ impl ScadaCore {
             .get(&username)
             .map(|u| u.clone())
             .filter(|u| u.enabled)
+    }
+
+    /// Indique si `token` est le jeton de contrôle local (comparaison à temps constant).
+    ///
+    /// Ce jeton ne sert qu'à l'arrêt propre par l'utilitaire desktop : le serveur web ne
+    /// l'accepte que depuis la boucle locale, sans en-tête de proxy, et pour une liste fermée
+    /// de routes, sous l'acteur [`Self::local_utility_account`].
+    pub fn is_local_control_token(&self, token: Option<&str>) -> bool {
+        token
+            .map(|raw| raw.strip_prefix("Bearer ").unwrap_or(raw).trim())
+            .is_some_and(|t| !t.is_empty() && constant_time_eq(t, &self.local_control_token))
+    }
+
+    /// Acteur interne « Utilitaire local » des requêtes faites avec le jeton de contrôle local.
+    ///
+    /// Distinct de tout compte réel (son nom n'est pas un identifiant valide) et indépendant
+    /// de l'état du compte `admin` : l'arrêt propre fonctionne même si ce compte est désactivé,
+    /// et le journal d'audit l'attribue à « Utilitaire local ». Le groupe Administrateur ne lui
+    /// ouvre que les routes que le serveur web autorise pour ce jeton.
+    pub fn local_utility_account() -> UserAccount {
+        UserAccount {
+            username: LOCAL_UTILITY_ACTOR.to_string(),
+            display_name: LOCAL_UTILITY_ACTOR.to_string(),
+            role: UserRole::Admin,
+            password_hash: String::new(),
+            department: "Poste local".to_string(),
+            enabled: true,
+            created_at: Utc::now(),
+            last_login_at: None,
+        }
     }
 
     /// Vérifie que l'utilisateur appartient au groupe `Admin` (Paramètres Système & Utilisateurs).
@@ -3509,6 +3568,14 @@ impl ScadaCore {
         self.sessions.retain(|_, s| s.username != username);
     }
 
+    /// Ferme les sessions d'un utilisateur sauf `keep` (session de l'administrateur qui modifie
+    /// son propre compte : il n'est pas déconnecté par sa propre action).
+    fn revoke_user_sessions_except(&self, username: &str, keep: Option<&str>) {
+        let keep = keep.map(|t| t.strip_prefix("Bearer ").unwrap_or(t).trim());
+        self.sessions
+            .retain(|tok, s| s.username != username || keep == Some(tok.as_str()));
+    }
+
     fn active_admin_count_excluding(&self, username: &str) -> usize {
         self.users
             .iter()
@@ -3518,10 +3585,17 @@ impl ScadaCore {
             .count()
     }
 
+    /// Crée ou modifie un compte (réservé aux administrateurs).
+    ///
+    /// Les sessions ouvertes du compte sont fermées si son rôle change, s'il est désactivé ou si
+    /// un nouveau mot de passe lui est donné (réinitialisation d'un compte compromis).
+    /// `actor_session` est le jeton de l'administrateur qui agit : s'il modifie son propre mot de
+    /// passe, sa session courante est conservée.
     pub async fn upsert_user(
         &self,
         actor: &str,
         req: UpsertUserRequest,
+        actor_session: Option<&str>,
     ) -> Result<UserPublicView, ScadaError> {
         let uname = req.username.trim().to_lowercase();
         security::validate_id("utilisateur", &uname)?;
@@ -3545,6 +3619,7 @@ impl ScadaCore {
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(str::to_string);
+        let password_changed = existing.is_some() && new_password.is_some();
         let password_hash = match (new_password, &existing) {
             (Some(p), _) => {
                 security::validate_new_password(&p)?;
@@ -3586,6 +3661,10 @@ impl ScadaCore {
         self.persist_user(&account).await;
         if role_or_state_changed {
             self.revoke_user_sessions(&uname);
+        } else if password_changed {
+            // Réinitialisation du mot de passe : les sessions existantes (peut-être celle d'un
+            // tiers qui connaissait l'ancien mot de passe) ne doivent pas lui survivre.
+            self.revoke_user_sessions_except(&uname, actor_session);
         }
 
         self.record_audit(
@@ -3594,9 +3673,14 @@ impl ScadaCore {
             "UPSERT_USER",
             &uname,
             &format!(
-                "Profil '{}' configuré dans le groupe '{}'",
+                "Profil '{}' configuré dans le groupe '{}'{}",
                 account.display_name,
-                account.role.label_fr()
+                account.role.label_fr(),
+                if password_changed {
+                    " (mot de passe réinitialisé, sessions fermées)"
+                } else {
+                    ""
+                }
             ),
         );
 
@@ -3650,11 +3734,12 @@ impl ScadaCore {
         new_password: &str,
     ) -> Result<(), ScadaError> {
         security::validate_new_password(new_password)?;
-        let stored = user.password_hash.clone();
-        let current = current_password.to_string();
-        let ok = tokio::task::spawn_blocking(move || security::verify_password(&current, &stored))
-            .await
-            .unwrap_or(false);
+        let ok = self
+            .verify_password_bounded(
+                current_password.to_string(),
+                Some(user.password_hash.clone()),
+            )
+            .await;
         if !ok {
             return Err(ScadaError::Unauthorized(
                 "Mot de passe actuel incorrect".to_string(),
@@ -3726,13 +3811,28 @@ impl ScadaCore {
         }
     }
 
-    /// Assainit (SVG, identifiant), enregistre et persiste un symbole importé.
-    async fn store_symbol(&self, mut item: SymbolLibraryItem) -> SymbolLibraryItem {
+    /// Assainit (SVG, identifiant), enregistre et persiste un symbole importé. Un symbole dont
+    /// le SVG est refusé (XML mal formé, racine autre que `<svg>`) n'est pas enregistré : il est
+    /// ajouté à `rejected` avec la raison du refus.
+    async fn store_symbol(
+        &self,
+        mut item: SymbolLibraryItem,
+        imported: &mut Vec<SymbolLibraryItem>,
+        rejected: &mut Vec<String>,
+    ) {
         item.id = security::slugify_id(&item.id);
-        item.svg_content = security::sanitize_svg(&item.svg_content);
-        self.symbols_library.insert(item.id.clone(), item.clone());
-        self.persist_symbol(&item).await;
-        item
+        match security::sanitize_svg(&item.svg_content) {
+            Ok(clean) => {
+                item.svg_content = clean;
+                self.symbols_library.insert(item.id.clone(), item.clone());
+                self.persist_symbol(&item).await;
+                imported.push(item);
+            }
+            Err(e) => {
+                warn!("Symbole '{}' non importé : {}", item.name, e);
+                rejected.push(format!("« {} » : {}", item.name, e));
+            }
+        }
     }
 
     pub async fn delete_symbol(&self, actor: &str, id: &str) -> Result<(), ScadaError> {
@@ -3817,6 +3917,7 @@ impl ScadaCore {
         };
 
         let mut imported = Vec::new();
+        let mut rejected: Vec<String> = Vec::new();
 
         // CAS 1 : Format Draw.io / Diagrams.net (<mxlibrary>[...]</mxlibrary>)
         if raw.contains("<mxlibrary>") || req.format == "drawio_xml" {
@@ -3841,7 +3942,8 @@ impl ScadaCore {
                         } else {
                             format!(
                                 "<svg viewBox=\"0 0 100 100\"><rect x=\"12\" y=\"12\" width=\"76\" height=\"76\" rx=\"8\" fill=\"#0f172a\" stroke=\"currentColor\" stroke-width=\"3\"/><text x=\"50\" y=\"55\" text-anchor=\"middle\" fill=\"currentColor\" font-size=\"12\" font-weight=\"bold\">{}</text></svg>",
-                                title
+                                // Titre libre : échappé pour rester du texte XML bien formé
+                                quick_xml::escape::escape(title)
                             )
                         }
                     } else {
@@ -3860,7 +3962,7 @@ impl ScadaCore {
                         colorize_on_state: true,
                         created_at: Utc::now(),
                     };
-                    imported.push(self.store_symbol(item).await);
+                    self.store_symbol(item, &mut imported, &mut rejected).await;
                 }
             }
         }
@@ -3927,7 +4029,7 @@ impl ScadaCore {
                     colorize_on_state: true,
                     created_at: Utc::now(),
                 };
-                imported.push(self.store_symbol(item).await);
+                self.store_symbol(item, &mut imported, &mut rejected).await;
             }
         }
         // CAS 3 : Planche Sprite SVG multi-symboles (<symbol id="...">...</symbol>)
@@ -3968,7 +4070,7 @@ impl ScadaCore {
                         colorize_on_state: true,
                         created_at: Utc::now(),
                     };
-                    imported.push(self.store_symbol(item).await);
+                    self.store_symbol(item, &mut imported, &mut rejected).await;
                 }
             }
         }
@@ -3988,11 +4090,27 @@ impl ScadaCore {
                 colorize_on_state: true,
                 created_at: Utc::now(),
             };
-            imported.push(self.store_symbol(item).await);
+            self.store_symbol(item, &mut imported, &mut rejected).await;
         } else {
             return Err(ScadaError::BadRequest(
                 "Format non reconnu : fournissez un fichier .svg, une planche <symbol>, un fichier Draw.io <mxlibrary> ou un pack .json".to_string(),
             ));
+        }
+
+        if imported.is_empty() && !rejected.is_empty() {
+            let mut reasons = rejected
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ; ");
+            if rejected.len() > 3 {
+                reasons.push_str(&format!(" ; et {} autre(s)", rejected.len() - 3));
+            }
+            return Err(ScadaError::BadRequest(format!(
+                "Aucun symbole importé : {}",
+                reasons
+            )));
         }
 
         self.record_audit(
@@ -4001,8 +4119,13 @@ impl ScadaCore {
             "IMPORT_SYMBOLS",
             &req.library_name,
             &format!(
-                "Import réussi de {} symbole(s) industriel(s)",
-                imported.len()
+                "Import réussi de {} symbole(s) industriel(s){}",
+                imported.len(),
+                if rejected.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} refusé(s) (SVG invalide)", rejected.len())
+                }
             ),
         );
 
@@ -4366,14 +4489,38 @@ fn sanitize_dashboard(layout: &mut DashboardLayout) -> Result<(), ScadaError> {
             .get("svg_content")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        if let Some(svg) = svg {
-            w.properties["svg_content"] = serde_json::Value::String(security::sanitize_svg(&svg));
+        // Un SVG vide reste vide (l'IHM affiche alors le symbole par défaut)
+        if let Some(svg) = svg.filter(|s| !s.trim().is_empty()) {
+            let clean = security::sanitize_svg(&svg)
+                .map_err(|e| ScadaError::BadRequest(format!("Widget '{}' : {}", w.id, e)))?;
+            w.properties["svg_content"] = serde_json::Value::String(clean);
         }
         if let Some(sym_id) = w.properties.get("symbol_id").and_then(|v| v.as_str()) {
             security::validate_id("symbole", sym_id)?;
         }
     }
     Ok(())
+}
+
+/// Au chargement de la base : le SVG d'un widget enregistré avant l'assainissement par liste
+/// blanche, et désormais refusé (XML mal formé), est vidé plutôt que de faire ignorer tout le
+/// synoptique. L'IHM affiche alors le symbole par défaut.
+fn drop_invalid_widget_svgs(layout: &mut DashboardLayout) {
+    for w in layout.widgets.iter_mut() {
+        let refused = w
+            .properties
+            .get("svg_content")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| security::sanitize_svg(s).err());
+        if let Some(e) = refused {
+            warn!(
+                "Synoptique '{}', widget '{}' : SVG retiré au chargement ({})",
+                layout.id, w.id, e
+            );
+            w.properties["svg_content"] = serde_json::Value::String(String::new());
+        }
+    }
 }
 
 /// Valide les identifiants d'un flux (nœuds, câbles, ports) et la cohérence des liaisons.
@@ -4471,6 +4618,188 @@ mod tests {
 
         d.widgets[0].bound_tag_id = Some("x');alert(1)//".into());
         assert!(sanitize_dashboard(&mut d).is_err());
+
+        // SVG mal formé : refusé à l'enregistrement, vidé (et non bloquant) au chargement
+        d.widgets[0].bound_tag_id = None;
+        d.widgets[0].properties["svg_content"] = "<svg><g></svg>".into();
+        let err = sanitize_dashboard(&mut d).unwrap_err().to_string();
+        assert!(err.contains("w-1") && err.contains("SVG refusé"), "{err}");
+        drop_invalid_widget_svgs(&mut d);
+        assert_eq!(d.widgets[0].properties["svg_content"], "");
+        sanitize_dashboard(&mut d).unwrap();
+    }
+
+    /// Les symboles des packs intégrés passent l'assainissement sans perdre d'élément ni d'attribut.
+    #[test]
+    fn builtin_symbols_survive_svg_sanitizer() {
+        for pack in ["iso_10628_pid", "isa_5_1_instr", "iec_60617_cvc"] {
+            let symbols = ScadaCore::builtin_pack_symbols(pack);
+            assert!(!symbols.is_empty(), "pack {pack} vide");
+            for sym in symbols {
+                let clean = security::sanitize_svg(&sym.svg_content)
+                    .unwrap_or_else(|e| panic!("symbole {} refusé : {e}", sym.id));
+                assert_eq!(
+                    clean.matches('<').count(),
+                    sym.svg_content.matches('<').count(),
+                    "élément perdu dans {}",
+                    sym.id
+                );
+                // Un attribut de plus : l'espace de noms SVG ajouté sur la racine
+                assert_eq!(
+                    clean.matches('=').count(),
+                    sym.svg_content.matches('=').count() + 1,
+                    "attribut perdu dans {}",
+                    sym.id
+                );
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // AUTHENTIFICATION
+    // ------------------------------------------------------------------------
+
+    /// Moteur de test sans base, avec un compte au mot de passe haché.
+    fn core_with_user(username: &str, password: &str) -> Arc<ScadaCore> {
+        let core = ScadaCore::new(None, &EngineOptions::default());
+        let mut account = factory_admin_account();
+        account.username = username.to_string();
+        account.password_hash = security::hash_password(password).unwrap();
+        core.users.insert(username.to_string(), account);
+        core
+    }
+
+    fn login_req(username: &str, password: &str) -> LoginRequest {
+        LoginRequest {
+            username: username.to_string(),
+            password: password.to_string(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn login_lockout_is_atomic_under_concurrency() {
+        let core = core_with_user("visu", "visu123");
+        let attempts: Vec<_> = (0..20)
+            .map(|_| {
+                let core = Arc::clone(&core);
+                tokio::spawn(async move { core.login(login_req("visu", "mauvais")).await })
+            })
+            .collect();
+        let (mut unauthorized, mut locked) = (0, 0);
+        for attempt in attempts {
+            match attempt.await.unwrap() {
+                Err(ScadaError::Unauthorized(_)) => unauthorized += 1,
+                Err(ScadaError::Forbidden(_)) => locked += 1,
+                other => panic!("résultat inattendu : {:?}", other.err()),
+            }
+        }
+        // Jamais plus de LOGIN_MAX_FAILURES vérifications, quel que soit l'entrelacement
+        assert_eq!(unauthorized, LOGIN_MAX_FAILURES as usize);
+        assert_eq!(locked, 20 - LOGIN_MAX_FAILURES as usize);
+        // Le bon mot de passe est lui aussi refusé pendant le verrouillage
+        assert!(matches!(
+            core.login(login_req("visu", "visu123")).await,
+            Err(ScadaError::Forbidden(_))
+        ));
+        // Tous les jetons du plafond Argon2 ont été rendus
+        assert_eq!(
+            core.password_checks.available_permits(),
+            PASSWORD_CHECKS_MAX_CONCURRENT
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn successful_login_resets_the_failure_counter() {
+        let core = core_with_user("visu", "visu123");
+        for _ in 0..2 {
+            for _ in 0..(LOGIN_MAX_FAILURES - 1) {
+                assert!(matches!(
+                    core.login(login_req("visu", "mauvais")).await,
+                    Err(ScadaError::Unauthorized(_))
+                ));
+            }
+            assert!(core.login(login_req("VISU ", "visu123")).await.is_ok());
+        }
+    }
+
+    /// Un identifiant inconnu coûte une vérification Argon2, comme un mot de passe faux.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_account_costs_like_a_wrong_password() {
+        let core = core_with_user("superviseur", "super123");
+        let (mut known, mut unknown) = (Duration::MAX, Duration::MAX);
+        for i in 0..4 {
+            let t = std::time::Instant::now();
+            let _ = core.login(login_req("superviseur", "faux")).await;
+            known = known.min(t.elapsed());
+            // Un identifiant différent à chaque fois : le verrouillage n'intervient pas
+            let t = std::time::Instant::now();
+            let r = core.login(login_req(&format!("inconnu{i}"), "faux")).await;
+            unknown = unknown.min(t.elapsed());
+            assert!(matches!(r, Err(ScadaError::Unauthorized(_))));
+        }
+        assert!(
+            unknown * 3 >= known,
+            "compte inconnu trop rapide : {unknown:?} contre {known:?} pour un mot de passe faux"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_control_token_never_opens_a_session() {
+        let core = ScadaCore::new(None, &EngineOptions::default());
+        let token = core.local_control_token.clone();
+        assert!(core.is_local_control_token(Some(&token)));
+        assert!(core.is_local_control_token(Some(&format!("Bearer {token}"))));
+        assert!(!core.is_local_control_token(Some("autre")));
+        assert!(!core.is_local_control_token(Some("")));
+        assert!(!core.is_local_control_token(None));
+        // Il ne donne accès à aucun compte, pas même « admin »
+        assert!(core.resolve_user(Some(&token)).is_none());
+        let actor = ScadaCore::local_utility_account();
+        assert_eq!(actor.username, LOCAL_UTILITY_ACTOR);
+        assert!(
+            security::validate_id("utilisateur", &actor.username).is_err(),
+            "l'acteur interne ne doit pas pouvoir correspondre à un compte réel"
+        );
+    }
+
+    #[tokio::test]
+    async fn password_reset_by_admin_revokes_sessions() {
+        let core = core_with_user("visu", "visu123");
+        let session = core
+            .login(login_req("visu", "visu123"))
+            .await
+            .unwrap()
+            .token;
+        let mut req = UpsertUserRequest {
+            username: "visu".into(),
+            display_name: "Visu".into(),
+            role: UserRole::Admin,
+            password: None,
+            department: String::new(),
+            enabled: true,
+        };
+        // Sans nouveau mot de passe (ni changement de rôle) : la session reste ouverte
+        core.upsert_user("admin", req.clone(), None).await.unwrap();
+        assert!(core.resolve_user(Some(&session)).is_some());
+        // Mot de passe réinitialisé : la session est fermée
+        req.password = Some("Nouveau-2026".into());
+        core.upsert_user("admin", req.clone(), None).await.unwrap();
+        assert!(core.resolve_user(Some(&session)).is_none());
+        // Sur son propre compte, l'administrateur garde la session d'où il agit
+        let own = core
+            .login(login_req("visu", "Nouveau-2026"))
+            .await
+            .unwrap()
+            .token;
+        let other = core
+            .login(login_req("visu", "Nouveau-2026"))
+            .await
+            .unwrap()
+            .token;
+        req.password = Some("Encore-2026".into());
+        core.upsert_user("visu", req, Some(&own)).await.unwrap();
+        assert!(core.resolve_user(Some(&own)).is_some());
+        assert!(core.resolve_user(Some(&other)).is_none());
     }
 
     #[test]

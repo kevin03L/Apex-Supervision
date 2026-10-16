@@ -5,7 +5,8 @@
 // Règles de sécurité de ce fichier :
 // - Toute donnée dynamique insérée dans du HTML passe par esc().
 // - Toute donnée passée en argument d'un gestionnaire onclick/onchange passe par jsArg().
-// - Tout SVG importé passe par sanitizeSvg() avant rendu.
+// - Tout SVG importé passe par sanitizeSvg() (reconstruction sur liste blanche) et est inséré
+//   par le DOM, jamais par innerHTML.
 
 const WIDGET_TYPES = [
   'Gauge', 'Pump', 'Valve', 'MotorValve2Way', 'Fan', 'Damper', 'Boiler', 'Chiller',
@@ -67,52 +68,136 @@ function jsArg(v) {
   return esc(JSON.stringify(v === undefined ? null : v));
 }
 
-const SVG_FORBIDDEN = new Set(['script', 'style', 'foreignobject', 'iframe', 'object', 'embed', 'handler', 'listener', 'link', 'meta', 'base']);
+// --- Assainissement des SVG : mêmes listes blanches que le serveur (crates/apex-core/src/security.rs) ---
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const SVG_MAX_DEPTH = 64;
+const SVG_ELEMENTS = new Set([
+  'svg', 'g', 'defs', 'symbol', 'use', 'title', 'desc', 'path', 'rect', 'circle', 'ellipse', 'line',
+  'polyline', 'polygon', 'text', 'tspan', 'textPath', 'linearGradient', 'radialGradient', 'stop',
+  'pattern', 'clipPath', 'mask', 'marker', 'image', 'filter', 'feBlend', 'feColorMatrix',
+  'feComponentTransfer', 'feFuncR', 'feFuncG', 'feFuncB', 'feFuncA', 'feComposite', 'feDropShadow',
+  'feFlood', 'feGaussianBlur', 'feMerge', 'feMergeNode', 'feMorphology', 'feOffset', 'feTurbulence',
+  'animate', 'animateMotion', 'animateTransform', 'set'
+]);
+const SVG_ANIMATIONS = new Set(['animate', 'animateMotion', 'animateTransform', 'set']);
+const SVG_HREF_ELEMENTS = new Set([
+  'use', 'linearGradient', 'radialGradient', 'pattern', 'textPath', 'image', 'filter',
+  'animate', 'animateMotion', 'animateTransform', 'set'
+]);
+const SVG_ATTRIBUTES = new Set([
+  'id', 'class', 'style', 'transform', 'viewBox', 'preserveAspectRatio', 'version',
+  'x', 'y', 'width', 'height', 'x1', 'y1', 'x2', 'y2', 'cx', 'cy', 'r', 'rx', 'ry', 'fx', 'fy', 'fr',
+  'd', 'points', 'pathLength', 'dx', 'dy', 'rotate', 'textLength', 'lengthAdjust', 'startOffset',
+  'method', 'spacing',
+  'fill', 'fill-opacity', 'fill-rule', 'stroke', 'stroke-width', 'stroke-opacity', 'stroke-linecap',
+  'stroke-linejoin', 'stroke-miterlimit', 'stroke-dasharray', 'stroke-dashoffset', 'opacity', 'color',
+  'display', 'visibility', 'overflow', 'clip-path', 'clip-rule', 'mask', 'filter', 'marker-start',
+  'marker-mid', 'marker-end', 'stop-color', 'stop-opacity', 'flood-color', 'flood-opacity',
+  'font-family', 'font-size', 'font-weight', 'font-style', 'font-variant', 'font-stretch',
+  'text-anchor', 'dominant-baseline', 'alignment-baseline', 'baseline-shift', 'letter-spacing',
+  'word-spacing', 'text-decoration', 'writing-mode', 'direction', 'vector-effect', 'shape-rendering',
+  'text-rendering', 'image-rendering', 'color-interpolation', 'color-interpolation-filters',
+  'paint-order', 'mix-blend-mode', 'isolation', 'transform-origin',
+  'offset', 'gradientUnits', 'gradientTransform', 'spreadMethod', 'patternUnits',
+  'patternContentUnits', 'patternTransform', 'clipPathUnits', 'maskUnits', 'maskContentUnits',
+  'markerWidth', 'markerHeight', 'markerUnits', 'refX', 'refY', 'orient',
+  'filterUnits', 'primitiveUnits', 'in', 'in2', 'result', 'mode', 'operator', 'k1', 'k2', 'k3', 'k4',
+  'values', 'type', 'stdDeviation', 'edgeMode', 'radius', 'tableValues', 'slope', 'intercept',
+  'amplitude', 'exponent', 'baseFrequency', 'numOctaves', 'seed', 'stitchTiles',
+  'attributeName', 'attributeType', 'from', 'to', 'by', 'begin', 'dur', 'end', 'min', 'max',
+  'restart', 'repeatCount', 'repeatDur', 'calcMode', 'keyTimes', 'keySplines', 'keyPoints',
+  'additive', 'accumulate', 'path'
+]);
+const SVG_ANIMATION_FORBIDDEN_TARGETS = new Set(['id', 'style', 'attributeName']);
+const SVG_FORBIDDEN_VALUE_FRAGMENTS = ['javascript:', 'vbscript:', 'livescript:', 'expression(', '-moz-binding', 'behavior:', '@import', '\\'];
+const SVG_RASTER_DATA = /^data:image\/(png|jpeg|gif|webp);base64,[a-z0-9+/=\s]*$/i;
+const SVG_SAFE_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 const svgCache = new Map();
 
-/** Filtre côté client des SVG (défense en profondeur, en plus du filtrage serveur). */
+/** Valeur d'attribut SVG acceptable (mêmes règles que le serveur). */
+function svgAttrValueOk(element, attr, value) {
+  // Forme compacte (sans blancs ni caractères de contrôle, en minuscules) pour la détection
+  const compact = value.replace(/[\s\u0000-\u001f\u007f-\u009f]/g, '').toLowerCase();
+  if (SVG_FORBIDDEN_VALUE_FRAGMENTS.some(f => compact.includes(f))) return false;
+  // Toute fonction url(...) doit désigner un élément interne : url(#id)
+  let rest = compact;
+  for (let i = rest.indexOf('url('); i !== -1; i = rest.indexOf('url(')) {
+    rest = rest.slice(i + 4);
+    if (!rest.replace(/^["']+/, '').startsWith('#')) return false;
+  }
+  const rasterImage = attr === 'href' && element === 'image';
+  if (compact.includes('data:') && !rasterImage) return false;
+  const v = value.trim();
+  switch (attr) {
+    case 'href': return (v.startsWith('#') && SVG_SAFE_ID.test(v.slice(1))) || (rasterImage && SVG_RASTER_DATA.test(v));
+    case 'style': return !compact.includes('/*') && !compact.includes('<');
+    case 'id': return SVG_SAFE_ID.test(v);
+    case 'attributeName': return SVG_ATTRIBUTES.has(v) && !SVG_ANIMATION_FORBIDDEN_TARGETS.has(v);
+    default: return true;
+  }
+}
+
+/**
+ * Reconstruit un SVG dans un arbre DOM neuf (createElementNS) à partir de son analyse XML.
+ * Seuls les éléments et attributs de la liste blanche et les nœuds texte sont recopiés :
+ * commentaires, instructions de traitement, CDATA et tout autre type de nœud sont supprimés.
+ * Renvoie null si le document est mal formé ou si sa racine n'est pas <svg>.
+ */
+function buildCleanSvg(raw) {
+  const doc = new DOMParser().parseFromString(raw, 'image/svg+xml');
+  if (doc.getElementsByTagName('parsererror').length) return null;
+  const copy = (src, depth) => {
+    const name = src.localName;
+    // Élément préfixé ou d'un autre espace de noms (XHTML...) : supprimé avec son contenu
+    if (src.prefix || (src.namespaceURI && src.namespaceURI !== SVG_NS)) return null;
+    if (!SVG_ELEMENTS.has(name) || depth > SVG_MAX_DEPTH) return null;
+    if (depth === 0 && name !== 'svg') return null;
+    const el = document.createElementNS(SVG_NS, name);
+    for (const a of [...src.attributes]) {
+      const attr = (a.name === 'href' || a.name === 'xlink:href') ? 'href' : a.name;
+      const allowed = attr === 'href' ? SVG_HREF_ELEMENTS.has(name) : SVG_ATTRIBUTES.has(attr);
+      // Pas de style sur la racine : il pourrait sortir le symbole de son cadre
+      if (!allowed || (depth === 0 && attr === 'style') || el.hasAttribute(attr)) continue;
+      if (!svgAttrValueOk(name, attr, a.value)) {
+        // Une animation dont la cible est refusée est supprimée entièrement
+        if (SVG_ANIMATIONS.has(name) && attr === 'attributeName') return null;
+        continue;
+      }
+      el.setAttribute(attr, a.value.trim());
+    }
+    for (const child of [...src.childNodes]) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        el.appendChild(document.createTextNode(child.data));
+      } else if (child.nodeType === Node.ELEMENT_NODE) {
+        const c = copy(child, depth + 1);
+        if (c) el.appendChild(c);
+      }
+      // Tout autre nœud (commentaire, instruction de traitement, CDATA...) est ignoré
+    }
+    return el;
+  };
+  return doc.documentElement ? copy(doc.documentElement, 0) : null;
+}
+
+/**
+ * Filtre côté client des SVG (défense en profondeur, en plus de la reconstruction serveur).
+ * Renvoie un élément <svg> neuf, à insérer par le DOM (appendChild / replaceChildren), jamais
+ * par innerHTML : le SVG n'est donc jamais réinterprété par l'analyseur HTML.
+ */
 function sanitizeSvg(svgText) {
   const raw = String(svgText || '');
-  if (svgCache.has(raw)) return svgCache.get(raw);
-  let clean = DEFAULT_SVG;
-  try {
-    const doc = new DOMParser().parseFromString(raw, 'image/svg+xml');
-    const root = doc.documentElement;
-    if (root && root.localName.toLowerCase() === 'svg' && !doc.getElementsByTagName('parsererror').length) {
-      const cleanAttrs = (el) => {
-        [...el.attributes].forEach(a => {
-          const name = a.name.toLowerCase();
-          const val = a.value.replace(/\s+/g, '').toLowerCase();
-          const isUrl = name === 'href' || name.endsWith(':href') || name === 'src';
-          if (name.startsWith('on') || /(java|vb)script:/.test(val)) {
-            el.removeAttribute(a.name);
-          } else if (isUrl && !(val.startsWith('#') || /^data:image\/(png|jpeg|gif)/.test(val))) {
-            el.removeAttribute(a.name);
-          }
-        });
-      };
-      const walk = (el) => {
-        [...el.children].forEach(child => {
-          const name = child.localName.toLowerCase();
-          const animatesHref = (name === 'animate' || name === 'set') && /href/i.test(child.getAttribute('attributeName') || '');
-          if (SVG_FORBIDDEN.has(name) || animatesHref) {
-            child.remove();
-            return;
-          }
-          cleanAttrs(child);
-          walk(child);
-        });
-      };
-      cleanAttrs(root);
-      walk(root);
-      clean = new XMLSerializer().serializeToString(root);
+  let clean = svgCache.get(raw);
+  if (clean === undefined) {
+    try {
+      clean = buildCleanSvg(raw);
+    } catch (_) {
+      clean = null;
     }
-  } catch (_) {
-    clean = DEFAULT_SVG;
+    if (!clean && raw !== DEFAULT_SVG) clean = sanitizeSvg(DEFAULT_SVG);
+    if (svgCache.size > 300) svgCache.clear();
+    svgCache.set(raw, clean);
   }
-  if (svgCache.size > 300) svgCache.clear();
-  svgCache.set(raw, clean);
-  return clean;
+  return clean ? clean.cloneNode(true) : null;
 }
 
 function readStoredToken() {
@@ -781,7 +866,7 @@ function buildWidgetCard(w) {
   const body = document.createElement('div');
   body.className = 'widget-body';
   body.id = `widget-body-${cssSafe(w.id)}`;
-  body.innerHTML = buildWidgetBodyHtml(w);
+  renderWidgetBody(body, w);
 
   const resizeHandle = document.createElement('div');
   resizeHandle.className = 'resize-handle';
@@ -1202,14 +1287,10 @@ function buildWidgetBodyHtml(w) {
     const sym = state.symbols.find(s => s.id === symId);
     const isActive = boolVal || numVal > 0.1;
     const dynColor = qual !== 'Good' ? '#f59e0b' : (isActive ? '#10b981' : '#38bdf8');
-    let svgHtml = sanitizeSvg(sym ? sym.svg_content : (w.properties && w.properties.svg_content) || DEFAULT_SVG);
-    if (isActive && ((sym && sym.animate_rotation) || (w.properties && w.properties.animate_rotation))) {
-      svgHtml = svgHtml.replace('sym-rotatable', 'sym-rotatable spin-active');
-    }
+    const spin = isActive && ((sym && sym.animate_rotation) || (w.properties && w.properties.animate_rotation));
+    // Emplacement vide : le SVG assaini y est inséré par le DOM (mountCustomSvg), jamais en HTML
     return `
-      <div class="custom-svg-wrapper" style="color:${dynColor};">
-        ${svgHtml}
-      </div>
+      <div class="custom-svg-wrapper" data-spin="${spin ? '1' : '0'}" style="color:${dynColor};"></div>
       <div style="font-weight:800;font-size:13.5px;color:${dynColor};font-family:Consolas;margin-top:4px;">
         ${typeof val === 'boolean' ? (val ? 'MARCHE (1)' : 'ARRÊT (0)') : `${numVal.toFixed(1)} ${unit}`}
       </div>
@@ -1223,6 +1304,30 @@ function buildWidgetBodyHtml(w) {
   `;
 }
 
+/** Insère le SVG assaini d'un symbole générique dans son emplacement, par le DOM. */
+function mountCustomSvg(container, w) {
+  if (w.widget_type !== 'CustomSvgSymbol') return;
+  const slot = container.querySelector('.custom-svg-wrapper');
+  if (!slot) return;
+  const symId = w.properties && w.properties.symbol_id;
+  const sym = state.symbols.find(s => s.id === symId);
+  const svg = sanitizeSvg(sym ? sym.svg_content : (w.properties && w.properties.svg_content) || DEFAULT_SVG);
+  if (!svg) {
+    slot.replaceChildren();
+    return;
+  }
+  if (slot.dataset.spin === '1') {
+    svg.querySelectorAll('.sym-rotatable').forEach(part => part.classList.add('spin-active'));
+  }
+  slot.replaceChildren(svg);
+}
+
+/** (Re)dessine le corps d'un widget : gabarit HTML échappé, puis SVG inséré par le DOM. */
+function renderWidgetBody(el, w) {
+  el.innerHTML = buildWidgetBodyHtml(w);
+  mountCustomSvg(el, w);
+}
+
 function updateBoundWidgetsInPlace(tagId) {
   const dash = getActiveDashboard();
   if (!dash || state.activeTab !== 'synoptic') return;
@@ -1233,7 +1338,7 @@ function updateBoundWidgetsInPlace(tagId) {
         return;
       }
       const el = document.getElementById(`widget-body-${cssSafe(w.id)}`);
-      if (el) el.innerHTML = buildWidgetBodyHtml(w);
+      if (el) renderWidgetBody(el, w);
     }
   });
 }

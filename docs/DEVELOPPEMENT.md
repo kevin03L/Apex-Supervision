@@ -64,15 +64,18 @@ Le dialogue passe uniquement par HTTP et WebSocket, avec un client minimal écri
 
 | Test | Vérifie |
 |---|---|
-| `health_est_public_et_detaille_en_boucle_locale` | `GET /api/health` sans jeton ; en boucle locale, `runtime` (PID, mode `manual`, mode sûr, simulation, fichier de configuration, empreinte), `started_at` et `total_drivers` ; en-têtes de sécurité et `Cache-Control: no-store` |
+| `health_est_public_et_detaille_en_boucle_locale` | `GET /api/health` sans jeton ; en boucle locale, `runtime` (PID, mode `manual`, mode sûr, simulation, fichier de configuration, empreinte), `started_at` et `total_drivers` ; en-têtes de sécurité et `Cache-Control: no-store` ; détails absents dès qu'un en-tête de proxy (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`) est présent |
 | `authentification_jeton_obligatoire` | 401 sans jeton ou avec un jeton inconnu ; échec de connexion (même message pour un mot de passe faux et un compte inconnu) ; connexion `admin`/`admin123`, rôle `Admin`, hachage non publié ; `X-Scada-Token` et `Authorization: Bearer` ; jeton invalidé par la déconnexion |
+| `verrouillage_resiste_aux_tentatives_concurrentes` | 30 connexions simultanées avec un mot de passe faux : exactement 5 réponses 401, 25 réponses 403 ; le bon mot de passe est refusé pendant le verrouillage, les autres comptes restent utilisables |
+| `reinitialisation_du_mot_de_passe_ferme_les_sessions` | Nouveau mot de passe donné par l'administrateur : sessions du compte fermées ; sur son propre compte, l'administrateur garde sa session courante ; modification sans mot de passe : sessions conservées |
 | `rbac_visualisation_refuse_les_actions_admin` | Compte `visu` : lecture autorisée ; 403 sur `POST /api/system/shutdown`, sur la création d'utilisateur, sur `GET /api/users` et sur une consigne ; le serveur reste en marche et l'utilisateur n'est pas créé |
-| `mode_sur_refuse_les_consignes_vers_un_driver_reel` | Consigne sur `MODBUS.GF01.Consigne_Eau_Glacee` (driver `MODBUS_GF01`) : 403 « Mode sûr », y compris avec le jeton de contrôle local ; une consigne sur un driver simulé (`GTB.CTA01.Consigne_Temp`) reste acceptée ; avertissement présent dans le journal |
+| `mode_sur_refuse_les_consignes_vers_un_driver_reel` | Consigne sur `MODBUS.GF01.Consigne_Eau_Glacee` (driver `MODBUS_GF01`) : 403 « Mode sûr » ; refusée aussi avec le jeton de contrôle local (réservé à l'arrêt) ; une consigne sur un driver simulé (`GTB.CTA01.Consigne_Temp`) reste acceptée ; avertissement présent dans le journal |
 | `websocket_exige_un_jeton_puis_diffuse_les_donnees` | `/ws/realtime` : 401 sans jeton ou avec un jeton inconnu ; avec jeton, `InitialSnapshot` puis au moins un `TagUpdateBatch` ; profil Visualisation : instantané sans drivers, flux ni plannings |
 | `code_3_configuration_invalide` | Port 0, TOML illisible, paramètre inconnu, format trop récent : code 3, sans base créée, et erreur consignée dans `logs/apex-scada-startup.log` |
 | `code_4_deuxieme_instance_meme_dossier` | Deuxième processus sur le même dossier : code 4, et la première instance continue de répondre |
 | `code_5_port_occupe` | Port web tenu par le test : code 5, détecté avant l'ouverture de la base |
-| `arret_propre_par_jeton_de_controle_local` | `POST /api/system/shutdown` : 401 sans jeton ; avec `run/control.token`, processus terminé avec le code 0, « arrêté proprement » dans la sortie et dans le journal fichier, jeton supprimé, port libéré |
+| `jeton_de_controle_local_reserve_a_l_arret_propre` | Jeton `run/control.token` : `GET /api/system/status` accepté ; 403 sur les utilisateurs, les tags, l'export, le redémarrage et le WebSocket ; 401 dès qu'un en-tête de proxy est présent ; aucun compte créé |
+| `arret_propre_par_jeton_de_controle_local` | `POST /api/system/shutdown` : 401 sans jeton ; avec `run/control.token`, processus terminé avec le code 0, « arrêté proprement » dans la sortie et dans le journal fichier, jeton supprimé, port libéré ; arrêt accepté avec le compte `admin` désactivé ; après relance, l'arrêt figure au journal d'audit sous l'acteur « Utilitaire local » |
 
 Ce que ces tests ne couvrent pas : l'absence des détails `runtime` pour un client distant (il faudrait une seconde interface réseau), le service Windows et l'unité systemd, ainsi que tout équipement réel.
 

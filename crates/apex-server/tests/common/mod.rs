@@ -418,6 +418,27 @@ impl Server {
     pub fn wait_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
         wait_timeout(self.child.get(), timeout)
     }
+
+    /// Requête HTTP avec des en-têtes supplémentaires (simulation d'un proxy inverse...).
+    pub fn call_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> Response {
+        request_with_headers(self.port(), method, path, token, None, headers).unwrap_or_else(|e| {
+            panic!("{method} {path} : erreur réseau {e}\n{}", self.logs());
+        })
+    }
+
+    /// Relance le moteur dans le même dossier, une fois le précédent arrêté (la base est
+    /// conservée).
+    pub fn restart(&mut self) {
+        self.child.kill();
+        self.child = ChildGuard(Some(spawn_engine(&self.dir.path, &self.config, "engine")));
+        self.wait_ready();
+    }
 }
 
 impl Drop for Server {
@@ -483,6 +504,18 @@ pub fn request(
     token: Option<&str>,
     body: Option<&Value>,
 ) -> io::Result<Response> {
+    request_with_headers(port, method, path, token, body, &[])
+}
+
+/// Comme [`request`], avec des en-têtes supplémentaires.
+pub fn request_with_headers(
+    port: u16,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&Value>,
+    headers: &[(&str, &str)],
+) -> io::Result<Response> {
     let mut stream = connect(port)?;
     let payload = body.map(|b| b.to_string()).unwrap_or_default();
     let mut head = format!(
@@ -490,6 +523,9 @@ pub fn request(
     );
     if let Some(t) = token {
         head.push_str(&format!("X-Scada-Token: {t}\r\n"));
+    }
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
     }
     if body.is_some() {
         head.push_str("Content-Type: application/json\r\n");
