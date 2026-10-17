@@ -837,6 +837,7 @@ impl ScadaCore {
         }
         // La valeur n'a pas été appliquée : un flux qui la visait doit pouvoir la réécrire
         self.flow_runtime.forget_outputs_for_tag(tag_id);
+        self.forget_schedule_state_for_tag(tag_id);
         let _ = self.driver_tx.send(self.get_all_drivers());
         self.record_audit(
             driver_id,
@@ -862,12 +863,23 @@ impl ScadaCore {
         }
     }
 
+    /// Réinitialise l'état appliqué des règles de planning ciblant cette variable, afin
+    /// qu'elles réémettent immédiatement leur consigne après un refus ou une déconnexion.
+    pub fn forget_schedule_state_for_tag(&self, tag_id: &str) {
+        for mut rule in self.schedules.iter_mut() {
+            if rule.target_tag_id == tag_id {
+                rule.last_applied_state = None;
+            }
+        }
+    }
+
     /// Changement d'état de la liaison d'un driver : les commandes en file ou en cours ont pu
     /// être perdues (coupure, commandes obsolètes vidées à la reconnexion). Les flux qui
     /// écrivent sur ses variables oublient leur dernière sortie et la réécriront.
     fn forget_flow_outputs_for_driver(&self, driver_id: &str) {
         for tag in self.get_tags_for_driver(driver_id) {
             self.flow_runtime.forget_outputs_for_tag(&tag.id);
+            self.forget_schedule_state_for_tag(&tag.id);
         }
     }
 
@@ -1893,6 +1905,15 @@ impl ScadaCore {
                         tag_meta.id, tag_meta.protocol_address, e
                     ))
                 })?;
+        }
+        if protocol == ProtocolType::BacnetIp {
+            crate::drivers::bacnet::check_bacnet_write(&tag_meta.protocol_address, &device_value)
+                .map_err(|e| {
+                ScadaError::BadRequest(format!(
+                    "Consigne refusée pour '{}' ({}) : {}",
+                    tag_meta.id, tag_meta.protocol_address, e
+                ))
+            })?;
         }
 
         if !running {
@@ -3760,11 +3781,25 @@ impl ScadaCore {
     /// ni la réponse ni son temps ne permettent d'énumérer les comptes. Au-delà de 5 tentatives
     /// sans succès, l'identifiant est verrouillé 60 secondes, y compris face à des requêtes
     /// concurrentes (réservation atomique de la tentative avant la vérification).
-    pub async fn login(&self, req: LoginRequest) -> Result<LoginResponse, ScadaError> {
+    pub async fn login(
+        &self,
+        req: LoginRequest,
+        client_ip: Option<&str>,
+    ) -> Result<LoginResponse, ScadaError> {
+        if req.password.len() > 256 {
+            return Err(ScadaError::BadRequest(
+                "Mot de passe trop long (256 octets maximum)".to_string(),
+            ));
+        }
+
         let key = req.username.trim().to_lowercase();
+        security::validate_id("utilisateur", &key)?;
+
+        let ip_key = client_ip.unwrap_or("direct");
+        let lock_key = format!("{}:{}", ip_key, key);
         let now = Utc::now();
 
-        self.reserve_login_attempt(&key, now)?;
+        self.reserve_login_attempt(&lock_key, now)?;
 
         let account = self.users.get(&key).map(|u| u.clone());
         let stored_hash = account.as_ref().map(|u| u.password_hash.clone());
@@ -3775,7 +3810,7 @@ impl ScadaCore {
             Ok(ok) => ok,
             Err(busy) => {
                 // Aucune vérification faite : la tentative réservée est rendue
-                self.release_login_attempt(&key);
+                self.release_login_attempt(&lock_key);
                 return Err(busy);
             }
         };
@@ -3833,7 +3868,7 @@ impl ScadaCore {
             );
             current.clone()
         };
-        self.login_failures.remove(&key);
+        self.login_failures.remove(&lock_key);
         self.persist_user(&account).await;
         self.persist_sessions().await;
 
@@ -3966,6 +4001,29 @@ impl ScadaCore {
             .get(&username)
             .map(|u| u.clone())
             .filter(|u| u.enabled)
+    }
+
+    /// Vérifie passivement la validité d'une session (présente, non expirée, compte activé).
+    /// Ne modifie ni `last_seen` ni `sessions_dirty` (utilisé par le tick de surveillance WebSocket).
+    pub fn is_session_valid(&self, token: Option<&str>) -> bool {
+        let Some(raw) = token else { return false };
+        let clean = raw.strip_prefix("Bearer ").unwrap_or(raw).trim();
+        if clean.is_empty() {
+            return false;
+        }
+        let ttl = chrono::Duration::hours(self.session_ttl_hours as i64);
+        let now = Utc::now();
+        let key = security::session_key(clean);
+        let Some(session) = self.sessions.get(&key) else {
+            return false;
+        };
+        if now - session.last_seen >= ttl {
+            return false;
+        }
+        self.users
+            .get(&session.username)
+            .map(|u| u.enabled)
+            .unwrap_or(false)
     }
 
     /// Indique si `token` est le jeton de contrôle local (comparaison à temps constant).
@@ -5255,7 +5313,10 @@ mod tests {
         let attempts: Vec<_> = (0..20)
             .map(|_| {
                 let core = Arc::clone(&core);
-                tokio::spawn(async move { core.login(login_req("visu", "mauvais")).await })
+                tokio::spawn(async move {
+                    core.login(login_req("visu", "mauvais"), Some("192.168.1.50"))
+                        .await
+                })
             })
             .collect();
         let (mut unauthorized, mut locked) = (0, 0);
@@ -5271,7 +5332,8 @@ mod tests {
         assert_eq!(locked, 20 - LOGIN_MAX_FAILURES as usize);
         // Le bon mot de passe est lui aussi refusé pendant le verrouillage
         assert!(matches!(
-            core.login(login_req("visu", "visu123")).await,
+            core.login(login_req("visu", "visu123"), Some("192.168.1.50"))
+                .await,
             Err(ScadaError::Forbidden(_))
         ));
         // Tous les jetons du plafond Argon2 ont été rendus
@@ -5287,11 +5349,15 @@ mod tests {
         for _ in 0..2 {
             for _ in 0..(LOGIN_MAX_FAILURES - 1) {
                 assert!(matches!(
-                    core.login(login_req("visu", "mauvais")).await,
+                    core.login(login_req("visu", "mauvais"), Some("192.168.1.51"))
+                        .await,
                     Err(ScadaError::Unauthorized(_))
                 ));
             }
-            assert!(core.login(login_req("VISU ", "visu123")).await.is_ok());
+            assert!(core
+                .login(login_req("VISU ", "visu123"), Some("192.168.1.51"))
+                .await
+                .is_ok());
         }
     }
 
@@ -5302,11 +5368,13 @@ mod tests {
         let (mut known, mut unknown) = (Duration::MAX, Duration::MAX);
         for i in 0..4 {
             let t = std::time::Instant::now();
-            let _ = core.login(login_req("superviseur", "faux")).await;
+            let _ = core.login(login_req("superviseur", "faux"), None).await;
             known = known.min(t.elapsed());
             // Un identifiant différent à chaque fois : le verrouillage n'intervient pas
             let t = std::time::Instant::now();
-            let r = core.login(login_req(&format!("inconnu{i}"), "faux")).await;
+            let r = core
+                .login(login_req(&format!("inconnu{i}"), "faux"), None)
+                .await;
             unknown = unknown.min(t.elapsed());
             assert!(matches!(r, Err(ScadaError::Unauthorized(_))));
         }
@@ -5339,7 +5407,7 @@ mod tests {
     async fn password_reset_by_admin_revokes_sessions() {
         let core = core_with_user("visu", "visu123");
         let session = core
-            .login(login_req("visu", "visu123"))
+            .login(login_req("visu", "visu123"), None)
             .await
             .unwrap()
             .token;
@@ -5360,12 +5428,12 @@ mod tests {
         assert!(core.resolve_user(Some(&session)).is_none());
         // Sur son propre compte, l'administrateur garde la session d'où il agit
         let own = core
-            .login(login_req("visu", "Nouveau-2026"))
+            .login(login_req("visu", "Nouveau-2026"), None)
             .await
             .unwrap()
             .token;
         let other = core
-            .login(login_req("visu", "Nouveau-2026"))
+            .login(login_req("visu", "Nouveau-2026"), None)
             .await
             .unwrap()
             .token;
@@ -5387,7 +5455,8 @@ mod tests {
                     tokio::spawn(async move {
                         let mut tokens = Vec::new();
                         for _ in 0..3 {
-                            if let Ok(r) = core.login(login_req("victime", "ancien123")).await {
+                            if let Ok(r) = core.login(login_req("victime", "ancien123"), None).await
+                            {
                                 tokens.push(r.token);
                             }
                         }
@@ -5423,6 +5492,44 @@ mod tests {
                 "sessions de l'ancien mot de passe encore valides"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn login_security_ip_lockout_and_input_validation() {
+        let core = core_with_user("secu", "motdepasse123");
+
+        // 1. Identifiant syntaxiquement invalide rejeté sans vérification de mot de passe
+        let res = core
+            .login(login_req("bad user!", "motdepasse123"), Some("10.0.0.1"))
+            .await;
+        assert!(matches!(res, Err(ScadaError::BadRequest(_))));
+
+        // 2. Mot de passe trop long (> 256 octets) rejeté pour prévenir le déni de service Argon2
+        let long_password = "a".repeat(257);
+        let res = core
+            .login(login_req("secu", &long_password), Some("10.0.0.1"))
+            .await;
+        assert!(matches!(res, Err(ScadaError::BadRequest(_))));
+
+        // 3. Verrouillage compartimenté par IP : un attaquant sur IP 10.0.0.1 ne bloque pas 10.0.0.2
+        for _ in 0..LOGIN_MAX_FAILURES {
+            let res = core
+                .login(login_req("secu", "mauvais"), Some("10.0.0.1"))
+                .await;
+            assert!(matches!(res, Err(ScadaError::Unauthorized(_))));
+        }
+
+        // L'IP 10.0.0.1 est maintenant verrouillée
+        let res = core
+            .login(login_req("secu", "motdepasse123"), Some("10.0.0.1"))
+            .await;
+        assert!(matches!(res, Err(ScadaError::Forbidden(_))));
+
+        // L'IP 10.0.0.2 peut se connecter avec succès sur le même compte
+        let res = core
+            .login(login_req("secu", "motdepasse123"), Some("10.0.0.2"))
+            .await;
+        assert!(res.is_ok());
     }
 
     #[test]
@@ -5808,6 +5915,79 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ScadaError::DriverError(_)), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn bacnet_writes_are_checked_before_sending() {
+        let core = ScadaCore::new(None, &engine_options(true));
+        let mut av_tag = driver_tag("BAC_01.AV", "BAC_01", "BACNET:AV:1:Present_Value", true);
+        av_tag.data_type = TagDataType::Float;
+        core.register_and_start_driver(
+            "test",
+            driver("BAC_01", ProtocolType::BacnetIp, vec![av_tag]),
+        )
+        .await
+        .unwrap();
+
+        // Valeur non numérique sur un REAL : refusée 400 immédiatement
+        let err = core
+            .write_tag("BAC_01.AV", TagValue::Text("invalide".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.http_status(), 400);
+
+        // Valeur valide : passe le pré-contrôle synchrone (puis refusée car driver arrêté)
+        let err = core
+            .write_tag("BAC_01.AV", TagValue::Float(21.5))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ScadaError::DriverError(_)), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn schedule_last_applied_state_is_reset_on_driver_rejection_and_disconnect() {
+        let core = ScadaCore::new(None, &engine_options(true));
+        let tag = driver_tag("MB.SP", "MB_DRV", "HR:10:FLOAT32", true);
+        core.register_and_start_driver(
+            "test",
+            driver("MB_DRV", ProtocolType::ModbusTcp, vec![tag]),
+        )
+        .await
+        .unwrap();
+
+        let rule = ScheduleRule {
+            id: "sched_1".into(),
+            name: "Confort".into(),
+            target_tag_id: "MB.SP".into(),
+            start_time: "07:00".into(),
+            end_time: "19:00".into(),
+            active_value: TagValue::Float(21.0),
+            inactive_value: TagValue::Float(18.0),
+            enabled: true,
+            days: vec![1, 2, 3, 4, 5, 6, 7],
+            last_applied_state: Some(true),
+        };
+        core.schedules.insert(rule.id.clone(), rule);
+
+        // 1. Refus d'écriture sur le tag : last_applied_state doit repasser à None
+        core.record_driver_write_rejected("MB_DRV", "MB.SP", "exception Modbus");
+        assert_eq!(
+            core.schedules.get("sched_1").unwrap().last_applied_state,
+            None
+        );
+
+        // Réarmons à Some(true)
+        core.schedules
+            .get_mut("sched_1")
+            .unwrap()
+            .last_applied_state = Some(true);
+
+        // 2. Déconnexion / coupure de liaison sur le driver : last_applied_state repasse à None
+        core.forget_flow_outputs_for_driver("MB_DRV");
+        assert_eq!(
+            core.schedules.get("sched_1").unwrap().last_applied_state,
+            None
+        );
     }
 
     #[tokio::test]

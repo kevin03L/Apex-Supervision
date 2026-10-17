@@ -406,9 +406,11 @@ async fn api_health(
 
 async fn api_auth_login(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
-    let resp = state.core.login(req).await?;
+    let client_ip = peer.ip().to_string();
+    let resp = state.core.login(req, Some(&client_ip)).await?;
     Ok(Json(resp))
 }
 
@@ -1271,7 +1273,7 @@ async fn handle_realtime_socket(
                 }
             }
             _ = session_check.tick() => {
-                if state.core.resolve_user(Some(&token)).is_none() {
+                if !state.core.is_session_valid(Some(&token)) {
                     let _ = socket.send(Message::Close(None)).await;
                     break;
                 }

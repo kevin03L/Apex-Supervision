@@ -713,7 +713,7 @@ pub fn to_app_value(addr: &BacnetAddress, value: &TagValue) -> Result<AppValue, 
         13 | 14 | 19 => {
             let n = match value {
                 TagValue::Int(i) => *i,
-                TagValue::Float(f) if f.fract() == 0.0 => *f as i64,
+                TagValue::Float(f) if f.is_finite() => f.round() as i64,
                 _ => return Err("état entier attendu (1, 2, 3…)".to_string()),
             };
             if !(1..=u32::MAX as i64).contains(&n) {
@@ -723,6 +723,18 @@ pub fn to_app_value(addr: &BacnetAddress, value: &TagValue) -> Result<AppValue, 
         }
         _ => Err("écriture non prise en charge pour ce type d'objet".to_string()),
     }
+}
+
+/// Pré-validation synchrone d'une commande BACnet avant transmission au driver.
+pub fn check_bacnet_write(protocol_address: &str, value: &TagValue) -> Result<(), String> {
+    let addr = BacnetAddress::parse(protocol_address)?;
+    if addr.is_input() && addr.property == PROP_PRESENT_VALUE {
+        return Err(
+            "la valeur d'une entrée BACnet (AI, BI, MSI) n'est pas inscriptible".to_string(),
+        );
+    }
+    to_app_value(&addr, value)?;
+    Ok(())
 }
 
 // ============================================================================
@@ -1147,6 +1159,10 @@ mod tests {
             to_app_value(&msv, &TagValue::Int(4)).unwrap(),
             AppValue::Unsigned(4)
         );
+        assert_eq!(
+            to_app_value(&msv, &TagValue::Float(4.3)).unwrap(),
+            AppValue::Unsigned(4)
+        );
         assert!(to_app_value(&msv, &TagValue::Int(0)).is_err());
         assert_eq!(
             to_tag_value(&bv, AppValue::Enumerated(1)).unwrap(),
@@ -1156,6 +1172,9 @@ mod tests {
             to_tag_value(&av, AppValue::Real(7.1)).unwrap(),
             TagValue::Float(7.1)
         );
+        assert!(check_bacnet_write("BACNET:AI:1", &TagValue::Float(10.0)).is_err());
+        assert!(check_bacnet_write("BACNET:AV:1", &TagValue::Float(10.5)).is_ok());
+        assert!(check_bacnet_write("BACNET:MSV:1", &TagValue::Float(2.2)).is_ok());
     }
 
     #[test]

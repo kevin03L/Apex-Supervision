@@ -81,6 +81,12 @@ impl FlowEngineRuntime {
     /// Oublie les mémoires d'exécution propres à un flux (redéploiement ou suppression).
     pub fn forget_flow(&self, flow_id: &str) {
         let prefix = format!("{}/", flow_id);
+        self.threshold_memory.retain(|k, _| !k.starts_with(&prefix));
+        self.hysteresis_memory
+            .retain(|k, _| !k.starts_with(&prefix));
+        self.pid_memory.retain(|k, _| !k.starts_with(&prefix));
+        self.gate_inputs.retain(|k, _| !k.starts_with(&prefix));
+        self.timer_since.retain(|k, _| !k.starts_with(&prefix));
         self.failing_scripts.retain(|k, _| !k.starts_with(&prefix));
         self.last_outputs.retain(|k, _| !k.starts_with(&prefix));
     }
@@ -326,6 +332,7 @@ async fn run_flow_from_entry_node(
             continue;
         };
 
+        let qualified_node_key = node_key(&flow.id, &current_node.id);
         let mut out_port = "out".to_string();
         let mut next_value = current_val.clone();
 
@@ -343,21 +350,21 @@ async fn run_flow_from_entry_node(
                 let prev = core
                     .flow_runtime
                     .threshold_memory
-                    .get(&current_node.id)
+                    .get(&qualified_node_key)
                     .map(|b| *b)
                     .unwrap_or(false);
 
                 let cond = eval_threshold(num_val, *operator, *threshold, *hysteresis, prev);
                 core.flow_runtime
                     .threshold_memory
-                    .insert(current_node.id.clone(), cond);
+                    .insert(qualified_node_key.clone(), cond);
 
                 out_port = if cond {
                     "true".to_string()
                 } else {
                     "false".to_string()
                 };
-                next_value = TagValue::Float(num_val);
+                next_value = TagValue::Bool(cond);
             }
 
             FlowNodeKind::Hysteresis {
@@ -371,7 +378,7 @@ async fn run_flow_from_entry_node(
                 let prev = core
                     .flow_runtime
                     .hysteresis_memory
-                    .get(&current_node.id)
+                    .get(&qualified_node_key)
                     .map(|b| *b)
                     .unwrap_or(false);
 
@@ -386,7 +393,7 @@ async fn run_flow_from_entry_node(
                 let final_state = if *invert { !raw_state } else { raw_state };
                 core.flow_runtime
                     .hysteresis_memory
-                    .insert(current_node.id.clone(), raw_state);
+                    .insert(qualified_node_key.clone(), raw_state);
 
                 out_port = if final_state {
                     "true".to_string()
@@ -428,7 +435,7 @@ async fn run_flow_from_entry_node(
                 let mut entry = core
                     .flow_runtime
                     .pid_memory
-                    .entry(current_node.id.clone())
+                    .entry(qualified_node_key.clone())
                     .or_insert_with(|| PidState {
                         integral: 0.0,
                         prev_error: 0.0,
@@ -458,7 +465,7 @@ async fn run_flow_from_entry_node(
                 let mut inputs_map = core
                     .flow_runtime
                     .gate_inputs
-                    .entry(current_node.id.clone())
+                    .entry(qualified_node_key.clone())
                     .or_default();
                 inputs_map.insert(upstream_node_id.clone(), in_bool);
 
@@ -487,7 +494,7 @@ async fn run_flow_from_entry_node(
                     let mut entry = core
                         .flow_runtime
                         .timer_since
-                        .entry(current_node.id.clone())
+                        .entry(qualified_node_key.clone())
                         .or_insert(Some(now));
                     let start = entry.get_or_insert(now);
                     let elapsed = (now - *start).num_milliseconds().max(0) as u64;
@@ -499,7 +506,7 @@ async fn run_flow_from_entry_node(
                 } else {
                     core.flow_runtime
                         .timer_since
-                        .insert(current_node.id.clone(), None);
+                        .insert(qualified_node_key.clone(), None);
                     next_value = TagValue::Bool(false);
                 }
             }
@@ -588,6 +595,36 @@ async fn run_flow_from_entry_node(
                 }
                 continue;
             }
+        }
+
+        if let FlowNodeKind::Threshold { .. } = &current_node.kind {
+            let cond = match next_value {
+                TagValue::Bool(b) => b,
+                _ => false,
+            };
+            for edge in flow.edges.iter().filter(|e| e.from_node == current_node.id) {
+                let (edge_val, port_name) = match edge.from_port.as_str() {
+                    "true" => (TagValue::Bool(cond), "true"),
+                    "false" => (TagValue::Bool(!cond), "false"),
+                    _ => (TagValue::Bool(cond), "out"),
+                };
+                core.emit_flow_trace(FlowExecutionTrace {
+                    flow_id: flow.id.clone(),
+                    from_node_id: edge.from_node.clone(),
+                    to_node_id: edge.to_node.clone(),
+                    port: port_name.to_string(),
+                    value: edge_val.clone(),
+                    timestamp: Utc::now(),
+                });
+
+                queue.push((
+                    edge.to_node.clone(),
+                    current_node.id.clone(),
+                    edge_val,
+                    depth + 1,
+                ));
+            }
+            continue;
         }
 
         let matching_edges: Vec<&FlowEdge> = flow
@@ -1316,5 +1353,118 @@ mod tests {
             TagValue::Bool(false),
             "DelayTimer n'a pas propagé false lors de la retombée de l'entrée"
         );
+    }
+
+    #[tokio::test]
+    async fn node_memory_is_qualified_by_flow_id_and_purged_on_forget() {
+        let core = ScadaCore::new(None, &crate::core::EngineOptions::default());
+        // Simuler des entrées dans les 5 tables avec la clé flow_id/node_id
+        core.flow_runtime
+            .threshold_memory
+            .insert("f1/n1".into(), true);
+        core.flow_runtime
+            .threshold_memory
+            .insert("f2/n1".into(), false);
+
+        core.flow_runtime
+            .hysteresis_memory
+            .insert("f1/n1".into(), true);
+        core.flow_runtime
+            .hysteresis_memory
+            .insert("f2/n1".into(), false);
+
+        core.flow_runtime
+            .gate_inputs
+            .insert("f1/n1".into(), Default::default());
+        core.flow_runtime
+            .gate_inputs
+            .insert("f2/n1".into(), Default::default());
+
+        core.flow_runtime
+            .timer_since
+            .insert("f1/n1".into(), Some(Utc::now()));
+        core.flow_runtime.timer_since.insert("f2/n1".into(), None);
+
+        // Clés qualifiées distinctes : f1 n'écrase pas f2
+        assert!(*core.flow_runtime.threshold_memory.get("f1/n1").unwrap());
+        assert!(!*core.flow_runtime.threshold_memory.get("f2/n1").unwrap());
+
+        // forget_flow sur f1 purge uniquement f1
+        core.flow_runtime.forget_flow("f1");
+        assert!(!core.flow_runtime.threshold_memory.contains_key("f1/n1"));
+        assert!(core.flow_runtime.threshold_memory.contains_key("f2/n1"));
+        assert!(!core.flow_runtime.hysteresis_memory.contains_key("f1/n1"));
+        assert!(core.flow_runtime.hysteresis_memory.contains_key("f2/n1"));
+        assert!(!core.flow_runtime.gate_inputs.contains_key("f1/n1"));
+        assert!(core.flow_runtime.gate_inputs.contains_key("f2/n1"));
+        assert!(!core.flow_runtime.timer_since.contains_key("f1/n1"));
+        assert!(core.flow_runtime.timer_since.contains_key("f2/n1"));
+    }
+
+    #[tokio::test]
+    async fn threshold_emits_boolean_and_descending_edge() {
+        let core = ScadaCore::new(None, &crate::core::EngineOptions::default());
+        core.register_tag(internal_tag("INT.In", 0.0), None);
+        let mut out_tag = internal_tag("INT.Out", 0.0);
+        out_tag.data_type = crate::models::TagDataType::Bool;
+        core.register_tag(out_tag, None);
+
+        let flow = FlowGraph {
+            id: "f_thresh".into(),
+            name: "f_thresh".into(),
+            description: String::new(),
+            enabled: true,
+            nodes: vec![
+                node(
+                    "in",
+                    FlowNodeKind::TagInput {
+                        tag_id: "INT.In".into(),
+                    },
+                ),
+                node(
+                    "th",
+                    FlowNodeKind::Threshold {
+                        operator: ComparisonOperator::Gt,
+                        threshold: 10.0,
+                        hysteresis: 0.0,
+                    },
+                ),
+                node(
+                    "out",
+                    FlowNodeKind::TagOutput {
+                        target_tag_id: "INT.Out".into(),
+                    },
+                ),
+            ],
+            edges: vec![
+                edge("e1", "in", "th"),
+                FlowEdge {
+                    id: "e2".into(),
+                    from_node: "th".into(),
+                    from_port: "true".into(),
+                    to_node: "out".into(),
+                    to_port: "in".into(),
+                },
+            ],
+        };
+
+        let engine = shared_engine(&core);
+        let out = |core: &ScadaCore| core.tags_state.get("INT.Out").unwrap().value.clone();
+
+        // 1er coup : 15.0 > 10.0 => out reçoit Bool(true) (et non Float(15.0))
+        run_flow_from_entry_node(
+            &core,
+            &flow,
+            &flow.nodes[0],
+            &input("INT.In", 15.0),
+            &engine,
+        )
+        .await;
+        assert_eq!(out(&core), TagValue::Bool(true));
+
+        // 2e coup : 5.0 <= 10.0 => la branche "true" reçoit le front descendant Bool(false)
+        run_flow_from_entry_node(&core, &flow, &flow.nodes[0], &input("INT.In", 5.0), &engine)
+            .await;
+        assert_eq!(out(&core), TagValue::Bool(false));
     }
 }

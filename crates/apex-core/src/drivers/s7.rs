@@ -281,7 +281,7 @@ impl S7Address {
             let v = match value {
                 TagValue::Int(i) => *i,
                 TagValue::Bool(b) => *b as i64,
-                TagValue::Float(f) if f.fract() == 0.0 => *f as i64,
+                TagValue::Float(f) if f.is_finite() => f.round() as i64,
                 _ => return Err(format!("valeur entière attendue pour {:?}", self.ty)),
             };
             if v < min || v > max {
@@ -909,6 +909,10 @@ mod tests {
         assert_eq!(real.decode(&bytes).unwrap(), TagValue::Float(7.1));
         let int = addr("DB1.DBW0:INT");
         assert_eq!(int.decode(&[0xFF, 0xFE]).unwrap(), TagValue::Int(-2));
+        assert_eq!(
+            int.encode(&TagValue::Float(215.3)).unwrap(),
+            215i16.to_be_bytes().to_vec()
+        );
         assert!(int.encode(&TagValue::Int(40000)).is_err());
         assert_eq!(
             addr("DB1.DBW0:WORD").decode(&[0xFF, 0xFE]).unwrap(),

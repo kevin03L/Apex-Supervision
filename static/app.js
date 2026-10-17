@@ -17,10 +17,10 @@ const WIDGET_TYPES = [
 ];
 
 // Protocoles sans implémentation réelle (valeurs fictives) : signalés comme tels dans l'IHM
-const SIMULATED_PROTOCOLS = ['Simulator', 'OpcUa', 'BacnetIp'];
-// Auto-Découverte : catalogue de démonstration des seuls protocoles simulés, simulation active.
-// Jamais pour un équipement réel (Modbus TCP, MQTT, S7) : ses variables se déclarent d'après sa table d'échange.
-const DISCOVERABLE_PROTOCOLS = ['OpcUa', 'BacnetIp'];
+const SIMULATED_PROTOCOLS = ['Simulator'];
+// Auto-Découverte : uniquement pour les protocoles industriels le supportant (BACnet/IP).
+// Jamais pour un équipement réel sans support de découverte (Modbus TCP, MQTT, S7, OPC-UA) : ses variables se déclarent d'après sa table d'échange.
+const DISCOVERABLE_PROTOCOLS = ['BacnetIp'];
 // Aide à la saisie par protocole : endpoint et exemple d'adresse de variable
 const PROTOCOL_HINTS = {
   ModbusTcp: { endpoint: 'ex. 192.168.1.10:502', address: 'ex. HR:0:FLOAT32, COIL:3, IR:5' },
@@ -1724,10 +1724,9 @@ function renderDriversCardsOnly() {
   box.innerHTML = cardsHtml + addCardHtml;
 }
 
-/** L'Auto-Découverte n'est proposée que pour un protocole simulé, avec la simulation active. */
+/** L'Auto-Découverte est proposée pour les protocoles industriels qui la supportent (BACnet/IP). */
 function canDiscoverTags(driver) {
-  return DISCOVERABLE_PROTOCOLS.includes(driver.protocol)
-    && !!(state.systemStatus && state.systemStatus.simulation_enabled);
+  return DISCOVERABLE_PROTOCOLS.includes(driver.protocol);
 }
 
 async function driverAction(id, action) {
