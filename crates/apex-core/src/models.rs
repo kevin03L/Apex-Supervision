@@ -54,6 +54,9 @@ pub enum ScadaError {
 
     #[error("Accès refusé (Privilèges insuffisants) : {0}")]
     Forbidden(String),
+
+    #[error("Serveur occupé : {0}")]
+    Busy(String),
 }
 
 impl ScadaError {
@@ -69,6 +72,7 @@ impl ScadaError {
             ScadaError::TypeMismatch { .. } | ScadaError::BadRequest(_) => 400,
             ScadaError::DriverError(_) | ScadaError::FlowError(_) => 502,
             ScadaError::DatabaseError(_) => 500,
+            ScadaError::Busy(_) => 503,
         }
     }
 }
@@ -380,6 +384,13 @@ pub struct DriverRuntimeStats {
     pub last_latency_ms: u64,
     pub last_poll_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
+    /// Dernière commande refusée par l'équipement (exception Modbus, valeur invalide). Elle
+    /// reste affichée jusqu'à la prochaine écriture acceptée, contrairement à `last_error` que
+    /// la scrutation suivante efface.
+    #[serde(default)]
+    pub last_write_rejected: Option<String>,
+    #[serde(default)]
+    pub last_write_rejected_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -79,7 +79,7 @@ Options : `--config <fichier>` pour administrer une instance précise, `--wizard
 | `apex-scada config show` | Affiche les emplacements, l'empreinte et la configuration effective. |
 | `apex-scada config init [--portable] [--force] [--name …] [--bind …] [--port …] [--simulation] [--safe-mode]` | Crée un fichier. Un fichier existant n'est remplacé qu'avec `--force`, et il est alors sauvegardé. |
 | `apex-scada config migrate` | Réécrit le fichier au format courant : valeurs conservées, sauvegarde préalable. |
-| `apex-scada migrate-legacy --from <dossier\|fichier.db> [--force]` | Copie la base d'une version 1.x. La source n'est jamais modifiée. |
+| `apex-scada migrate-legacy --from <dossier\|fichier.db> [--force]` | Copie la base d'une version 1.x (journal WAL compris). La source n'est jamais modifiée. Une base déjà en place n'est remplacée qu'avec `--force` : elle est d'abord sauvegardée en entier sous `<base>.bak-<date>`, et la commande refuse si cette sauvegarde est impossible. En mode portable, ajoutez `--config <fichier>`. |
 | `apex-scada service install\|uninstall\|start\|stop\|restart\|status\|enable\|disable\|permissions` | Service Windows (administrateur). `permissions` réapplique le propriétaire et les droits de `C:\ProgramData\Apex Supervision`. Sous Linux, utilisez `systemctl`. |
 | `apex-scada version` | Version, commit et cible de compilation. |
 
@@ -121,22 +121,40 @@ Sans mode sûr, le planificateur et les flux **écrivent sur les équipements d�
 
 Les drivers **OPC-UA, BACnet/IP et Siemens S7 sont simulés** à ce stade : ils produisent des valeurs fictives. Ils ne sont **pas** opérationnels sur de vrais équipements. Seuls **Modbus TCP** et **MQTT** communiquent réellement.
 
+Quand la simulation est désactivée, les drivers simulés (OPC-UA, BACnet/IP, S7, simulateur GTB) sont refusés à l'ajout et au démarrage (erreur 400). À l'import d'un projet, ils sont écartés avec leurs variables, et la réponse de `POST /api/system/import` les liste dans `ignored_drivers` et `ignored_tags`. Un driver simulé déjà enregistré reste modifiable. Il ne démarre simplement pas.
+
+L'**Auto-Découverte** n'existe que pour les protocoles simulés OPC-UA, BACnet/IP et S7, et seulement avec la simulation active. Modbus TCP, MQTT et le simulateur GTB n'ont pas de catalogue à parcourir : `POST /api/drivers/:id/browse` répond 400 et le bouton est masqué.
+
+---
+
+## 6 bis. Drivers et automatismes : règles de contrôle
+
+- **Modbus TCP** : une variable inscriptible doit viser une bobine (`CO`) ou un registre de maintien (`HR`). `DI`, `IR` et les types texte sont refusés à l'enregistrement. `HR:x:INT32` est inscriptible. Une valeur hors de la plage du type (INT16, UINT16, INT32, FLOAT32) est refusée (400) au lieu d'être saturée.
+- **Écriture refusée par l'équipement** (exception Modbus) : la liaison reste saine et aucune alarme de communication n'est levée. Le refus est tracé dans le journal d'audit (action `WRITE_REJECTED`, acteur = identifiant du driver). Il reste affiché en orange sur la carte du driver jusqu'à la prochaine écriture acceptée.
+- **Alarmes** : la bande morte d'une alarme retarde seulement la disparition du niveau actif. Elle n'empêche jamais l'escalade vers HH ou LL. Chaque alarme porte son niveau (`level` : `Tor`, `HighHigh`, `High`, `LowLow` ou `Low`) dans `/api/alarms` et dans le WebSocket.
+- **Flux** : un script Rhai vide ou invalide est refusé à l'enregistrement (400). Une erreur d'exécution n'est journalisée qu'une fois par nœud, jusqu'au rétablissement.
+- **Nœud « Écrire variable »** : il ne réécrit sa sortie que si elle varie d'au moins max(bande morte du tag, 0,08) depuis sa dernière écriture. Une valeur modifiée par un opérateur n'est donc pas écrasée à chaque cycle. La sortie est réécrite dans trois cas :
+  - un redéploiement du flux ;
+  - un refus de l'équipement ;
+  - un changement d'état de la liaison du driver (commande perdue pendant une coupure).
+
 ---
 
 ## 7. Sécurité
 
 - Changez les mots de passe des comptes d'usine (`admin`, `superviseur`, `visu`) dès la première connexion. Le moteur le rappelle dans ses journaux tant que ce n'est pas fait.
-- **Connexion** : après 5 tentatives sans succès, l'identifiant est verrouillé 60 secondes, y compris face à des tentatives simultanées. Un identifiant inconnu est traité comme un mot de passe faux, avec le même message et le même temps de réponse. Le moteur fait au plus 4 vérifications de mot de passe à la fois.
-- **Sessions** : changer le rôle d'un compte, le désactiver ou lui donner un nouveau mot de passe depuis l'écran Utilisateurs ferme toutes ses sessions ouvertes. Un administrateur qui change son propre mot de passe garde la session d'où il agit.
+- **Connexion** : après 5 tentatives sans succès, l'identifiant est verrouillé 60 secondes, y compris face à des tentatives simultanées. Un identifiant inconnu est traité comme un mot de passe faux, avec le même message et le même temps de réponse. Le moteur fait au plus 4 vérifications de mot de passe à la fois. Une requête qui attend plus de 5 secondes une place reçoit 503 (« serveur occupé ») : la tentative n'est pas comptée. Le changement de son propre mot de passe est soumis au même verrouillage, avec un compteur distinct.
+- **Sessions** : changer le rôle d'un compte, le désactiver ou lui donner un nouveau mot de passe depuis l'écran Utilisateurs ferme toutes ses sessions ouvertes. Un administrateur qui change son propre mot de passe garde la session d'où il agit. Une connexion en cours pendant la modification ne peut ni restaurer l'ancien mot de passe ni conserver une session.
 - Le serveur parle **HTTP non chiffré**. Gardez `server.bind = 127.0.0.1` ou limitez l'accès par pare-feu. Pour un accès réseau, utilisez un proxy inverse HTTPS (nginx, Caddy, IIS).
 - **Jeton de contrôle local** (`run/control.token`, régénéré à chaque démarrage et protégé par les permissions du système). Il sert uniquement à l'utilitaire desktop et n'ouvre que deux routes : `POST /api/system/shutdown` (arrêt propre) et `GET /api/system/status`. Toute autre route répond 403 avec ce jeton : pas d'administration, pas de consigne, pas de WebSocket. Les actions faites avec ce jeton sont journalisées sous l'acteur interne **« Utilitaire local »**. Cet acteur ne correspond à aucun compte : l'arrêt propre fonctionne même si le compte `admin` est désactivé.
-- **Ce qui est réservé au poste local.** Le jeton de contrôle local et les détails d'exécution de `/api/health` (chemins de configuration, de données et de journaux, PID, mode) ne sont accordés qu'à une requête qui remplit deux conditions :
+- **Détails d'exécution de `/api/health`** (chemins de configuration, de données et de journaux, PID, mode, empreinte de la configuration) : publiés seulement à une requête qui présente le jeton de contrôle local, en plus des deux conditions ci-dessous. Une page web ou un proxy local mal configuré ne peuvent donc pas les lire. L'utilitaire lit ce jeton : sous Windows, lancé sans élévation, il n'affiche pas ces détails et le signale.
+- **Ce qui est réservé au poste local.** Le jeton de contrôle local n'est accepté, et les détails d'exécution ne sont publiés, qu'à une requête qui remplit deux conditions :
   - elle vient de la boucle locale (`127.0.0.1` ou `::1`) ;
   - elle ne porte **aucun** en-tête de proxy inverse : `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto` ou `X-Real-IP`.
 
   Derrière un proxy inverse installé **sur le même poste**, toutes les requêtes arrivent de `127.0.0.1` : l'adresse seule ne permet pas de savoir qu'elles viennent du réseau. **Configurez donc le proxy pour qu'il ajoute `X-Forwarded-For`** (ou `Forwarded`) à chaque requête. Caddy le fait par défaut. Avec nginx, ajoutez `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`. Avec IIS/ARR, activez l'en-tête `X-Forwarded-For`. Un proxy qui n'ajoute aucun de ces en-têtes rend ce contrôle inopérant.
 - Aucune interface d'administration n'est exposée sur le réseau en dehors de l'IHM web authentifiée.
-- **Symboles SVG** (import de bibliothèque, symboles des synoptiques) : le serveur analyse le SVG comme du XML, puis le reconstruit à partir d'une liste blanche d'éléments et d'attributs de dessin. Il retire les scripts, les styles globaux, `foreignObject`, les gestionnaires `on*`, les liens externes (seules les références internes `#id` et les images PNG, JPEG, GIF ou WebP embarquées sont gardées), les commentaires, les instructions de traitement, les sections CDATA et le DOCTYPE. Un fichier qui n'est pas du XML bien formé est refusé avec un message explicite. Un symbole déjà enregistré qui ne passe plus ce contrôle est ignoré au chargement, avec un avertissement dans le journal. L'IHM refait le même filtrage et insère le dessin par le DOM, jamais sous forme de HTML.
+- **Symboles SVG** (import de bibliothèque, symboles des synoptiques) : le serveur analyse le SVG comme du XML, puis le reconstruit à partir d'une liste blanche d'éléments et d'attributs de dessin. Il retire les scripts, les styles globaux, `foreignObject`, les gestionnaires `on*`, les liens externes (seules les références internes `#id` et les images PNG, JPEG, GIF ou WebP embarquées sont gardées), les commentaires, les instructions de traitement, les sections CDATA et le DOCTYPE. Un fichier qui n'est pas du XML bien formé est refusé avec un message explicite. Un symbole déjà enregistré qui ne passe plus ce contrôle est ignoré au chargement, avec un avertissement dans le journal. Les règles de classe simples d'une feuille `<style>` (`.st0 { fill: … }`, exports Illustrator) sont reportées dans l'attribut `style` des éléments concernés. Les autres sélecteurs sont ignorés. L'IHM refait le même filtrage et insère le dessin par le DOM, jamais sous forme de HTML.
 
 ---
 

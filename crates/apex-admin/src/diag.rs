@@ -118,7 +118,7 @@ pub fn run(layout: &Layout, service: Option<&ServiceInfo>) -> Vec<Check> {
     let layout = layout.clone().with_overrides(&cfg);
 
     // 2. Serveur web et moteur
-    let health: Option<Health> = match probe::health(&cfg) {
+    let health: Option<Health> = match probe::health_detailed(&cfg, &layout) {
         Ok(h) => {
             out.push(check(
                 Level::Ok,

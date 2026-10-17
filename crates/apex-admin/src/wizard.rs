@@ -78,6 +78,8 @@ pub struct Wizard {
     initial_autostart: Option<bool>,
     start_engine: bool,
     legacy_db: Option<PathBuf>,
+    /// Base actuelle déjà présente (moteur déjà démarré une fois) : la reprise la remplacera.
+    current_db: Option<PathBuf>,
     migrate_legacy: bool,
     custom_paths: bool,
     port_check: Option<(String, u16, Result<(), String>)>,
@@ -91,6 +93,7 @@ impl Wizard {
         layout: &Layout,
         has_service: bool,
         legacy_db: Option<PathBuf>,
+        current_db: Option<PathBuf>,
     ) -> Self {
         let custom_paths = !start.paths.data_dir.is_empty() || !start.paths.log_dir.is_empty();
         Self {
@@ -99,8 +102,9 @@ impl Wizard {
             autostart: true,
             initial_autostart: None,
             start_engine: true,
-            migrate_legacy: legacy_db.is_some(),
+            migrate_legacy: legacy_db.is_some() && current_db.is_none(),
             legacy_db,
+            current_db,
             custom_paths,
             port_check: None,
             has_service,
@@ -466,6 +470,18 @@ impl Wizard {
                 "La base est COPIÉE avant le premier démarrage (configuration, historique, comptes) ; \
                  l'original n'est jamais modifié.",
             );
+            if let Some(current) = &self.current_db {
+                form::banner(
+                    ui,
+                    form::warn_color(ui),
+                    &format!(
+                        "Une base existe déjà ({}). Si vous cochez la reprise, elle sera d'abord sauvegardée \
+                         en entier (fichier .bak-<date> à côté), puis remplacée. Ne cochez que si elle ne \
+                         contient encore aucune donnée utile.",
+                        current.display()
+                    ),
+                );
+            }
         }
     }
 

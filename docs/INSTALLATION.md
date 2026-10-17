@@ -171,7 +171,7 @@ sudo systemctl edit apex-scada
 # CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ```
 
-Une solution plus sûre consiste à placer un proxy HTTPS (nginx, Caddy) devant le port 3000.
+Une solution plus sûre consiste à placer un proxy HTTPS (nginx, Caddy) devant le port 3000. Configurez alors le proxy pour qu'il ajoute l'en-tête `X-Forwarded-For` (avec nginx : `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`) : voir [ADMINISTRATION.md §7](ADMINISTRATION.md#7-sécurité).
 
 ### 2.5 Mise à jour
 

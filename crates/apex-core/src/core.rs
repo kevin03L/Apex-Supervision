@@ -54,6 +54,8 @@ const LOGIN_LOCK_SECONDS: i64 = 60;
 /// Vérifications Argon2 simultanées au plus, pour tout le moteur (environ 19 Mio de mémoire et
 /// un cœur chacune) : une rafale de connexions ne peut pas saturer le poste.
 const PASSWORD_CHECKS_MAX_CONCURRENT: usize = 4;
+/// Attente maximale d'une place de vérification avant de répondre « serveur occupé » (503).
+const PASSWORD_CHECK_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Acteur interne des actions faites avec le jeton de contrôle local (utilitaire desktop).
 /// Son nom contient un espace : il ne peut correspondre à aucun compte réel.
@@ -141,6 +143,8 @@ pub struct ScadaCore {
     login_failures: DashMap<String, LoginFailure>,
     /// Plafond global des vérifications Argon2 simultanées.
     password_checks: Arc<Semaphore>,
+    /// Sérialise l'écriture des comptes en base (voir `persist_user`).
+    users_persist_lock: tokio::sync::Mutex<()>,
     /// Jeton de contrôle local de l'utilitaire desktop (arrêt propre uniquement), accepté
     /// seulement depuis la boucle locale sans en-tête de proxy (contrôle fait par le serveur web).
     pub local_control_token: String,
@@ -198,6 +202,7 @@ impl ScadaCore {
             sessions: DashMap::new(),
             login_failures: DashMap::new(),
             password_checks: Arc::new(Semaphore::new(PASSWORD_CHECKS_MAX_CONCURRENT)),
+            users_persist_lock: tokio::sync::Mutex::new(()),
             local_control_token: security::generate_token(),
             symbols_library: DashMap::new(),
             flow_runtime: FlowEngineRuntime::new(),
@@ -617,7 +622,9 @@ impl ScadaCore {
         self.persist_driver(driver_id).await;
         self.record_audit(actor, "DRIVER", "UPDATE", driver_id, &changes.join(", "));
 
-        if cfg.enabled {
+        // Driver simulé alors que la simulation est désactivée : il ne peut pas tourner, la
+        // modification enregistrée est un succès (pas d'erreur 400 après persistance)
+        if cfg.enabled && self.ensure_protocol_available(&cfg.protocol).is_ok() {
             // Redémarrage à chaud avec la nouvelle configuration ; l'alarme de communication
             // éventuelle sera réévaluée à la première trame.
             self.start_or_restart_driver(actor, driver_id).await
@@ -800,16 +807,25 @@ impl ScadaCore {
         } else if !was_connected {
             self.update_comm_alarm(driver_id, true);
         }
+        if connected != was_connected {
+            self.forget_flow_outputs_for_driver(driver_id);
+        }
     }
 
     /// Commande refusée par l'équipement (exception Modbus) ou invalide pour son adresse : la
     /// liaison reste saine, donc ni alarme de communication ni passage des variables en défaut.
     /// L'erreur est visible sur la carte du driver et tracée dans le journal d'audit.
     pub fn record_driver_write_rejected(&self, driver_id: &str, tag_id: &str, err: &str) {
+        let msg = format!("Écriture refusée sur '{}' : {}", tag_id, err);
         if let Some(mut drv) = self.drivers_config.get_mut(driver_id) {
             drv.stats.frames_err += 1;
-            drv.stats.last_error = Some(format!("Écriture refusée sur '{}' : {}", tag_id, err));
+            drv.stats.last_error = Some(msg.clone());
+            drv.stats.last_write_rejected = Some(msg);
+            drv.stats.last_write_rejected_at = Some(Utc::now());
         }
+        // La valeur n'a pas été appliquée : un flux qui la visait doit pouvoir la réécrire
+        self.flow_runtime.forget_outputs_for_tag(tag_id);
+        let _ = self.driver_tx.send(self.get_all_drivers());
         self.record_audit(
             driver_id,
             "CONSIGNE",
@@ -817,6 +833,30 @@ impl ScadaCore {
             tag_id,
             &format!("Commande refusée par l'équipement : {}", err),
         );
+    }
+
+    /// Écriture acceptée par l'équipement : le dernier refus affiché sur la carte est levé.
+    pub fn record_driver_write_accepted(&self, driver_id: &str) {
+        let cleared = self
+            .drivers_config
+            .get_mut(driver_id)
+            .map(|mut drv| {
+                drv.stats.last_write_rejected_at = None;
+                drv.stats.last_write_rejected.take().is_some()
+            })
+            .unwrap_or(false);
+        if cleared {
+            let _ = self.driver_tx.send(self.get_all_drivers());
+        }
+    }
+
+    /// Changement d'état de la liaison d'un driver : les commandes en file ou en cours ont pu
+    /// être perdues (coupure, commandes obsolètes vidées à la reconnexion). Les flux qui
+    /// écrivent sur ses variables oublient leur dernière sortie et la réécriront.
+    fn forget_flow_outputs_for_driver(&self, driver_id: &str) {
+        for tag in self.get_tags_for_driver(driver_id) {
+            self.flow_runtime.forget_outputs_for_tag(&tag.id);
+        }
     }
 
     pub fn get_tags_for_driver(&self, driver_id: &str) -> Vec<RegisteredTag> {
@@ -2870,6 +2910,11 @@ impl ScadaCore {
         let Some(pool) = &self.db_pool else {
             return;
         };
+        // Écritures sérialisées, et toujours avec l'état courant du compte en mémoire : deux
+        // modifications concurrentes ne peuvent pas laisser en base une copie périmée.
+        let _guard = self.users_persist_lock.lock().await;
+        let current = self.users.get(&account.username).map(|u| u.clone());
+        let account = current.as_ref().unwrap_or(account);
         match serde_json::to_string(account) {
             Ok(json) => log_db_error(
                 "persistance utilisateur",
@@ -3514,9 +3559,17 @@ impl ScadaCore {
 
         let account = self.users.get(&key).map(|u| u.clone());
         let stored_hash = account.as_ref().map(|u| u.password_hash.clone());
-        let password_ok = self
+        let password_ok = match self
             .verify_password_bounded(req.password.clone(), stored_hash)
-            .await;
+            .await
+        {
+            Ok(ok) => ok,
+            Err(busy) => {
+                // Aucune vérification faite : la tentative réservée est rendue
+                self.release_login_attempt(&key);
+                return Err(busy);
+            }
+        };
 
         let Some(account) = account.filter(|_| password_ok) else {
             // La tentative a déjà été comptée par la réservation
@@ -3538,21 +3591,41 @@ impl ScadaCore {
             ));
         }
 
-        self.login_failures.remove(&key);
-        let mut account = account;
-        account.last_login_at = Some(now);
-        self.users.insert(account.username.clone(), account.clone());
-        self.persist_user(&account).await;
-
+        // Le compte a pu changer pendant la vérification Argon2 (mot de passe réinitialisé,
+        // compte désactivé ou supprimé par un administrateur). On ne réécrit jamais la copie
+        // lue avant la vérification : seule la date de connexion est posée sur l'entrée
+        // courante, et la session est créée sous le verrou de cette entrée. Une modification
+        // ultérieure du compte fermera donc bien cette session.
         let token = security::generate_token();
-        self.sessions.insert(
-            token.clone(),
-            Session {
-                username: account.username.clone(),
-                created_at: now,
-                last_seen: now,
-            },
-        );
+        let account = {
+            let Some(mut current) = self.users.get_mut(&key) else {
+                return Err(ScadaError::Unauthorized(
+                    "Identifiant ou mot de passe incorrect".to_string(),
+                ));
+            };
+            if current.password_hash != account.password_hash {
+                return Err(ScadaError::Unauthorized(
+                    "Identifiant ou mot de passe incorrect".to_string(),
+                ));
+            }
+            if !current.enabled {
+                return Err(ScadaError::Forbidden(
+                    "Ce compte utilisateur est désactivé par l'administrateur".to_string(),
+                ));
+            }
+            current.last_login_at = Some(now);
+            self.sessions.insert(
+                token.clone(),
+                Session {
+                    username: current.username.clone(),
+                    created_at: now,
+                    last_seen: now,
+                },
+            );
+            current.clone()
+        };
+        self.login_failures.remove(&key);
+        self.persist_user(&account).await;
 
         self.record_audit(
             &account.username,
@@ -3604,16 +3677,37 @@ impl ScadaCore {
     /// avec au plus `PASSWORD_CHECKS_MAX_CONCURRENT` vérifications Argon2 simultanées pour tout
     /// le moteur. Le jeton du sémaphore suit le calcul : il n'est libéré qu'à la fin de celui-ci,
     /// même si la requête HTTP est abandonnée entre-temps.
-    async fn verify_password_bounded(&self, plain: String, stored_hash: Option<String>) -> bool {
-        let Ok(permit) = Arc::clone(&self.password_checks).acquire_owned().await else {
-            return false;
+    async fn verify_password_bounded(
+        &self,
+        plain: String,
+        stored_hash: Option<String>,
+    ) -> Result<bool, ScadaError> {
+        // Attente bornée : sous une rafale de tentatives, une requête qui n'obtient pas de place
+        // à temps échoue au lieu d'allonger sans fin la file (la connexion d'un administrateur
+        // n'attend jamais derrière des milliers de requêtes).
+        let Ok(Ok(permit)) = tokio::time::timeout(
+            PASSWORD_CHECK_QUEUE_TIMEOUT,
+            Arc::clone(&self.password_checks).acquire_owned(),
+        )
+        .await
+        else {
+            return Err(ScadaError::Busy(
+                "trop de connexions simultanées, réessayez dans quelques secondes".to_string(),
+            ));
         };
-        tokio::task::spawn_blocking(move || {
+        Ok(tokio::task::spawn_blocking(move || {
             let _permit = permit;
             security::verify_password_constant_cost(&plain, stored_hash.as_deref())
         })
         .await
-        .unwrap_or(false)
+        .unwrap_or(false))
+    }
+
+    /// Rend une tentative réservée qui n'a pas pu être vérifiée (serveur occupé).
+    fn release_login_attempt(&self, key: &str) {
+        if let Some(mut entry) = self.login_failures.get_mut(key) {
+            entry.count = entry.count.saturating_sub(1);
+        }
     }
 
     pub fn logout(&self, token: &str) {
@@ -3893,29 +3987,49 @@ impl ScadaCore {
         new_password: &str,
     ) -> Result<(), ScadaError> {
         security::validate_new_password(new_password)?;
-        let ok = self
+        // Même verrouillage que la connexion (compteur distinct) : une session volée ne permet
+        // pas de chercher le mot de passe actuel sans limite.
+        let attempt_key = format!("{}#mot-de-passe", user.username);
+        self.reserve_login_attempt(&attempt_key, Utc::now())?;
+        let ok = match self
             .verify_password_bounded(
                 current_password.to_string(),
                 Some(user.password_hash.clone()),
             )
-            .await;
+            .await
+        {
+            Ok(ok) => ok,
+            Err(busy) => {
+                self.release_login_attempt(&attempt_key);
+                return Err(busy);
+            }
+        };
         if !ok {
             return Err(ScadaError::Unauthorized(
                 "Mot de passe actuel incorrect".to_string(),
             ));
         }
+        self.login_failures.remove(&attempt_key);
         let new_p = new_password.to_string();
         let hash = tokio::task::spawn_blocking(move || security::hash_password(&new_p))
             .await
             .map_err(|e| ScadaError::BadRequest(e.to_string()))??;
 
-        let mut account = self
-            .users
-            .get(&user.username)
-            .map(|u| u.clone())
-            .ok_or_else(|| ScadaError::Unauthorized("Compte introuvable".to_string()))?;
-        account.password_hash = hash;
-        self.users.insert(account.username.clone(), account.clone());
+        // Modification sur l'entrée courante, sous son verrou : un mot de passe réinitialisé
+        // ou un compte désactivé entre-temps par un administrateur n'est pas écrasé.
+        let account = {
+            let mut current = self
+                .users
+                .get_mut(&user.username)
+                .ok_or_else(|| ScadaError::Unauthorized("Compte introuvable".to_string()))?;
+            if current.password_hash != user.password_hash || !current.enabled {
+                return Err(ScadaError::Unauthorized(
+                    "Le compte a été modifié entre-temps : reconnectez-vous".to_string(),
+                ));
+            }
+            current.password_hash = hash;
+            current.clone()
+        };
         self.persist_user(&account).await;
 
         let keep = current_token
@@ -5002,6 +5116,56 @@ mod tests {
         core.upsert_user("visu", req, Some(&own)).await.unwrap();
         assert!(core.resolve_user(Some(&own)).is_some());
         assert!(core.resolve_user(Some(&other)).is_none());
+    }
+
+    /// Des connexions avec l'ancien mot de passe, en cours pendant la réinitialisation, ne
+    /// restaurent ni l'ancien mot de passe ni des sessions qui lui survivent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_logins_cannot_undo_a_password_reset() {
+        for _ in 0..3 {
+            let core = core_with_user("victime", "ancien123");
+            let attackers: Vec<_> = (0..4)
+                .map(|_| {
+                    let core = Arc::clone(&core);
+                    tokio::spawn(async move {
+                        let mut tokens = Vec::new();
+                        for _ in 0..3 {
+                            if let Ok(r) = core.login(login_req("victime", "ancien123")).await {
+                                tokens.push(r.token);
+                            }
+                        }
+                        tokens
+                    })
+                })
+                .collect();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let req = UpsertUserRequest {
+                username: "victime".into(),
+                display_name: "Victime".into(),
+                role: UserRole::Admin,
+                password: Some("Nouveau-2026".into()),
+                department: String::new(),
+                enabled: true,
+            };
+            core.upsert_user("admin", req, None).await.unwrap();
+            let mut tokens = Vec::new();
+            for a in attackers {
+                tokens.extend(a.await.unwrap());
+            }
+            let hash = core.users.get("victime").unwrap().password_hash.clone();
+            assert!(security::verify_password("Nouveau-2026", &hash));
+            assert!(!security::verify_password("ancien123", &hash));
+            // Seules les sessions ouvertes APRÈS la réinitialisation pourraient survivre, et
+            // l'ancien mot de passe ne permet plus d'en ouvrir
+            let survivors = tokens
+                .iter()
+                .filter(|t| core.resolve_user(Some(t)).is_some())
+                .count();
+            assert_eq!(
+                survivors, 0,
+                "sessions de l'ancien mot de passe encore valides"
+            );
+        }
     }
 
     #[test]

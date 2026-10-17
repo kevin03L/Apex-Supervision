@@ -117,7 +117,9 @@ pub fn router(state: AppState, web_dir: &FsPath) -> Router {
         .route("/api/symbols", get(api_get_symbols))
         .route(
             "/api/symbols/import",
-            post(api_import_symbols).layer(DefaultBodyLimit::max(SYMBOL_IMPORT_MAX_BYTES)),
+            post(api_import_symbols)
+                .layer(DefaultBodyLimit::max(SYMBOL_IMPORT_MAX_BYTES))
+                .layer(middleware::from_fn(supervisor_before_body)),
         )
         .route(
             "/api/symbols/install-pack/:pack_id",
@@ -137,7 +139,9 @@ pub fn router(state: AppState, web_dir: &FsPath) -> Router {
         .route("/api/system/export", get(api_system_export))
         .route(
             "/api/system/import",
-            post(api_system_import).layer(DefaultBodyLimit::max(PROJECT_IMPORT_MAX_BYTES)),
+            post(api_system_import)
+                .layer(DefaultBodyLimit::max(PROJECT_IMPORT_MAX_BYTES))
+                .layer(middleware::from_fn(admin_before_body)),
         )
         .route("/api/audit", get(api_get_audit_logs))
         // --- TAG DATABASE ---
@@ -325,6 +329,27 @@ async fn security_headers_middleware(req: Request, next: Next) -> Response {
     res
 }
 
+/// Routes à gros corps (import de projet, de symboles) : le rôle est contrôlé AVANT la lecture
+/// du corps, sinon un compte Visualisation ferait lire et analyser jusqu'à la limite élargie
+/// par requête avant de recevoir son 403.
+async fn admin_before_body(req: Request, next: Next) -> Result<Response, ApiError> {
+    let user = req
+        .extensions()
+        .get::<CurrentUser>()
+        .ok_or_else(|| ScadaError::Unauthorized("Session requise".into()))?;
+    require_admin(user)?;
+    Ok(next.run(req).await)
+}
+
+async fn supervisor_before_body(req: Request, next: Next) -> Result<Response, ApiError> {
+    let user = req
+        .extensions()
+        .get::<CurrentUser>()
+        .ok_or_else(|| ScadaError::Unauthorized("Session requise".into()))?;
+    require_supervisor(user)?;
+    Ok(next.run(req).await)
+}
+
 fn require_admin(user: &CurrentUser) -> Result<(), ScadaError> {
     ScadaCore::require_admin(&user.0)
 }
@@ -357,7 +382,15 @@ async fn api_health(
         "acquisition_paused": st.acquisition_paused,
         "running_drivers": st.running_drivers,
     });
-    if is_direct_local_peer(&peer, &headers) {
+    // Détail d'exécution (chemins, PID, mode) : seulement pour le porteur du jeton de contrôle
+    // local, en connexion directe. L'adresse seule ne suffit pas : un proxy inverse local qui
+    // n'ajoute pas d'en-tête de transfert, ou une page web (DNS rebinding), arrivent aussi de
+    // la boucle locale, mais ne peuvent pas lire le fichier du jeton.
+    if is_direct_local_peer(&peer, &headers)
+        && state
+            .core
+            .is_local_control_token(extract_token(&headers).as_deref())
+    {
         body["runtime"] = serde_json::to_value(state.runtime.as_ref()).unwrap_or_default();
         body["started_at"] = serde_json::to_value(st.started_at).unwrap_or_default();
         body["total_drivers"] = st.total_drivers.into();

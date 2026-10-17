@@ -340,7 +340,7 @@ impl AdminApp {
                     continue;
                 }
                 tried.push(addr);
-                match probe::health(&cfg) {
+                match probe::health_detailed(&cfg, &layout) {
                     Ok(h) => {
                         health = Ok(h);
                         target = Some((cfg, layout));
@@ -572,10 +572,18 @@ impl AdminApp {
         // installation système, elle exige root puis l'utilisateur apex-scada : elle passe par
         // la procédure documentée et non par l'utilitaire.
         let legacy_possible = cfg!(windows) || self.base_layout.kind == LayoutKind::Portable;
-        let legacy = diag::find_legacy_db(&self.layout)
-            .filter(|_| legacy_possible && !self.layout.database_file(&self.disk.config).exists());
+        // Proposée même si la base actuelle existe : le moteur la crée dès son premier démarrage.
+        // Elle est alors décochée par défaut, et la reprise la sauvegarde avant de la remplacer.
+        let legacy = diag::find_legacy_db(&self.layout).filter(|_| legacy_possible);
+        let current_db = Some(self.layout.database_file(&self.disk.config)).filter(|f| f.exists());
         // L'assistant part des valeurs en cours d'édition : rien n'est perdu
-        let mut w = Wizard::new(self.edit.clone(), &self.base_layout, has_service, legacy);
+        let mut w = Wizard::new(
+            self.edit.clone(),
+            &self.base_layout,
+            has_service,
+            legacy,
+            current_db,
+        );
         if let (true, Some(auto)) = (has_service, service.automatic) {
             w.set_autostart(auto);
         }
@@ -1184,7 +1192,11 @@ impl AdminApp {
                         }
                     } else {
                         ui.label("Détails");
-                        form::hint(ui, "publiés uniquement aux connexions locales (le moteur écoute sur une adresse réseau)");
+                        form::hint(ui, if cfg!(windows) {
+                            "réservés au poste local et aux administrateurs : relancez l'utilitaire en administrateur"
+                        } else {
+                            "réservés au poste local et au groupe apex-scada"
+                        });
                         ui.end_row();
                     }
                 }

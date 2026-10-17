@@ -934,6 +934,7 @@ impl IndustrialDriver for ModbusTcpDriver {
                                 Ok(Ok(())) => {
                                     let lat = start_w.elapsed().as_millis() as u64;
                                     core_ref.record_driver_poll(&config.id, true, lat, None);
+                                    core_ref.record_driver_write_accepted(&config.id);
                                 }
                                 // Commande refusée (exception Modbus, adresse ou valeur invalide) :
                                 // la liaison reste saine, ni coupure ni alarme de communication.
@@ -1507,7 +1508,8 @@ impl IndustrialDriver for MqttDriver {
             .ok_or_else(|| "Driver MQTT déjà démarré".to_string())?;
 
         let (host, port) = self.parse_broker_endpoint();
-        let client_id = format!("rust-scada-flow-{}", self.config.id);
+        // Identifiant client vu par le broker (ACL éventuelles) : « apex-scada-<id du driver> »
+        let client_id = format!("apex-scada-{}", self.config.id);
 
         let mut mqttoptions = MqttOptions::new(client_id, host.clone(), port);
         mqttoptions.set_keep_alive(Duration::from_secs(15));

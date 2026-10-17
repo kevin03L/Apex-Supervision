@@ -47,8 +47,9 @@ pub struct FlowEngineRuntime {
     /// nœud jusqu'au retour à la normale, au lieu d'une erreur à chaque cycle.
     pub failing_scripts: DashMap<String, ()>,
     /// Dernière valeur écrite par chaque nœud TagOutput (clé `flux/nœud`) : la sortie n'est
-    /// réécrite que si elle change au-delà de la bande morte du tag cible.
-    pub last_outputs: DashMap<String, TagValue>,
+    /// réécrite que si elle change au-delà de la bande morte du tag cible. La valeur est
+    /// accompagnée du tag visé, pour l'oublier quand l'écriture n'a pas abouti.
+    pub last_outputs: DashMap<String, (String, TagValue)>,
     /// Scripts Rhai déjà compilés, indexés par leur texte source.
     ast_cache: DashMap<String, Arc<AST>>,
     /// Moteur Rhai partagé (initialisé au démarrage du worker).
@@ -82,6 +83,12 @@ impl FlowEngineRuntime {
         let prefix = format!("{}/", flow_id);
         self.failing_scripts.retain(|k, _| !k.starts_with(&prefix));
         self.last_outputs.retain(|k, _| !k.starts_with(&prefix));
+    }
+
+    /// Oublie la dernière sortie des nœuds qui écrivent sur ce tag : l'écriture a été refusée
+    /// ou perdue (coupure de liaison), elle sera refaite à la prochaine évaluation du flux.
+    pub fn forget_outputs_for_tag(&self, tag_id: &str) {
+        self.last_outputs.retain(|_, (target, _)| target != tag_id);
     }
 
     pub fn spawn_worker(core: Arc<ScadaCore>) {
@@ -507,13 +514,19 @@ async fn run_flow_from_entry_node(
                         .unwrap_or_else(|| next_value.clone());
                     let should_write = output_needs_write(
                         &candidate,
-                        core.flow_runtime.last_outputs.get(&key).as_deref(),
+                        core.flow_runtime
+                            .last_outputs
+                            .get(&key)
+                            .as_deref()
+                            .map(|(_, v)| v),
                         band,
                     );
                     if should_write {
                         match core.write_tag(target_tag_id, next_value.clone()).await {
                             Ok(written) => {
-                                core.flow_runtime.last_outputs.insert(key, written.value);
+                                core.flow_runtime
+                                    .last_outputs
+                                    .insert(key, (target_tag_id.clone(), written.value));
                                 core.flow_runtime.failing_outputs.remove(target_tag_id);
                             }
                             // Un seul avertissement par sortie en échec, jusqu'au retour à la normale
@@ -904,6 +917,24 @@ mod tests {
         )
         .await;
         assert_eq!(out(&core), TagValue::Float(30.0));
+        run_flow_from_entry_node(
+            &core,
+            &flow,
+            &flow.nodes[0],
+            &input("INT.In", 20.6),
+            &engine,
+        )
+        .await;
+        assert_eq!(out(&core), TagValue::Float(20.6));
+        // Écriture refusée ou perdue sur le tag cible (exception, coupure) : la mémoire du nœud
+        // est oubliée et la même consigne est réécrite à l'évaluation suivante
+        core.write_tag("INT.Out", TagValue::Float(30.0))
+            .await
+            .unwrap();
+        core.flow_runtime.forget_outputs_for_tag("INT.Autre");
+        assert_eq!(core.flow_runtime.last_outputs.len(), 1);
+        core.flow_runtime.forget_outputs_for_tag("INT.Out");
+        assert!(core.flow_runtime.last_outputs.is_empty());
         run_flow_from_entry_node(
             &core,
             &flow,

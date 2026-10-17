@@ -61,9 +61,21 @@ pub fn web_url(cfg: &AppConfig) -> String {
 }
 
 /// Interroge `/api/health`. `Err` signifie « serveur web injoignable » (avec la cause).
+/// Sans le jeton de contrôle local, le moteur ne publie pas le détail d'exécution.
 pub fn health(cfg: &AppConfig) -> Result<Health, String> {
+    health_with_token(cfg, None)
+}
+
+/// Comme [`health`], avec le jeton de contrôle local s'il est lisible (administrateur sous
+/// Windows, groupe `apex-scada` sous Linux) : le détail d'exécution est alors publié.
+pub fn health_detailed(cfg: &AppConfig, layout: &Layout) -> Result<Health, String> {
+    let token = std::fs::read_to_string(layout.control_token_file()).ok();
+    health_with_token(cfg, token.as_deref().map(str::trim))
+}
+
+fn health_with_token(cfg: &AppConfig, token: Option<&str>) -> Result<Health, String> {
     let addr = target(cfg)?;
-    let (status, body) = request(addr, "GET", "/api/health", None, Duration::from_secs(2))?;
+    let (status, body) = request(addr, "GET", "/api/health", token, Duration::from_secs(2))?;
     if status != 200 {
         return Err(format!("réponse HTTP {status} inattendue de {addr}"));
     }

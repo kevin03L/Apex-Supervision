@@ -39,7 +39,18 @@ fn health_est_public_et_detaille_en_boucle_locale() {
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert!(body["uptime_seconds"].is_u64());
 
-    // Détails d'exécution réservés à la boucle locale (utilitaire desktop)
+    // Sans le jeton de contrôle local, aucun détail d'exécution, même en boucle locale (proxy
+    // inverse local sans en-tête de transfert, page web par DNS rebinding)
+    assert!(
+        body.get("runtime").is_none() && body.get("started_at").is_none(),
+        "détails d'exécution publiés sans jeton : {body}"
+    );
+    let r = srv.call("GET", "/api/health", Some("jeton-invente"), None);
+    assert!(r.json().get("runtime").is_none(), "jeton inconnu accepté");
+
+    // Détails d'exécution réservés au porteur du jeton local, en boucle locale (utilitaire)
+    let local = srv.control_token();
+    let body = srv.call("GET", "/api/health", Some(&local), None).json();
     let rt = &body["runtime"];
     assert!(rt.is_object(), "runtime absent : {body}");
     assert_eq!(rt["pid"], srv.pid());
@@ -67,7 +78,7 @@ fn health_est_public_et_detaille_en_boucle_locale() {
         ("Forwarded", "for=203.0.113.7;proto=https"),
         ("X-Real-IP", "203.0.113.7"),
     ] {
-        let r = srv.call_with_headers("GET", "/api/health", None, &[header]);
+        let r = srv.call_with_headers("GET", "/api/health", Some(&local), &[header]);
         assert_eq!(r.status, 200, "{}", r.text());
         let body = r.json();
         assert_eq!(body["status"], "ok");

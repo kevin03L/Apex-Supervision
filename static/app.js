@@ -80,11 +80,13 @@ const SVG_ELEMENTS = new Set([
   'pattern', 'clipPath', 'mask', 'marker', 'image', 'filter', 'feBlend', 'feColorMatrix',
   'feComponentTransfer', 'feFuncR', 'feFuncG', 'feFuncB', 'feFuncA', 'feComposite', 'feDropShadow',
   'feFlood', 'feGaussianBlur', 'feMerge', 'feMergeNode', 'feMorphology', 'feOffset', 'feTurbulence',
+  'feDiffuseLighting', 'feSpecularLighting', 'feDistantLight', 'fePointLight', 'feSpotLight',
+  'feDisplacementMap', 'feTile', 'feConvolveMatrix', 'switch', 'a',
   'animate', 'animateMotion', 'animateTransform', 'set'
 ]);
 const SVG_ANIMATIONS = new Set(['animate', 'animateMotion', 'animateTransform', 'set']);
 const SVG_HREF_ELEMENTS = new Set([
-  'use', 'linearGradient', 'radialGradient', 'pattern', 'textPath', 'image', 'filter',
+  'a', 'use', 'linearGradient', 'radialGradient', 'pattern', 'textPath', 'image', 'filter',
   'animate', 'animateMotion', 'animateTransform', 'set'
 ]);
 const SVG_ATTRIBUTES = new Set([
@@ -107,6 +109,10 @@ const SVG_ATTRIBUTES = new Set([
   'filterUnits', 'primitiveUnits', 'in', 'in2', 'result', 'mode', 'operator', 'k1', 'k2', 'k3', 'k4',
   'values', 'type', 'stdDeviation', 'edgeMode', 'radius', 'tableValues', 'slope', 'intercept',
   'amplitude', 'exponent', 'baseFrequency', 'numOctaves', 'seed', 'stitchTiles',
+  'surfaceScale', 'specularConstant', 'specularExponent', 'diffuseConstant', 'kernelUnitLength',
+  'lighting-color', 'azimuth', 'elevation', 'z', 'pointsAtX', 'pointsAtY', 'pointsAtZ',
+  'limitingConeAngle', 'scale', 'xChannelSelector', 'yChannelSelector', 'order', 'kernelMatrix',
+  'divisor', 'bias', 'targetX', 'targetY', 'preserveAlpha',
   'attributeName', 'attributeType', 'from', 'to', 'by', 'begin', 'dur', 'end', 'min', 'max',
   'restart', 'repeatCount', 'repeatDur', 'calcMode', 'keyTimes', 'keySplines', 'keyPoints',
   'additive', 'accumulate', 'path'
@@ -129,7 +135,7 @@ function svgAttrValueOk(element, attr, value) {
     if (!rest.replace(/^["']+/, '').startsWith('#')) return false;
   }
   const rasterImage = attr === 'href' && element === 'image';
-  if (compact.includes('data:') && !rasterImage) return false;
+  if (compact.includes('data:') && !rasterImage && attr !== 'id') return false;
   const v = value.trim();
   switch (attr) {
     case 'href': return (v.startsWith('#') && SVG_SAFE_ID.test(v.slice(1))) || (rasterImage && SVG_RASTER_DATA.test(v));
@@ -2302,6 +2308,9 @@ function renderDriversCardsOnly() {
             Protocole : <b>${esc(d.protocol)}</b> | Endpoint : <code>${esc(d.endpoint)}</code> | Slave : ${Number(d.unit_id)} |
             Trames OK : <b style="color:#34d399;">${Number(st.frames_ok) || 0}</b> | Erreurs : <b style="color:#f87171;">${Number(st.frames_err) || 0}</b>
             ${st.last_error ? `| <span style="color:#f87171;">${esc(st.last_error)}</span>` : ''}
+            ${st.last_write_rejected && st.last_write_rejected !== st.last_error
+              ? `| <span style="color:#fbbf24;" title="Dernier refus de l'équipement (affiché jusqu'à la prochaine écriture acceptée)">⚠️ ${esc(st.last_write_rejected)}${st.last_write_rejected_at ? ` (${esc(new Date(st.last_write_rejected_at).toLocaleString('fr-FR'))})` : ''}</span>`
+              : ''}
           </div>
         </div>
         <div style="display:flex;gap:6px;align-items:center;">

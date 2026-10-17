@@ -378,14 +378,21 @@ fn display_host(ip: std::net::IpAddr) -> String {
 /// Ferme la base à l'arrêt propre : le journal WAL est reporté dans le fichier principal, qui
 /// se suffit alors à lui-même (copie, sauvegarde ou reprise sans les fichiers `-wal`/`-shm`).
 async fn close_database(pool: &sqlx::SqlitePool) {
-    if let Err(e) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-        .execute(pool)
+    // Le PRAGMA renvoie (busy, pages du journal, pages reportées) : busy = 1 signale un report
+    // incomplet (une connexion lisait encore), le journal sera alors rejoué à l'ouverture.
+    match sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(TRUNCATE)")
+        .fetch_one(pool)
         .await
     {
-        warn!("Report du journal WAL dans la base impossible : {e}");
+        Ok((0, _, _)) => {}
+        Ok((_, log, done)) => warn!(
+            "Report du journal WAL incomplet à l'arrêt ({done}/{log} pages) : il sera repris au prochain démarrage"
+        ),
+        Err(e) => warn!("Report du journal WAL dans la base impossible : {e}"),
     }
-    // Attend la restitution des connexions ; SQLite reporte le journal et le supprime à la
-    // fermeture de la dernière.
+    // Attend la restitution des connexions. Le journal est vide après le report ; selon la
+    // plateforme, des fichiers -wal (0 octet) et -shm peuvent rester : la base se suffit à
+    // elle-même.
     pool.close().await;
 }
 

@@ -6,7 +6,7 @@
 //! - Assainissement des symboles SVG importés : analyse XML réelle puis reconstruction à partir
 //!   d'une liste blanche d'éléments et d'attributs de dessin.
 
-use std::sync::OnceLock;
+use std::{collections::HashMap, sync::OnceLock};
 
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -211,6 +211,17 @@ const SVG_ELEMENTS: &[&str] = &[
     "feMorphology",
     "feOffset",
     "feTurbulence",
+    "feDiffuseLighting",
+    "feSpecularLighting",
+    "feDistantLight",
+    "fePointLight",
+    "feSpotLight",
+    "feDisplacementMap",
+    "feTile",
+    "feConvolveMatrix",
+    // Structure des exports d'éditeurs (draw.io, Inkscape) ; <a> n'accepte qu'un lien interne
+    "switch",
+    "a",
     "animate",
     "animateMotion",
     "animateTransform",
@@ -222,6 +233,7 @@ const SVG_ANIMATIONS: &[&str] = &["animate", "animateMotion", "animateTransform"
 
 /// Éléments sur lesquels un `href` (forcément interne, `#id`) a un sens.
 const SVG_HREF_ELEMENTS: &[&str] = &[
+    "a",
     "use",
     "linearGradient",
     "radialGradient",
@@ -369,6 +381,29 @@ const SVG_ATTRIBUTES: &[&str] = &[
     "numOctaves",
     "seed",
     "stitchTiles",
+    "surfaceScale",
+    "specularConstant",
+    "specularExponent",
+    "diffuseConstant",
+    "kernelUnitLength",
+    "lighting-color",
+    "azimuth",
+    "elevation",
+    "z",
+    "pointsAtX",
+    "pointsAtY",
+    "pointsAtZ",
+    "limitingConeAngle",
+    "scale",
+    "xChannelSelector",
+    "yChannelSelector",
+    "order",
+    "kernelMatrix",
+    "divisor",
+    "bias",
+    "targetX",
+    "targetY",
+    "preserveAlpha",
     // Animations SMIL
     "attributeName",
     "attributeType",
@@ -430,6 +465,9 @@ fn svg_refused(detail: impl std::fmt::Display) -> ScadaError {
 /// Renvoie le SVG reconstruit (racine `<svg xmlns="http://www.w3.org/2000/svg">`), ou une
 /// erreur si le document n'est pas du XML bien formé ou si sa racine n'est pas `<svg>`.
 pub fn sanitize_svg(input: &str) -> Result<String, ScadaError> {
+    // Les feuilles <style> sont supprimées, mais leurs règles de classe simples (.st0 {…},
+    // exports Illustrator) sont reportées dans l'attribut style des éléments concernés.
+    let class_styles = collect_class_styles(input);
     let mut reader = Reader::from_str(input);
     let mut out = String::with_capacity(input.len());
     // Éléments ouverts et conservés (pour fermer avec le même nom)
@@ -457,7 +495,7 @@ pub fn sanitize_svg(input: &str) -> Result<String, ScadaError> {
                     continue;
                 }
                 let is_root = !root_seen;
-                let Some((name, attributes)) = rebuild_element(e, is_root)? else {
+                let Some((name, attributes)) = rebuild_element(e, is_root, &class_styles)? else {
                     if is_root {
                         return Err(svg_refused("l'élément racine doit être <svg>"));
                     }
@@ -560,6 +598,7 @@ pub fn sanitize_svg(input: &str) -> Result<String, ScadaError> {
 fn rebuild_element(
     e: &BytesStart<'_>,
     is_root: bool,
+    class_styles: &HashMap<String, String>,
 ) -> Result<Option<(&'static str, SvgAttributes)>, ScadaError> {
     let qname = e.name();
     let raw_name = std::str::from_utf8(qname.as_ref()).unwrap_or("");
@@ -599,7 +638,118 @@ fn rebuild_element(
             None => {}
         }
     }
+    if !is_root && !class_styles.is_empty() {
+        apply_class_styles(name, &mut attributes, class_styles);
+    }
     Ok(Some((name, attributes)))
+}
+
+/// Règles `.classe { déclarations }` des éléments `<style>` du document. Les autres
+/// sélecteurs et les règles `@…` sont ignorés. Un document illisible donne une table vide
+/// (l'analyse principale signale alors l'erreur).
+fn collect_class_styles(input: &str) -> HashMap<String, String> {
+    let mut css = String::new();
+    let mut reader = Reader::from_str(input);
+    let mut in_style = 0usize;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) if e.name().as_ref() == b"style" => in_style += 1,
+            Ok(Event::End(e)) if e.name().as_ref() == b"style" => {
+                in_style = in_style.saturating_sub(1)
+            }
+            Ok(Event::Text(t)) if in_style > 0 => {
+                if let Ok(content) = t.xml10_content() {
+                    css.push_str(&content);
+                }
+            }
+            Ok(Event::CData(t)) if in_style > 0 => {
+                css.push_str(&String::from_utf8_lossy(&t));
+            }
+            Ok(Event::GeneralRef(r)) if in_style > 0 => {
+                if let Ok(Some(c)) = r.resolve_char_ref() {
+                    css.push(c);
+                } else if let Some(s) = r.decode().ok().and_then(|n| resolve_predefined_entity(&n))
+                {
+                    css.push_str(s);
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    parse_class_rules(&css)
+}
+
+fn parse_class_rules(css: &str) -> HashMap<String, String> {
+    // Commentaires CSS retirés
+    let mut text = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        text.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        rest = after.find("*/").map_or("", |end| &after[end + 2..]);
+    }
+    text.push_str(rest);
+
+    let mut rules: HashMap<String, String> = HashMap::new();
+    for block in text.split('}') {
+        let Some((selectors, declarations)) = block.split_once('{') else {
+            continue;
+        };
+        let declarations = declarations.trim().trim_end_matches(';').trim();
+        if declarations.is_empty() || selectors.contains('@') || declarations.contains('{') {
+            continue;
+        }
+        for selector in selectors.split(',') {
+            let Some(class) = selector.trim().strip_prefix('.') else {
+                continue;
+            };
+            if class.is_empty()
+                || !class
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+            {
+                continue;
+            }
+            let entry = rules.entry(class.to_string()).or_default();
+            if !entry.is_empty() {
+                entry.push(';');
+            }
+            entry.push_str(declarations);
+        }
+    }
+    rules
+}
+
+/// Reporte les règles de classe dans l'attribut `style` (le style propre à l'élément reste
+/// prioritaire : il est placé après). Les déclarations passent par le même contrôle que tout
+/// attribut `style`.
+fn apply_class_styles(
+    element: &str,
+    attributes: &mut SvgAttributes,
+    class_styles: &HashMap<String, String>,
+) {
+    let Some(classes) = attributes
+        .iter()
+        .find(|(k, _)| *k == "class")
+        .map(|(_, v)| v.clone())
+    else {
+        return;
+    };
+    let inherited: Vec<&str> = classes
+        .split_whitespace()
+        .filter_map(|c| class_styles.get(c).map(String::as_str))
+        .collect();
+    if inherited.is_empty() {
+        return;
+    }
+    let Some(inherited) = sanitize_attribute_value(element, "style", &inherited.join(";")) else {
+        return;
+    };
+    match attributes.iter_mut().find(|(k, _)| *k == "style") {
+        Some((_, own)) => *own = format!("{};{}", inherited, own),
+        None => attributes.push(("style", inherited)),
+    }
 }
 
 /// Nom d'attribut reconstruit, ou `None` s'il n'est pas dans la liste blanche.
@@ -630,7 +780,8 @@ fn sanitize_attribute_value(element: &str, attr: &str, value: &str) -> Option<St
         return None;
     }
     let raster_image = attr == "href" && element == "image";
-    if compact.contains("data:") && !raster_image {
+    // id exclu : ses caractères sont déjà restreints (metadata:x est un identifiant valide)
+    if compact.contains("data:") && !raster_image && attr != "id" {
         return None;
     }
     let value = value.trim();
@@ -897,6 +1048,50 @@ mod tests {
         for dirty in payloads {
             assert_refused_or_inert(dirty);
         }
+    }
+
+    /// Exports courants d'éditeurs : le dessin n'est pas perdu.
+    #[test]
+    fn svg_sanitizer_keeps_editor_exports() {
+        // Illustrator : couleurs dans une feuille <style> reportées sur les éléments
+        let illustrator = r##"<svg viewBox="0 0 10 10"><defs><style>/* calque */ .st0{fill:#38BDF8;} .st1, .st2 { stroke:#000 ; } svg rect{fill:red} @media print{.st0{fill:blue}}</style></defs><circle class="st0" r="4"/><rect class="st1" style="opacity:.5" width="2" height="2"/></svg>"##;
+        let clean = sanitize_svg(illustrator).unwrap();
+        assert!(clean.contains(r#"style="fill:#38BDF8""#), "{clean}");
+        assert!(
+            clean.contains(r#"style="stroke:#000;opacity:.5""#),
+            "{clean}"
+        );
+        assert!(!clean.contains("<style") && !clean.contains("red") && !clean.contains("blue"));
+        // Une règle dangereuse n'est pas reportée
+        let evil = r##"<svg><style>.x{fill:url(http://e/a)} .y{behavior:url(#a)}</style><rect class="x y"/></svg>"##;
+        assert!(!sanitize_svg(evil).unwrap().contains("style="));
+        // draw.io : <switch> et liens internes conservés avec leur contenu
+        let drawio = r##"<svg><switch><g><text>P</text></g></switch><a href="#x"><rect id="x" width="1"/></a><a href="http://e"><circle r="1"/></a></svg>"##;
+        let clean = sanitize_svg(drawio).unwrap();
+        assert!(
+            clean.contains("<switch><g><text>P</text></g></switch>"),
+            "{clean}"
+        );
+        assert!(
+            clean.contains(r##"<a href="#x"><rect id="x" width="1"/></a>"##),
+            "{clean}"
+        );
+        assert!(
+            clean.contains("<a><circle"),
+            "lien externe retiré : {clean}"
+        );
+        // Filtres d'éclairage et de déplacement
+        let filter = r##"<svg><filter id="b"><feSpecularLighting surfaceScale="5" specularExponent="20" lighting-color="#fff"><fePointLight x="1" y="2" z="3"/></feSpecularLighting><feDisplacementMap scale="4" xChannelSelector="R"/></filter></svg>"##;
+        let clean = sanitize_svg(filter).unwrap();
+        assert!(
+            clean.contains(r#"<fePointLight x="1" y="2" z="3"/>"#),
+            "{clean}"
+        );
+        assert!(clean.contains(r#"specularExponent="20""#) && clean.contains(r#"scale="4""#));
+        // Identifiant contenant « data: »
+        let clean = sanitize_svg(r#"<svg><g id="metadata:x"/></svg>"#).unwrap();
+        assert!(clean.contains(r#"id="metadata:x""#), "{clean}");
+        assert_inert(&clean);
     }
 
     #[test]
