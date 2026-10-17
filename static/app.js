@@ -3073,5 +3073,6 @@ async function reloadProjectResources() {
   if (!dashboards.some(d => d.id === state.currentDashboardId)) {
     state.currentDashboardId = dashboards[0]?.id || null;
   }
+  populateDashboardSelect();
   renderDashboard();
 }

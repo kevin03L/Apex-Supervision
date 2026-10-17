@@ -955,3 +955,41 @@ fn arret_propre_par_jeton_de_controle_local() {
         .unwrap_or_else(|| panic!("arrêt absent du journal d'audit : {audit}"));
     assert_eq!(shutdown["actor"], "Utilitaire local", "{shutdown}");
 }
+
+#[test]
+fn initialisation_comptes_usine_selon_mode_simulation() {
+    // Démarrage sans simulation (mode production) : seul le compte admin est initialisé
+    let mut settings_prod = Settings::new();
+    settings_prod.simulation = false;
+    let srv_prod = Server::start_with("comptes_prod", settings_prod);
+
+    // Connexion admin réussie
+    let r_admin = srv_prod.call(
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(&json!({"username": "admin", "password": "admin123"})),
+    );
+    assert_eq!(r_admin.status, 200, "admin doit pouvoir se connecter");
+
+    // Connexion visu refusée (compte non créé)
+    let r_visu = srv_prod.call(
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(&json!({"username": "visu", "password": "visu123"})),
+    );
+    assert_eq!(r_visu.status, 401, "visu ne doit pas exister en production");
+
+    // Connexion superviseur refusée (compte non créé)
+    let r_sup = srv_prod.call(
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(&json!({"username": "superviseur", "password": "super123"})),
+    );
+    assert_eq!(
+        r_sup.status, 401,
+        "superviseur ne doit pas exister en production"
+    );
+}

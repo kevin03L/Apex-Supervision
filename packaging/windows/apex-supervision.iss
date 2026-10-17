@@ -182,7 +182,9 @@ begin
 end;
 
 { Mise à jour : le service est arrêté proprement avant le remplacement des binaires.
-  « net stop » attend la fin de l'arrêt et renvoie 0 seulement si le service tournait. }
+  « net stop » attend la fin de l'arrêt et renvoie 0 seulement si le service tournait.
+  Les éventuelles instances de l'utilitaire desktop sont également fermées pour que son
+  exécutable puisse être remplacé sans blocage ni annulation silencieuse. }
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Code: Integer;
@@ -198,6 +200,27 @@ begin
       WasRunning := (Code = 0);
     Log(Format('net stop : code %d', [Code]));
   end;
+
+  { tasklist | find renvoie 0 seulement si l'utilitaire est en cours d'exécution. }
+  if not Exec(ExpandConstant('{cmd}'),
+              '/C tasklist /NH /FI "IMAGENAME eq {#AdminExe}" | find /I "{#AdminExe}"',
+              '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
+    Exit;
+
+  if not WizardSilent then
+  begin
+    if MsgBox('L''utilitaire d''administration ({#AdminExe}) doit être fermé pour continuer la mise à jour.' + #13#10#13#10 +
+              'Cliquez sur OK pour le fermer automatiquement, ou sur Annuler pour interrompre l''installation.',
+              mbConfirmation, MB_OKCANCEL or MB_DEFBUTTON1) <> IDOK then
+    begin
+      Result := 'Installation annulée par l''utilisateur : {#AdminExe} est resté ouvert.';
+      Exit;
+    end;
+  end;
+
+  Log('Fermeture des instances de {#AdminExe}');
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM {#AdminExe} /F', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  Log(Format('taskkill /IM {#AdminExe} /F : code %d', [Code]));
 end;
 
 { Désinstallation : les données ne sont supprimées que sur demande explicite (jamais en

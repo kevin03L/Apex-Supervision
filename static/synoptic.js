@@ -140,15 +140,23 @@ function parseInputForTag(dataType, rawStr) {
 
 function populateDashboardSelect() {
   const sel = document.getElementById('dashboardSelect');
+  if (!sel) return;
   sel.innerHTML = state.dashboards.map(d =>
     `<option value="${esc(d.id)}" ${d.id === state.currentDashboardId ? 'selected' : ''}>${esc(d.name)}</option>`
   ).join('');
+  if (state.currentDashboardId) {
+    sel.value = state.currentDashboardId;
+  }
 }
 
 function selectDashboard(id) {
   cancelCommand(false);
   state.currentDashboardId = id;
   state.selectedWidgetId = null;
+  const sel = document.getElementById('dashboardSelect');
+  if (sel && sel.value !== id) {
+    sel.value = id;
+  }
   renderDashboard();
 }
 
@@ -226,6 +234,13 @@ async function saveCurrentDashboard() {
     body: JSON.stringify(dash)
   });
   if (res.ok) {
+    const saved = await res.json().catch(() => null);
+    if (saved && saved.id) {
+      const idx = state.dashboards.findIndex(d => d.id === saved.id);
+      if (idx >= 0) state.dashboards[idx] = saved;
+    }
+    populateDashboardSelect();
+    renderDashboard();
     notify(`Synoptique « ${dash.name} » enregistré`);
   } else {
     notify(`Enregistrement refusé : ${await apiError(res)}`, 'error');
@@ -343,6 +358,10 @@ function synSnap(v) {
 function renderDashboard() {
   const container = document.getElementById('widgetsContainer');
   if (!container) return;
+  const sel = document.getElementById('dashboardSelect');
+  if (sel && state.currentDashboardId && sel.value !== state.currentDashboardId) {
+    sel.value = state.currentDashboardId;
+  }
   const dash = getActiveDashboard();
   const frag = document.createDocumentFragment();
   if (dash) dash.widgets.forEach(w => frag.appendChild(buildWidgetCard(w)));

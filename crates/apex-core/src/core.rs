@@ -3075,7 +3075,15 @@ impl ScadaCore {
                 .execute(&pool)
                 .await
                 .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
-            info!("Première initialisation : configuration de démonstration enregistrée en base");
+            if self.simulation_enabled {
+                info!(
+                    "Première initialisation : configuration de démonstration enregistrée en base"
+                );
+            } else {
+                info!(
+                    "Première initialisation : base de production créée (compte admin uniquement)"
+                );
+            }
         }
 
         // La base fait foi : la démonstration en mémoire est remplacée par le contenu persisté
@@ -3258,7 +3266,8 @@ impl ScadaCore {
                 .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
         }
         // Données de démonstration (synoptiques, flux, plannings liés au simulateur) :
-        // uniquement si la simulation est active. Comptes et symboles sont toujours créés.
+        // uniquement si la simulation est active. Sans simulation (production), seul le compte
+        // administrateur d'usine est initialisé. Symboles toujours créés.
         let demo_dashboards = if self.simulation_enabled {
             self.get_all_dashboards()
         } else {
@@ -4094,19 +4103,22 @@ impl ScadaCore {
         self.schedules.insert(sched_1.id.clone(), sched_1);
         self.schedules.insert(sched_2.id.clone(), sched_2);
 
-        // COMPTES UTILISATEURS PAR DÉFAUT (3 GROUPES : ADMIN, SUPERVISEUR, VISUALISATION)
-        let default_users = vec![
-            UserAccount {
-                username: "admin".to_string(),
-                display_name: "Administrateur Système SCADA".to_string(),
-                role: UserRole::Admin,
-                password_hash: "admin123".to_string(),
-                department: "Direction Technique / Automatisme".to_string(),
-                enabled: true,
-                created_at: Utc::now(),
-                last_login_at: Some(Utc::now()),
-            },
-            UserAccount {
+        // COMPTES UTILISATEURS PAR DÉFAUT
+        // En production (simulation désactivée), seul le compte administrateur est créé.
+        // En démonstration (simulation active), les trois profils d'usine sont initialisés.
+        let mut default_users = vec![UserAccount {
+            username: "admin".to_string(),
+            display_name: "Administrateur Système SCADA".to_string(),
+            role: UserRole::Admin,
+            password_hash: "admin123".to_string(),
+            department: "Direction Technique / Automatisme".to_string(),
+            enabled: true,
+            created_at: Utc::now(),
+            last_login_at: Some(Utc::now()),
+        }];
+
+        if self.simulation_enabled {
+            default_users.push(UserAccount {
                 username: "superviseur".to_string(),
                 display_name: "Ingénieur Superviseur GTB".to_string(),
                 role: UserRole::Supervisor,
@@ -4115,8 +4127,8 @@ impl ScadaCore {
                 enabled: true,
                 created_at: Utc::now(),
                 last_login_at: None,
-            },
-            UserAccount {
+            });
+            default_users.push(UserAccount {
                 username: "visu".to_string(),
                 display_name: "Poste Opérateur Visualisation".to_string(),
                 role: UserRole::Viewer,
@@ -4125,8 +4137,8 @@ impl ScadaCore {
                 enabled: true,
                 created_at: Utc::now(),
                 last_login_at: None,
-            },
-        ];
+            });
+        }
 
         // Les mots de passe d'usine sont hachés (Argon2id) lors du chargement initial
         // (voir `migrate_legacy_passwords`) : ils ne sont jamais conservés en clair.
@@ -6691,6 +6703,50 @@ mod tests {
         assert!(
             core.flow_runtime.last_outputs.is_empty(),
             "last_outputs non vidé à la suppression du tag"
+        );
+    }
+
+    #[tokio::test]
+    async fn demarrage_sans_simulation_ne_cree_que_admin() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        assert!(
+            core.users.contains_key("admin"),
+            "Le compte admin doit exister"
+        );
+        assert!(
+            !core.users.contains_key("superviseur"),
+            "Le compte superviseur ne doit pas exister en production"
+        );
+        assert!(
+            !core.users.contains_key("visu"),
+            "Le compte visu ne doit pas exister en production"
+        );
+        assert_eq!(
+            core.users.len(),
+            1,
+            "Seul le compte admin doit être créé sans simulation"
+        );
+    }
+
+    #[tokio::test]
+    async fn demarrage_avec_simulation_cree_les_trois_comptes() {
+        let core = ScadaCore::new(None, &engine_options(true));
+        assert!(
+            core.users.contains_key("admin"),
+            "Le compte admin doit exister"
+        );
+        assert!(
+            core.users.contains_key("superviseur"),
+            "Le compte superviseur doit exister en simulation"
+        );
+        assert!(
+            core.users.contains_key("visu"),
+            "Le compte visu doit exister en simulation"
+        );
+        assert_eq!(
+            core.users.len(),
+            3,
+            "Les trois comptes doivent être créés avec simulation"
         );
     }
     include!("core_vague2_tests.rs");

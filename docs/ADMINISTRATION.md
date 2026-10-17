@@ -220,7 +220,7 @@ Protocole normalisé pour la gestion technique du bâtiment (GTB).
 Le réglage `simulation.enabled = true` active l'environnement de simulation :
 - un automate Modbus TCP embarqué (groupe froid), sur `127.0.0.1:<modbus_slave_port>` ;
 - le simulateur physique GTB (`Simulator` : CTA, chaufferie, TGBT) ;
-- les données de démonstration, au **premier** démarrage sur une base vide.
+- les données de démonstration et les trois comptes d'usine (`admin`, `superviseur`, `visu`), au **premier** démarrage sur une base vide. Quand la simulation est désactivée (production), seul le compte `admin` est créé.
 
 Le seul driver de démonstration restant est le **simulateur GTB** (`Simulator`, `ProtocolType::is_simulated()`). Quand la simulation est désactivée, seul le simulateur GTB est refusé à l'ajout et au démarrage (erreur HTTP 400). À l'import d'un projet, il est écarté avec ses variables (`ignored_drivers`, `ignored_tags`). Un simulateur déjà enregistré reste modifiable mais ne démarre pas.
 
@@ -247,7 +247,8 @@ Les cinq protocoles industriels réels (Modbus TCP, MQTT, Siemens S7, OPC-UA, BA
 
 ## 7. Sécurité
 
-- Changez les mots de passe des comptes d'usine (`admin`, `superviseur`, `visu`) dès la première connexion. Le moteur le rappelle dans ses journaux tant que ce n'est pas fait.
+- **Comptes au premier démarrage** : en production (simulation désactivée), seul le compte administrateur `admin` est créé avec son mot de passe initial `admin123` ; les comptes `superviseur` et `visu` ne sont pas créés. En démonstration (simulation active), les trois comptes d'usine (`admin`, `superviseur`, `visu`) sont initialisés. Une base déjà initialisée n'est jamais modifiée au redémarrage.
+- **Obligation de changer le mot de passe administrateur** : changez impérativement le mot de passe d'`admin` dès la première connexion (et ceux des autres comptes d'usine s'ils ont été créés). Le moteur émet un avertissement de sécurité dans ses journaux à chaque démarrage tant qu'un mot de passe d'usine reste en place.
 - **Connexion** : après 5 tentatives sans succès, l'identifiant est verrouillé 60 secondes, y compris face à des tentatives simultanées. Un identifiant inconnu est traité comme un mot de passe faux, avec le même message et le même temps de réponse. Le moteur fait au plus 4 vérifications de mot de passe à la fois. Une requête qui attend plus de 5 secondes une place reçoit 503 (« serveur occupé ») : la tentative n'est pas comptée. Le changement de son propre mot de passe est soumis au même verrouillage, avec un compteur distinct.
 - **Sessions conservées** : les sessions ouvertes survivent à un redémarrage du moteur, y compris après un arrêt brutal. Elles expirent après `security.session_ttl_hours` heures d'inactivité. La base (table `user_sessions`) ne contient que l'empreinte SHA-256 de chaque jeton, jamais le jeton lui-même : une copie de la base ne permet pas de reprendre une session. Déconnexions et fermetures de sessions sont écrites en base avant la réponse, et les dates d'activité au plus une minute après.
 - **Sessions** : changer le rôle d'un compte, le désactiver ou lui donner un nouveau mot de passe depuis l'écran Utilisateurs ferme toutes ses sessions ouvertes. Un administrateur qui change son propre mot de passe garde la session d'où il agit. Une connexion en cours pendant la modification ne peut ni restaurer l'ancien mot de passe ni conserver une session.

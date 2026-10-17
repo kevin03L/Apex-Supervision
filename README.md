@@ -41,15 +41,18 @@ L'IHM web est disponible sur <http://localhost:3000>. Pour une installation en s
 
 ## Comptes
 
-Au premier démarrage, trois comptes d'usine sont créés :
+Au premier démarrage sur une base vierge, les comptes créés dépendent du mode de fonctionnement :
 
-| Identifiant | Mot de passe initial | Rôle |
-|---|---|---|
-| `admin` | `admin123` | Administrateur : tous les droits, dont système et utilisateurs |
-| `superviseur` | `super123` | Superviseur : tout sauf système et utilisateurs |
-| `visu` | `visu123` | Visualisation : synoptiques en lecture seule, consultation des alarmes et acquittement unitaire confirmé |
+- **En production (simulation désactivée)** : seul le compte administrateur `admin` est créé, avec son mot de passe initial `admin123`. Les comptes `superviseur` et `visu` ne sont pas créés.
+- **En démonstration (simulation active)** : les trois comptes d'usine sont initialisés pour permettre l'évaluation des différents profils.
 
-> ⚠️ **Changez ces mots de passe dès la première connexion.** Pour cela, cliquez sur le badge utilisateur en haut à droite, puis sur « Changer mon mot de passe ». Tant qu'un compte garde son mot de passe d'usine, le moteur l'indique dans ses journaux à chaque démarrage.
+| Identifiant | Mot de passe initial | Rôle | Disponibilité au premier démarrage |
+|---|---|---|---|
+| `admin` | `admin123` | Administrateur : tous les droits, dont système et utilisateurs | Toujours créé (production et démonstration) |
+| `superviseur` | `super123` | Superviseur : tout sauf système et utilisateurs | Démonstration / simulation uniquement |
+| `visu` | `visu123` | Visualisation : synoptiques en lecture seule, consultation des alarmes et acquittement unitaire confirmé | Démonstration / simulation uniquement |
+
+> **Obligation de sécurité : changez le mot de passe d'admin dès la première connexion.** Pour cela, cliquez sur le badge utilisateur en haut à droite, puis sur « Changer mon mot de passe ». Tant qu'un compte conserve son mot de passe d'usine, le moteur émet un avertissement dans ses journaux à chaque démarrage.
 
 ## Sécurité
 

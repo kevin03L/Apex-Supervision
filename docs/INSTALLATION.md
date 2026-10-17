@@ -59,6 +59,14 @@ L'utilitaire s'exécute en utilisateur standard, avec la configuration en lectur
 
 > L'assistant lancé à la fin de l'installation hérite des droits administrateur de l'installateur (il doit écrire la configuration et régler le service). Fermez-le une fois la configuration terminée ; relancez ensuite l'utilitaire normalement depuis le menu Démarrer.
 
+### 1.2.1 Première connexion et comptes d'usine
+
+Au premier démarrage sur une base vierge :
+- **En production (simulation désactivée)** : seul le compte administrateur `admin` est créé, avec son mot de passe initial `admin123`. Les comptes `superviseur` et `visu` ne sont pas créés.
+- **En démonstration (simulation active)** : les trois comptes d'usine `admin`/`admin123`, `superviseur`/`super123` et `visu`/`visu123` sont créés.
+
+**Obligation de sécurité** : connectez-vous immédiatement avec le compte `admin` et changez impérativement son mot de passe depuis l'IHM (clic sur le profil en haut à droite → « Changer mon mot de passe »). Le moteur émet un avertissement de sécurité dans ses journaux à chaque démarrage tant que le mot de passe d'usine reste actif. Une base existante n'est jamais modifiée lors des démarrages ultérieurs.
+
 ### 1.3 Installation silencieuse (déploiement)
 
 ```bat
