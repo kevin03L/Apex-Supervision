@@ -1194,7 +1194,10 @@ impl AdminApp {
                         }
                         if rt.simulation_enabled {
                             ui.label("Simulation");
-                            ui.colored_label(form::info_color(ui), "active (automate embarqué, protocoles simulés)");
+                            ui.colored_label(
+                                form::info_color(ui),
+                                "active (automate embarqué, simulateur GTB, démo)",
+                            );
                             ui.end_row();
                         }
                     } else {
@@ -1387,7 +1390,7 @@ impl AdminApp {
                     ui.checkbox(&mut edit.simulation.enabled, "Simulation et données de démonstration");
                     form::hint(
                         ui,
-                        "Automate Modbus embarqué, simulateur GTB et drivers OPC-UA / BACnet / S7 SIMULÉS : \
+                        "Automate Modbus embarqué, simulateur GTB et données de démonstration : \
                          à désactiver en production.",
                     );
                     if edit.simulation.enabled {

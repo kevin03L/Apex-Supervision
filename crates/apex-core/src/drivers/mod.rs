@@ -4,7 +4,10 @@
 //! est supervisé par une tâche Tokio contrôlable (`Start`, `Stop`, `Restart`) et remonte en temps réel
 //! ses compteurs de trames (`frames_ok`, `frames_err`) et sa latence réseau (`last_latency_ms`).
 
+pub mod bacnet;
 pub mod modbus_slave;
+pub mod opc_ua;
+pub mod s7;
 
 use std::{
     net::SocketAddr,
@@ -181,10 +184,22 @@ pub async fn spawn_driver_task(
             let handle = mq.start(core_tx).await?;
             Ok((handle, writer))
         }
-        ProtocolType::OpcUa | ProtocolType::BacnetIp | ProtocolType::SiemensS7 => {
-            let mut gen = FieldbusDriver::new(config, Arc::clone(&core));
-            let writer = gen.writer_sender();
-            let handle = gen.start(core_tx).await?;
+        ProtocolType::SiemensS7 => {
+            let mut s7 = s7::S7Driver::new(config, Arc::clone(&core));
+            let writer = s7.writer_sender();
+            let handle = s7.start(core_tx).await?;
+            Ok((handle, writer))
+        }
+        ProtocolType::OpcUa => {
+            let mut ua = opc_ua::OpcUaDriver::new(config, Arc::clone(&core));
+            let writer = ua.writer_sender();
+            let handle = ua.start(core_tx).await?;
+            Ok((handle, writer))
+        }
+        ProtocolType::BacnetIp => {
+            let mut bac = bacnet::BacnetDriver::new(config, Arc::clone(&core));
+            let writer = bac.writer_sender();
+            let handle = bac.start(core_tx).await?;
             Ok((handle, writer))
         }
     }
@@ -879,19 +894,16 @@ impl IndustrialDriver for ModbusTcpDriver {
             let mut warned: std::collections::HashSet<String> = Default::default();
 
             loop {
-                let t0 = Instant::now();
                 let connect_res = tokio::time::timeout(
                     Duration::from_secs(3),
                     tcp::connect_slave(socket_addr, Slave(config.unit_id)),
                 )
                 .await;
 
+                // La liaison n'est déclarée établie qu'à la première réponse de l'équipement : une
+                // passerelle ou un proxy peut accepter la connexion TCP sans que l'automate réponde.
                 let mut ctx = match connect_res {
-                    Ok(Ok(c)) => {
-                        let lat = t0.elapsed().as_millis() as u64;
-                        core_ref.record_driver_poll(&config.id, true, lat, None);
-                        c
-                    }
+                    Ok(Ok(c)) => c,
                     Ok(Err(e)) => {
                         let msg = format!("Connexion refusée : {}", e);
                         core_ref.record_driver_poll(&config.id, false, 0, Some(msg));
@@ -925,6 +937,8 @@ impl IndustrialDriver for ModbusTcpDriver {
                 }
 
                 let mut ticker = tokio::time::interval(poll_duration);
+                // Après une attente (équipement lent), pas de rafale de lectures en retard
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
                 loop {
                     tokio::select! {
@@ -1123,6 +1137,18 @@ enum BlockData {
     Registers(Vec<u16>),
 }
 
+/// Délai de réponse d'une requête Modbus. Un équipement qui ne répond plus sans fermer la
+/// connexion (câble coupé, automate figé) est ainsi détecté : sans ce délai, la lecture
+/// attendrait indéfiniment et les dernières valeurs resteraient affichées en qualité Good.
+const MODBUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn no_reply_error() -> String {
+    format!(
+        "Pas de réponse de l'équipement en {} s",
+        MODBUS_REQUEST_TIMEOUT.as_secs()
+    )
+}
+
 /// Lit un bloc. Erreur externe : défaut de transport (connexion perdue).
 /// Erreur interne : exception Modbus renvoyée par l'équipement (la liaison reste valide).
 async fn read_block(
@@ -1130,24 +1156,29 @@ async fn read_block(
     block: &ReadBlock,
 ) -> Result<Result<BlockData, String>, String> {
     let (start, count) = (block.start, block.count);
-    let res = match block.area {
-        RegisterArea::Coils => ctx
-            .read_coils(start, count)
-            .await
-            .map(|r| r.map(BlockData::Bits)),
-        RegisterArea::DiscreteInputs => ctx
-            .read_discrete_inputs(start, count)
-            .await
-            .map(|r| r.map(BlockData::Bits)),
-        RegisterArea::InputRegisters => ctx
-            .read_input_registers(start, count)
-            .await
-            .map(|r| r.map(BlockData::Registers)),
-        RegisterArea::HoldingRegisters => ctx
-            .read_holding_registers(start, count)
-            .await
-            .map(|r| r.map(BlockData::Registers)),
+    let request = async {
+        match block.area {
+            RegisterArea::Coils => ctx
+                .read_coils(start, count)
+                .await
+                .map(|r| r.map(BlockData::Bits)),
+            RegisterArea::DiscreteInputs => ctx
+                .read_discrete_inputs(start, count)
+                .await
+                .map(|r| r.map(BlockData::Bits)),
+            RegisterArea::InputRegisters => ctx
+                .read_input_registers(start, count)
+                .await
+                .map(|r| r.map(BlockData::Registers)),
+            RegisterArea::HoldingRegisters => ctx
+                .read_holding_registers(start, count)
+                .await
+                .map(|r| r.map(BlockData::Registers)),
+        }
     };
+    let res = tokio::time::timeout(MODBUS_REQUEST_TIMEOUT, request)
+        .await
+        .map_err(|_| no_reply_error())?;
     match res {
         Err(e) => Err(e.to_string()),
         Ok(Err(exc)) => Ok(Err(format!("exception Modbus {:?}", exc))),
@@ -1428,11 +1459,16 @@ async fn execute_modbus_write(
         Ok(frame) => frame,
         Err(e) => return Ok(Err(e)),
     };
-    let res = match frame {
-        ModbusWrite::Coil(addr, b) => ctx.write_single_coil(addr, b).await,
-        ModbusWrite::Register(addr, word) => ctx.write_single_register(addr, word).await,
-        ModbusWrite::Registers(addr, words) => ctx.write_multiple_registers(addr, &words).await,
+    let request = async {
+        match frame {
+            ModbusWrite::Coil(addr, b) => ctx.write_single_coil(addr, b).await,
+            ModbusWrite::Register(addr, word) => ctx.write_single_register(addr, word).await,
+            ModbusWrite::Registers(addr, words) => ctx.write_multiple_registers(addr, &words).await,
+        }
     };
+    let res = tokio::time::timeout(MODBUS_REQUEST_TIMEOUT, request)
+        .await
+        .map_err(|_| no_reply_error())?;
     match res {
         Err(e) => Err(e.to_string()),
         Ok(Err(exc)) => Ok(Err(format!("exception Modbus {:?}", exc))),
@@ -1457,6 +1493,39 @@ async fn publish_bad_disconnect_for_all(tags: &[RegisteredTag], core_tx: &mpsc::
 // ============================================================================
 // 3. DRIVER MQTT INDUSTRIEL COMPLET
 // ============================================================================
+
+/// Adresse MQTT « sujet » ou « sujet#clé » (clé d'un objet JSON publié sur le sujet).
+///
+/// Le `#` d'un filtre multi-niveaux (« bat/# », « # ») fait partie du sujet : ce n'est une clé
+/// que s'il suit un caractère autre que `/` et qu'un nom le suit.
+fn mqtt_split_address(address: &str) -> (&str, Option<&str>) {
+    match address.split_once('#') {
+        Some((topic, key)) if !topic.is_empty() && !topic.ends_with('/') && !key.is_empty() => {
+            (topic, Some(key))
+        }
+        _ => (address, None),
+    }
+}
+
+fn mqtt_topic(address: &str) -> &str {
+    mqtt_split_address(address).0
+}
+
+/// Correspondance d'un sujet publié avec un filtre d'abonnement (`+` : un niveau, `#` : tous
+/// les niveaux suivants), selon MQTT 3.1.1 §4.7.
+fn mqtt_topic_matches(filter: &str, topic: &str) -> bool {
+    let mut f = filter.split('/');
+    let mut t = topic.split('/');
+    loop {
+        match (f.next(), t.next()) {
+            (Some("#"), _) => return true,
+            (Some("+"), Some(_)) => {}
+            (Some(a), Some(b)) if a == b => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
 
 pub struct MqttDriver {
     config: DriverConfig,
@@ -1519,32 +1588,56 @@ impl IndustrialDriver for MqttDriver {
         let core_ref = Arc::clone(&self.core);
 
         let join_handle = tokio::spawn(async move {
+            // Sujets abonnés sur la connexion courante ; les variables ajoutées ensuite sont
+            // abonnées au tour suivant de `resync` (sans attendre une reconnexion).
+            let mut subscribed: std::collections::HashSet<String> = Default::default();
+            let mut connected = false;
+            let mut resync = tokio::time::interval(Duration::from_secs(2));
             loop {
                 tokio::select! {
                     Some(cmd) = write_rx.recv() => {
-                        let topic = cmd.protocol_address.split('#').next().unwrap_or(&cmd.protocol_address);
-                        if let Ok(payload) = serde_json::to_vec(&cmd.value) {
-                            let _ = client.publish(topic, QoS::AtLeastOnce, false, payload).await;
+                        let topic = mqtt_topic(&cmd.protocol_address).to_string();
+                        if topic.contains(['+', '#']) {
+                            core_ref.record_driver_write_rejected(
+                                &config.id,
+                                &cmd.tag_id,
+                                "sujet à jokers : publication impossible",
+                            );
+                            continue;
+                        }
+                        match serde_json::to_vec(&cmd.value) {
+                            Ok(payload) => match client.publish(topic, QoS::AtLeastOnce, false, payload).await {
+                                Ok(()) => core_ref.record_driver_write_accepted(&config.id),
+                                Err(e) => core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, &e.to_string()),
+                            },
+                            Err(e) => core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, &e.to_string()),
+                        }
+                    }
+                    _ = resync.tick(), if connected => {
+                        for tag in core_ref.get_tags_for_driver(&config.id) {
+                            let topic = mqtt_topic(&tag.protocol_address).to_string();
+                            if !subscribed.contains(&topic)
+                                && client.subscribe(topic.clone(), QoS::AtLeastOnce).await.is_ok()
+                            {
+                                subscribed.insert(topic);
+                            }
                         }
                     }
                     ev = eventloop.poll() => {
                         match ev {
                             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                                 core_ref.record_driver_poll(&config.id, true, 5, None);
-                                for tag in core_ref.get_tags_for_driver(&config.id) {
-                                    let topic = tag.protocol_address.split('#').next().unwrap_or(&tag.protocol_address);
-                                    let _ = client.subscribe(topic, QoS::AtLeastOnce).await;
-                                }
+                                connected = true;
+                                // Nouvelle session : tous les abonnements sont à refaire
+                                subscribed.clear();
+                                resync.reset_immediately();
                             }
                             Ok(Event::Incoming(Packet::Publish(publish))) => {
                                 core_ref.record_driver_poll(&config.id, true, 3, None);
                                 let payload_str = String::from_utf8_lossy(&publish.payload);
                                 for tag in core_ref.get_tags_for_driver(&config.id) {
-                                    let (topic, json_key) = match tag.protocol_address.split_once('#') {
-                                        Some((t, k)) => (t, Some(k)),
-                                        None => (tag.protocol_address.as_str(), None),
-                                    };
-                                    if topic == publish.topic {
+                                    let (topic, json_key) = mqtt_split_address(&tag.protocol_address);
+                                    if mqtt_topic_matches(topic, &publish.topic) {
                                         let extracted = if let Some(key) = json_key {
                                             serde_json::from_str::<serde_json::Value>(&payload_str)
                                                 .ok()
@@ -1567,6 +1660,7 @@ impl IndustrialDriver for MqttDriver {
                             }
                             Ok(_) => {}
                             Err(err) => {
+                                connected = false;
                                 core_ref.record_driver_poll(&config.id, false, 0, Some(err.to_string()));
                                 let tags = core_ref.get_tags_for_driver(&config.id);
                                 publish_bad_disconnect_for_all(&tags, &core_tx).await;
@@ -1598,229 +1692,33 @@ impl IndustrialDriver for MqttDriver {
 }
 
 // ============================================================================
-// 4. DRIVER BUS DE TERRAIN (OPC-UA / BACNET-IP / SIEMENS S7)
+// 4. AUTO-DÉCOUVERTE
 // ============================================================================
 
-pub struct FieldbusDriver {
-    config: DriverConfig,
-    core: Arc<ScadaCore>,
-    write_rx: Option<mpsc::Receiver<WriteCommand>>,
-    write_tx: mpsc::Sender<WriteCommand>,
-}
-
-impl FieldbusDriver {
-    pub fn new(config: DriverConfig, core: Arc<ScadaCore>) -> Self {
-        let (write_tx, write_rx) = mpsc::channel::<WriteCommand>(128);
-        Self {
-            config,
-            core,
-            write_rx: Some(write_rx),
-            write_tx,
-        }
-    }
-
-    pub fn writer_sender(&self) -> mpsc::Sender<WriteCommand> {
-        self.write_tx.clone()
-    }
-}
-
-#[async_trait]
-impl IndustrialDriver for FieldbusDriver {
-    fn id(&self) -> &str {
-        &self.config.id
-    }
-
-    async fn start(&mut self, core_tx: mpsc::Sender<TagState>) -> Result<AbortHandle, String> {
-        let mut write_rx = self
-            .write_rx
-            .take()
-            .ok_or_else(|| "Driver déjà démarré".to_string())?;
-        let config = self.config.clone();
-        let core_ref = Arc::clone(&self.core);
-        let mem_vals: Arc<DashMap<String, TagValue>> = Arc::new(DashMap::new());
-
-        let join_handle = tokio::spawn(async move {
-            let mut step: f64 = 0.0;
-            let mut ticker =
-                tokio::time::interval(Duration::from_millis(config.poll_interval_ms.max(400)));
-
-            loop {
-                tokio::select! {
-                    Some(cmd) = write_rx.recv() => {
-                        mem_vals.insert(cmd.tag_id.clone(), cmd.value.clone());
-                        let _ = core_tx.send(TagState {
-                            tag_id: cmd.tag_id,
-                            value: cmd.value,
-                            quality: Quality::Good,
-                            timestamp: Utc::now(),
-                        }).await;
-                        core_ref.record_driver_poll(&config.id, true, 2, None);
-                    }
-                    _ = ticker.tick() => {
-                        if core_ref.is_acquisition_paused() {
-                            continue;
-                        }
-                        step += 0.15;
-                        for tag in core_ref.get_tags_for_driver(&config.id) {
-                            let val = if let Some(existing) = mem_vals.get(&tag.id) {
-                                existing.value().clone()
-                            } else {
-                                match tag.data_type {
-                                    TagDataType::Float => TagValue::Float(round2(20.0 + (step.sin() * 1.5))),
-                                    TagDataType::Int => TagValue::Int(42),
-                                    TagDataType::Bool => TagValue::Bool(true),
-                                    TagDataType::Text => TagValue::Text("NOMINAL".to_string()),
-                                }
-                            };
-                            let _ = core_tx.send(TagState {
-                                tag_id: tag.id.clone(),
-                                value: val,
-                                quality: Quality::Good,
-                                timestamp: Utc::now(),
-                            }).await;
-                        }
-                        core_ref.record_driver_poll(&config.id, true, 4, None);
-                    }
-                }
-            }
-        });
-
-        Ok(join_handle.abort_handle())
-    }
-
-    async fn write_tag(&self, address: &str, value: TagValue) -> Result<(), String> {
-        self.write_tx
-            .send(WriteCommand {
-                tag_id: address.to_string(),
-                protocol_address: address.to_string(),
-                value,
-            })
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn browse_tags(&self) -> Result<Vec<RegisteredTag>, String> {
-        discover_protocol_tags(&self.config.id, &self.config.protocol)
-    }
-}
-
-/// Catalogue de démonstration des protocoles simulés (OPC-UA, BACnet/IP, Siemens S7).
+/// Refus de découverte propre au protocole, ou `None` si l'équipement sait décrire ses objets.
 ///
-/// Refusé pour les drivers réels (Modbus TCP, MQTT) et pour le simulateur GTB. Le contrôle de
-/// la simulation active est fait par `ScadaCore::discover_driver_tags`.
-pub fn discover_protocol_tags(
-    driver_id: &str,
-    protocol: &ProtocolType,
-) -> Result<Vec<RegisteredTag>, String> {
-    let src = driver_id.to_string();
-    let tags = match protocol {
-        ProtocolType::OpcUa => vec![
-            RegisteredTag {
-                id: format!("{}.OPC.Chiller_Temp_Eau_Glacee", src),
-                label: "Température Départ Eau Glacée Groupe Froid".to_string(),
-                module_source: src.clone(),
-                protocol_address: "ns=2;s=Chiller01.LWT".to_string(),
-                data_type: TagDataType::Float,
-                unit: Some("°C".to_string()),
-                writable: false,
-                deadband: 0.05,
-                scale_factor: 1.0,
-                scale_offset: 0.0,
-                historize: true,
-                alarm_config: TagAlarmConfig::default(),
-            },
-            RegisteredTag {
-                id: format!("{}.OPC.Chiller_Consigne", src),
-                label: "Consigne Groupe Froid OPC-UA".to_string(),
-                module_source: src,
-                protocol_address: "ns=2;s=Chiller01.Setpoint".to_string(),
-                data_type: TagDataType::Float,
-                unit: Some("°C".to_string()),
-                writable: true,
-                deadband: 0.05,
-                scale_factor: 1.0,
-                scale_offset: 0.0,
-                historize: true,
-                alarm_config: TagAlarmConfig::default(),
-            },
-        ],
-        ProtocolType::BacnetIp => vec![
-            RegisteredTag {
-                id: format!("{}.BACNET.VCV_Bureau_201_Temp", src),
-                label: "Température Ambiante Ventilo-Convecteur B201".to_string(),
-                module_source: src.clone(),
-                protocol_address: "BACNET:AI:101:Present_Value".to_string(),
-                data_type: TagDataType::Float,
-                unit: Some("°C".to_string()),
-                writable: false,
-                deadband: 0.05,
-                scale_factor: 1.0,
-                scale_offset: 0.0,
-                historize: true,
-                alarm_config: TagAlarmConfig::default(),
-            },
-            RegisteredTag {
-                id: format!("{}.BACNET.VCV_Bureau_201_Consigne", src),
-                label: "Consigne Confort BACnet B201".to_string(),
-                module_source: src,
-                protocol_address: "BACNET:AV:201:Present_Value".to_string(),
-                data_type: TagDataType::Float,
-                unit: Some("°C".to_string()),
-                writable: true,
-                deadband: 0.05,
-                scale_factor: 1.0,
-                scale_offset: 0.0,
-                historize: true,
-                alarm_config: TagAlarmConfig::default(),
-            },
-        ],
-        ProtocolType::SiemensS7 => vec![
-            RegisteredTag {
-                id: format!("{}.S7.Station_Relevage_Niveau", src),
-                label: "Niveau Bâche Relevage Automate S7-1500".to_string(),
-                module_source: src.clone(),
-                protocol_address: "DB10.DBD0:REAL".to_string(),
-                data_type: TagDataType::Float,
-                unit: Some("%".to_string()),
-                writable: false,
-                deadband: 0.1,
-                scale_factor: 1.0,
-                scale_offset: 0.0,
-                historize: true,
-                alarm_config: TagAlarmConfig::default(),
-            },
-            RegisteredTag {
-                id: format!("{}.S7.Pompe_Vide_Cave_Cmd", src),
-                label: "Commande Marche Pompe Relevage S7-1500".to_string(),
-                module_source: src,
-                protocol_address: "DB10.DBX4.0:BOOL".to_string(),
-                data_type: TagDataType::Bool,
-                unit: None,
-                writable: true,
-                deadband: 0.0,
-                scale_factor: 1.0,
-                scale_offset: 0.0,
-                historize: true,
-                alarm_config: TagAlarmConfig::default(),
-            },
-        ],
-        // Le simulateur GTB a un catalogue fixe, déjà déclaré avec le driver
-        ProtocolType::Simulator => {
-            return Err(
-                "Auto-Découverte sans objet pour le simulateur GTB : son catalogue de variables est fixe"
-                    .to_string(),
-            )
-        }
-        // Un équipement réel ne décrit pas sa table d'échange : inventer des variables
-        // (dont des consignes inscriptibles) écrirait à des adresses inconnues.
-        ProtocolType::ModbusTcp | ProtocolType::Mqtt => {
-            return Err(format!(
-                "Auto-Découverte non disponible pour le protocole {:?} : déclarez les variables d'après la table d'échange de l'équipement",
-                protocol
-            ))
-        }
-    };
-    Ok(tags)
+/// Seul BACnet/IP décrit son contenu (liste des objets de l'équipement). Pour les autres, des
+/// variables inventées (dont des consignes inscriptibles) écriraient à des adresses inconnues.
+pub fn discovery_refusal(protocol: &ProtocolType) -> Option<String> {
+    match protocol {
+        ProtocolType::BacnetIp => None,
+        ProtocolType::Simulator => Some(
+            "Auto-Découverte sans objet pour le simulateur GTB : son catalogue de variables est fixe"
+                .to_string(),
+        ),
+        other => Some(format!(
+            "Auto-Découverte non disponible pour le protocole {:?} : déclarez les variables d'après la table d'échange de l'équipement",
+            other
+        )),
+    }
+}
+
+/// Interroge l'équipement et propose ses variables (BACnet/IP uniquement).
+pub async fn discover_driver_tags(config: &DriverConfig) -> Result<Vec<RegisteredTag>, String> {
+    if let Some(why) = discovery_refusal(&config.protocol) {
+        return Err(why);
+    }
+    bacnet::discover(&config.id, &config.endpoint).await
 }
 
 #[cfg(test)]
@@ -2004,18 +1902,34 @@ mod tests {
     }
 
     #[test]
-    fn discovery_never_invents_tags_on_real_drivers() {
-        assert!(discover_protocol_tags("MB", &ProtocolType::ModbusTcp).is_err());
-        assert!(discover_protocol_tags("MQ", &ProtocolType::Mqtt).is_err());
-        assert!(discover_protocol_tags("SIM", &ProtocolType::Simulator).is_err());
+    fn discovery_never_invents_tags() {
         for p in [
-            ProtocolType::OpcUa,
-            ProtocolType::BacnetIp,
+            ProtocolType::ModbusTcp,
+            ProtocolType::Mqtt,
             ProtocolType::SiemensS7,
+            ProtocolType::OpcUa,
+            ProtocolType::Simulator,
         ] {
-            let tags = discover_protocol_tags("D1", &p).unwrap();
-            assert!(!tags.is_empty());
-            assert!(tags.iter().all(|t| t.module_source == "D1"));
+            assert!(discovery_refusal(&p).is_some(), "{p:?}");
         }
+        assert!(discovery_refusal(&ProtocolType::BacnetIp).is_none());
+    }
+
+    #[test]
+    fn mqtt_addresses_and_wildcards() {
+        assert_eq!(
+            mqtt_split_address("bat/ta01#temp"),
+            ("bat/ta01", Some("temp"))
+        );
+        assert_eq!(mqtt_split_address("bat/ta01"), ("bat/ta01", None));
+        assert_eq!(mqtt_split_address("bat/#"), ("bat/#", None));
+        assert_eq!(mqtt_split_address("#"), ("#", None));
+        assert!(mqtt_topic_matches("bat/ta01", "bat/ta01"));
+        assert!(!mqtt_topic_matches("bat/ta01", "bat/ta02"));
+        assert!(mqtt_topic_matches("bat/+/temp", "bat/ta01/temp"));
+        assert!(!mqtt_topic_matches("bat/+/temp", "bat/ta01/hygro"));
+        assert!(mqtt_topic_matches("bat/#", "bat/ta01/temp"));
+        assert!(mqtt_topic_matches("bat/#", "bat"));
+        assert!(!mqtt_topic_matches("bat/ta01", "bat/ta01/temp"));
     }
 }

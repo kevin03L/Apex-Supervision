@@ -180,7 +180,7 @@ Ordre de priorité : sécurité, puis persistance et stabilité, puis performanc
 
 ### Hors périmètre (recommandations futures)
 - **HTTPS** : placer le serveur derrière un proxy inverse TLS (Caddy, nginx, IIS) pour un usage réseau.
-- **Vrais drivers OPC-UA, BACnet/IP et S7** : ils sont aujourd'hui simulés.
+- [x] **Vrais drivers OPC-UA, BACnet/IP et Siemens S7** : désormais implémentés et validés sur serveurs réels (Modbus 19/19, MQTT 13/13, S7 26/26, OPC-UA 23/23, BACnet/IP 20/20). Seul le simulateur GTB reste réservé à la simulation active.
 - **Regroupement des requêtes Modbus** (PRF-07) : lecture des registres contigus en une seule trame.
 - **CSP stricte** : elle demande de retirer les `onclick` en ligne de l'IHM (refonte importante).
 - **Sessions persistantes** : aujourd'hui en mémoire, donc perdues à l'arrêt du processus.
@@ -251,7 +251,7 @@ Ordre de priorité : sécurité, puis persistance et stabilité, puis performanc
 3. **Changer les 3 mots de passe d'usine** : un avertissement apparaît à chaque démarrage tant que ce n'est pas fait.
 4. Le driver `MODBUS_GF01` garde l'endpoint enregistré en base (`127.0.0.1:5502`). Si `SCADA_MODBUS_SLAVE_PORT` est modifié, il faut mettre à jour l'endpoint du driver.
 5. La suppression d'un driver supprime désormais ses variables (confirmation affichée dans l'IHM).
-6. Restent hors périmètre : HTTPS, vrais drivers OPC-UA / BACnet / S7, regroupement des requêtes Modbus, CSP stricte (voir §3).
+6. Restent hors périmètre : HTTPS, regroupement des requêtes Modbus, CSP stricte (voir §3) ; les vrais drivers OPC-UA, BACnet/IP et Siemens S7 sont désormais implémentés.
 
 ---
 
@@ -308,7 +308,7 @@ Après la mise en service de la 1.1, une seconde revue complète du code a été
 ### 6.5 Reste à faire (pistes pour une version suivante)
 
 - **Persistance de l'état des alarmes** : elles sont en mémoire et réapparaissent comme « nouvelles » après un redémarrage du processus.
-- **HTTPS natif** (aujourd'hui via proxy inverse), **vrais drivers OPC-UA, BACnet et S7**.
+- **HTTPS natif** (aujourd'hui via proxy inverse). *(Note : les vrais drivers OPC-UA, BACnet/IP et Siemens S7 sont désormais réalisés et opérationnels).*
 - **CSP stricte** sans `unsafe-inline` : il faut retirer les gestionnaires `onclick` en ligne de l'IHM.
 - **Temporisation d'apparition des alarmes** (on-delay) pour filtrer les dépassements très brefs.
 

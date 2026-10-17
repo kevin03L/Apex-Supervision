@@ -4,7 +4,7 @@
 //!
 //! Aucun test ne touche à une base existante ni n'envoie de commande à un équipement : le seul
 //! « automate » joint est l'automate Modbus embarqué de la simulation, sur la boucle locale,
-//! et le mode sûr refuse toute consigne vers les drivers non simulés.
+//! et le mode sûr refuse toute consigne vers les drivers réels (les cinq protocoles industriels).
 
 mod common;
 

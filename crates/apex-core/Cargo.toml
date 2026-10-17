@@ -26,6 +26,8 @@ rhai = { version = "1.19", features = ["sync"] }
 # Protocoles industriels
 tokio-modbus = "0.14"
 rumqttc = "0.24"
+# Client OPC-UA (cryptographie pure Rust, sans OpenSSL)
+async-opcua = { version = "0.19", default-features = false, features = ["client"] }
 byteorder = "1.5"
 async-trait = "0.1"
 rand = "0.8"

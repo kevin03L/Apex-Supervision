@@ -4,8 +4,8 @@
 //!
 //! - [`core`] : noyau temps réel `ScadaCore` (tags, drivers, alarmes ISA-18.2, planificateur,
 //!   historique, audit, utilisateurs, réglages) ;
-//! - [`drivers`] : drivers industriels (Modbus TCP, MQTT, simulateur et protocoles simulés)
-//!   et automate Modbus esclave embarqué ;
+//! - [`drivers`] : drivers industriels (Modbus TCP, MQTT, OPC-UA, BACnet/IP, Siemens S7,
+//!   simulateur GTB) et automate Modbus esclave embarqué ;
 //! - [`flow_engine`] : moteur de flux logiques et scripts Rhai ;
 //! - [`models`] : types de données partagés ;
 //! - [`security`] : mots de passe, jetons, validation des identifiants, assainissement SVG.

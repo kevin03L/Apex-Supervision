@@ -95,12 +95,14 @@ pub struct EngineOptions {
     pub instance_name: String,
     pub session_ttl_hours: u64,
     pub history_retention_days: u32,
-    /// Mode sûr : aucune commande n'est envoyée aux équipements réels (Modbus TCP, MQTT).
+    /// Mode sûr : aucune commande n'est envoyée aux équipements réels (les cinq protocoles industriels).
     pub safe_mode: bool,
-    /// Simulation : simulateur GTB, protocoles simulés (OPC-UA, BACnet/IP, S7), données de démo.
+    /// Simulation : simulateur GTB, automate Modbus embarqué, données de démo.
     pub simulation_enabled: bool,
     /// Port de l'automate Modbus embarqué (affiché dans l'état système).
     pub modbus_slave_port: u16,
+    /// Répertoire des données (None dans les tests : répertoire temporaire du système).
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for EngineOptions {
@@ -112,12 +114,15 @@ impl Default for EngineOptions {
             safe_mode: false,
             simulation_enabled: true,
             modbus_slave_port: 5502,
+            data_dir: None,
         }
     }
 }
 
 pub struct ScadaCore {
     pub started_at: DateTime<Utc>,
+    /// Répertoire des données de l'instance (certificats des clients OPC-UA, par exemple).
+    pub data_dir: Option<std::path::PathBuf>,
     pub modbus_slave_port: u16,
     pub instance_name: String,
     pub safe_mode: bool,
@@ -185,6 +190,7 @@ impl ScadaCore {
         let core = Arc::new(Self {
             started_at: Utc::now(),
             modbus_slave_port: config.modbus_slave_port,
+            data_dir: config.data_dir.clone(),
             instance_name: config.instance_name.clone(),
             safe_mode: config.safe_mode,
             simulation_enabled: config.simulation_enabled,
@@ -392,7 +398,7 @@ impl ScadaCore {
         start_result.map(|_| views)
     }
 
-    /// Refuse un protocole simulé (simulateur GTB, OPC-UA, BACnet/IP, S7) quand la simulation est
+    /// Refuse un protocole simulé (simulateur GTB) quand la simulation est
     /// désactivée : aucun chemin (ajout, import, démarrage) ne doit l'enregistrer ni le persister.
     fn ensure_protocol_available(&self, protocol: &ProtocolType) -> Result<(), ScadaError> {
         if protocol.is_simulated() && !self.simulation_enabled {
@@ -427,13 +433,7 @@ impl ScadaCore {
                 config.stats.running = true;
                 // Les drivers internes sont immédiatement « connectés » ; les drivers réseau
                 // le deviennent à leur première trame réussie (record_driver_poll).
-                config.stats.connected = matches!(
-                    config.protocol,
-                    crate::models::ProtocolType::Simulator
-                        | crate::models::ProtocolType::OpcUa
-                        | crate::models::ProtocolType::BacnetIp
-                        | crate::models::ProtocolType::SiemensS7
-                );
+                config.stats.connected = config.protocol.is_simulated();
                 config.stats.last_error = None;
                 config.stats.last_poll_at = Some(Utc::now());
                 Ok(())
@@ -686,27 +686,38 @@ impl ScadaCore {
         Ok(tag_ids.len())
     }
 
-    /// « Auto-Découverte » : déclare le catalogue de démonstration d'un driver simulé.
+    /// « Auto-Découverte » : interroge l'équipement pour proposer ses variables (BACnet/IP uniquement).
     ///
-    /// Réservée aux protocoles simulés (OPC-UA, BACnet/IP, S7) avec la simulation active.
-    /// Refusée pour un driver réel (Modbus TCP, MQTT) : aucune variable n'est inventée, en
-    /// particulier aucune consigne inscriptible à une adresse inconnue de l'équipement.
+    /// Refusée pour les protocoles sans auto-découverte (Modbus TCP, MQTT, Siemens S7, OPC-UA, simulateur GTB) :
+    /// aucune variable n'est inventée, en particulier aucune consigne inscriptible à une adresse inconnue de l'équipement.
     pub async fn discover_driver_tags(
         &self,
         actor: &str,
         driver_id: &str,
     ) -> Result<Vec<TagFullView>, ScadaError> {
-        let protocol = self
+        let config = self
             .drivers_config
             .get(driver_id)
-            .map(|d| d.protocol.clone())
+            .map(|d| d.clone())
             .ok_or_else(|| ScadaError::DriverNotFound(driver_id.to_string()))?;
-        self.ensure_protocol_available(&protocol)?;
-        let discovered = crate::drivers::discover_protocol_tags(driver_id, &protocol)
-            .map_err(ScadaError::BadRequest)?;
+        self.ensure_protocol_available(&config.protocol)?;
+        if let Some(why) = crate::drivers::discovery_refusal(&config.protocol) {
+            return Err(ScadaError::BadRequest(why));
+        }
+        let discovered = crate::drivers::discover_driver_tags(&config)
+            .await
+            .map_err(|e| {
+                ScadaError::DriverError(format!(
+                    "Auto-Découverte de '{}' impossible : {}",
+                    driver_id, e
+                ))
+            })?;
+        // Les variables déjà déclarées (libellé, alarmes, mise à l'échelle) ne sont pas écrasées
         let mut views = Vec::with_capacity(discovered.len());
         for tag in discovered {
-            views.push(self.upsert_tag(actor, tag).await?);
+            if !self.tags_registry.contains_key(&tag.id) {
+                views.push(self.upsert_tag(actor, tag).await?);
+            }
         }
         Ok(views)
     }
@@ -1860,6 +1871,30 @@ impl ScadaCore {
             )?;
         }
 
+        if protocol == ProtocolType::OpcUa {
+            crate::drivers::opc_ua::precheck_write(
+                &tag_meta.module_source,
+                &tag_meta.protocol_address,
+                &device_value,
+            )
+            .map_err(|e| {
+                ScadaError::BadRequest(format!(
+                    "Consigne refusée pour '{}' ({}) : {}",
+                    tag_meta.id, tag_meta.protocol_address, e
+                ))
+            })?;
+        }
+        if protocol == ProtocolType::SiemensS7 {
+            crate::drivers::s7::S7Address::parse(&tag_meta.protocol_address, tag_meta.data_type)
+                .and_then(|a| a.encode(&device_value))
+                .map_err(|e| {
+                    ScadaError::BadRequest(format!(
+                        "Consigne refusée pour '{}' ({}) : {}",
+                        tag_meta.id, tag_meta.protocol_address, e
+                    ))
+                })?;
+        }
+
         if !running {
             return Err(ScadaError::DriverError(format!(
                 "Driver '{}' arrêté : commande refusée",
@@ -2524,7 +2559,7 @@ impl ScadaCore {
     ) -> Result<serde_json::Value, ScadaError> {
         let mut errors: Vec<String> = Vec::new();
         let mut counts = [0usize; 5];
-        // Drivers non importés (protocole simulé sans simulation, configuration invalide) :
+        // Drivers non importés (simulateur GTB sans simulation, configuration invalide) :
         // leurs variables sont écartées elles aussi.
         let mut ignored_drivers: std::collections::HashSet<String> = Default::default();
         let mut ignored_tags = 0usize;
@@ -3230,6 +3265,8 @@ impl ScadaCore {
             category: "CVC / Climatisation".to_string(),
             description: "Supervision complète de la CTA 01".to_string(),
             grid_size: 20,
+            canvas_width: None,
+            canvas_height: None,
             updated_at: Utc::now(),
             widgets: vec![
                 DashboardWidget {
@@ -3330,6 +3367,8 @@ impl ScadaCore {
             category: "Production Thermique".to_string(),
             description: "Supervision de la chaudière, des pompes P1/P2 et de l'automate Modbus TCP Groupe Froid".to_string(),
             grid_size: 20,
+            canvas_width: None,
+            canvas_height: None,
             updated_at: Utc::now(),
             widgets: vec![
                 DashboardWidget {
@@ -3419,6 +3458,8 @@ impl ScadaCore {
             category: "Énergie / TGBT".to_string(),
             description: "Mesure temps réel de la puissance active, de la tension triphasée et du facteur de puissance".to_string(),
             grid_size: 20,
+            canvas_width: None,
+            canvas_height: None,
             updated_at: Utc::now(),
             widgets: vec![
                 DashboardWidget {
@@ -4939,6 +4980,17 @@ async fn write_history_batch(pool: &SqlitePool, batch: &[TagState]) {
 /// Valide les identifiants d'un synoptique et assainit les SVG embarqués dans ses widgets.
 fn sanitize_dashboard(layout: &mut DashboardLayout) -> Result<(), ScadaError> {
     security::validate_id("synoptique", &layout.id)?;
+    if layout
+        .canvas_width
+        .is_some_and(|w| !(320..=7680).contains(&w))
+        || layout
+            .canvas_height
+            .is_some_and(|h| !(240..=4320).contains(&h))
+    {
+        return Err(ScadaError::BadRequest(
+            "Taille d'écran du synoptique invalide (320 × 240 à 7680 × 4320 px)".to_string(),
+        ));
+    }
     for w in layout.widgets.iter_mut() {
         security::validate_id("widget", &w.id)?;
         if w.bound_tag_id
@@ -4970,6 +5022,15 @@ fn sanitize_dashboard(layout: &mut DashboardLayout) -> Result<(), ScadaError> {
 
 /// Contrôle de l'endpoint d'un driver, à l'ajout, à l'import et à la modification.
 fn validate_driver_endpoint(protocol: &ProtocolType, endpoint: &str) -> Result<(), ScadaError> {
+    if *protocol == ProtocolType::SiemensS7 {
+        crate::drivers::s7::S7Endpoint::parse(endpoint).map_err(ScadaError::BadRequest)?;
+    }
+    if *protocol == ProtocolType::OpcUa {
+        crate::drivers::opc_ua::validate_endpoint(endpoint).map_err(ScadaError::BadRequest)?;
+    }
+    if *protocol == ProtocolType::BacnetIp {
+        crate::drivers::bacnet::parse_endpoint(endpoint).map_err(ScadaError::BadRequest)?;
+    }
     if *protocol == ProtocolType::ModbusTcp
         && endpoint.trim().parse::<std::net::SocketAddr>().is_err()
     {
@@ -4989,6 +5050,15 @@ fn validate_tag_for_protocol(
     match protocol {
         ProtocolType::ModbusTcp => {
             crate::drivers::validate_modbus_tag(tag).map_err(ScadaError::BadRequest)
+        }
+        ProtocolType::SiemensS7 => {
+            crate::drivers::s7::validate_s7_tag(tag).map_err(ScadaError::BadRequest)
+        }
+        ProtocolType::OpcUa => {
+            crate::drivers::opc_ua::validate_opcua_tag(tag).map_err(ScadaError::BadRequest)
+        }
+        ProtocolType::BacnetIp => {
+            crate::drivers::bacnet::validate_bacnet_tag(tag).map_err(ScadaError::BadRequest)
         }
         _ => Ok(()),
     }
@@ -5099,6 +5169,8 @@ mod tests {
             category: "c".into(),
             description: "d".into(),
             grid_size: 20,
+            canvas_width: None,
+            canvas_height: None,
             widgets: vec![DashboardWidget {
                 id: "w-1".into(),
                 x: 0.0,
@@ -5592,17 +5664,17 @@ mod tests {
     async fn simulated_drivers_are_never_registered_without_simulation() {
         let core = ScadaCore::new(None, &engine_options(false));
         let sim = driver(
-            "OPC_DEMO",
-            ProtocolType::OpcUa,
-            vec![driver_tag("OPC_DEMO.T1", "OPC_DEMO", "ns=2;s=T1", false)],
+            "SIM_DEMO",
+            ProtocolType::Simulator,
+            vec![driver_tag("SIM_DEMO.T1", "SIM_DEMO", "SIM:T1", false)],
         );
         let err = core
             .register_and_start_driver("test", sim.clone())
             .await
             .unwrap_err();
         assert_eq!(err.http_status(), 400);
-        assert!(!core.drivers_config.contains_key("OPC_DEMO"));
-        assert!(!core.tags_registry.contains_key("OPC_DEMO.T1"));
+        assert!(!core.drivers_config.contains_key("SIM_DEMO"));
+        assert!(!core.tags_registry.contains_key("SIM_DEMO.T1"));
 
         // Import : le driver simulé et ses variables sont écartés, avec un rapport explicite
         let mb = driver(
@@ -5615,7 +5687,7 @@ mod tests {
             version: APP_VERSION.to_string(),
             drivers: vec![sim.clone(), mb],
             tags: vec![
-                driver_tag("OPC_DEMO.T1", "OPC_DEMO", "ns=2;s=T1", false),
+                driver_tag("SIM_DEMO.T1", "SIM_DEMO", "SIM:T1", false),
                 driver_tag("MB_01.T1", "MB_01", "HR:0:FLOAT32", false),
             ],
             dashboards: vec![],
@@ -5629,19 +5701,19 @@ mod tests {
         assert!(report["errors"][0]
             .as_str()
             .unwrap()
-            .contains("Driver 'OPC_DEMO' ignoré"));
-        assert!(!core.drivers_config.contains_key("OPC_DEMO"));
-        assert!(!core.tags_registry.contains_key("OPC_DEMO.T1"));
+            .contains("Driver 'SIM_DEMO' ignoré"));
+        assert!(!core.drivers_config.contains_key("SIM_DEMO"));
+        assert!(!core.tags_registry.contains_key("SIM_DEMO.T1"));
         assert!(core.tags_registry.contains_key("MB_01.T1"));
 
         // Driver simulé hérité de la base : le démarrage est refusé et l'état voulu reste « arrêté »
-        core.drivers_config.insert("OPC_DEMO".to_string(), sim);
+        core.drivers_config.insert("SIM_DEMO".to_string(), sim);
         let err = core
-            .start_or_restart_driver("test", "OPC_DEMO")
+            .start_or_restart_driver("test", "SIM_DEMO")
             .await
             .unwrap_err();
         assert_eq!(err.http_status(), 400);
-        assert!(!core.drivers_config.get("OPC_DEMO").unwrap().enabled);
+        assert!(!core.drivers_config.get("SIM_DEMO").unwrap().enabled);
     }
 
     #[tokio::test]
@@ -5666,34 +5738,28 @@ mod tests {
         core.register_and_start_driver("test", driver("MQ_01", ProtocolType::Mqtt, vec![]))
             .await
             .unwrap();
-        for id in ["MB_01", "MQ_01"] {
+        core.register_and_start_driver("test", driver("S7_01", ProtocolType::SiemensS7, vec![]))
+            .await
+            .unwrap();
+        core.register_and_start_driver("test", driver("UA_01", ProtocolType::OpcUa, vec![]))
+            .await
+            .unwrap_err(); // endpoint de test invalide pour OPC-UA : refusé à l'enregistrement
+        for id in ["MB_01", "MQ_01", "S7_01"] {
             let err = core.discover_driver_tags("test", id).await.unwrap_err();
             assert_eq!(err.http_status(), 400);
             assert!(core.get_tags_for_driver(id).is_empty(), "{}", id);
         }
-        core.register_and_start_driver("test", driver("S7_01", ProtocolType::SiemensS7, vec![]))
+
+        // BACnet : l'équipement est réellement interrogé ; injoignable, aucune variable inventée
+        core.register_and_start_driver("test", driver("BAC_01", ProtocolType::BacnetIp, vec![]))
             .await
             .unwrap();
-        assert!(!core
-            .discover_driver_tags("test", "S7_01")
+        let err = core
+            .discover_driver_tags("test", "BAC_01")
             .await
-            .unwrap()
-            .is_empty());
-
-        // Simulation désactivée : découverte refusée même pour un protocole simulé
-        let prod = ScadaCore::new(None, &engine_options(false));
-        prod.drivers_config.insert(
-            "S7_01".to_string(),
-            driver("S7_01", ProtocolType::SiemensS7, vec![]),
-        );
-        assert_eq!(
-            prod.discover_driver_tags("test", "S7_01")
-                .await
-                .unwrap_err()
-                .http_status(),
-            400
-        );
-        assert!(prod.get_tags_for_driver("S7_01").is_empty());
+            .unwrap_err();
+        assert_ne!(err.http_status(), 400, "{err}");
+        assert!(core.get_tags_for_driver("BAC_01").is_empty());
     }
 
     #[tokio::test]

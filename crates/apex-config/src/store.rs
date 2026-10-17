@@ -465,7 +465,7 @@ safe_mode = {safe_mode}
 
 [simulation]
 # Automate Modbus embarqué, simulateur GTB et données de démonstration.
-# Les drivers OPC-UA, BACnet/IP et Siemens S7 sont SIMULÉS : ils ne fonctionnent qu'avec la simulation active.
+# Seul le simulateur GTB est réservé à la simulation active.
 enabled = {sim_enabled}
 # Port de l'automate Modbus TCP embarqué (écoute sur 127.0.0.1 uniquement).
 modbus_slave_port = {sim_port}

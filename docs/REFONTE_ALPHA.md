@@ -282,7 +282,7 @@ La version est définie **une seule fois** (`[workspace.package] version`) et pr
 3. CI verte sur Windows et Linux (`fmt`, `clippy -D warnings`, `test`), artefacts reproductibles avec empreintes SHA-256.
 4. Signature Authenticode des binaires et de l'installateur ; paquets Linux signés.
 5. HTTPS natif ou procédure de proxy inverse validée.
-6. Protocoles simulés (OPC-UA, BACnet, S7) soit implémentés, soit retirés de l'IHM de production.
+6. Protocoles industriels (OPC-UA, BACnet, S7) : implémentés avec de vrais drivers réels (voir §12.8).
 7. Tests d'intégration du serveur web automatisés en CI (authentification, RBAC, WebSocket, écriture Modbus contre l'automate embarqué).
 8. Documentation d'exploitation relue par un utilisateur cible.
 
@@ -302,7 +302,7 @@ La version est définie **une seule fois** (`[workspace.package] version`) et pr
 | 5b Paquet Linux | Métadonnées `cargo-deb` (paquet `apex-supervision`), `postinst` et `postrm`, unité systemd durcie, règle polkit, raccourci desktop. |
 | 6 CI et documentation | `.github/workflows/ci.yml` (Windows et Ubuntu 22.04, artefacts sur tag), [INSTALLATION.md](INSTALLATION.md), [ADMINISTRATION.md](ADMINISTRATION.md), [DEVELOPPEMENT.md](DEVELOPPEMENT.md), README. |
 | Icône et ressources de version | Icône sobre générée par code (`packaging/icons/generer-icones.ps1` → SVG, PNG 256 px, ICO 16 à 256 px, sortie reproductible). Crate de compilation `apex-build` (`embed-resource` : `windres` pour windows-gnu, `rc.exe` pour windows-msvc, rien pour une cible Linux) : icône et `VERSIONINFO` en français dans `apex-scada.exe` et `apex-scada-admin.exe` (version de fichier `0.4.0.1` dérivée de `0.4.0-alpha.1`, comme l'installateur). Icône de la fenêtre de l'utilitaire, de l'installateur (`SetupIconFile`) et du raccourci Linux (thème `hicolor`, 256 px et SVG). `build-installer.ps1` refuse des binaires sans la bonne version de fichier. |
-| Exigence « rien de simulé présenté comme réel » | L'IHM web regroupe et étiquette OPC-UA, BACnet/IP et S7 comme « SIMULÉ », avec un badge sur les drivers concernés. Le moteur refuse ces drivers si la simulation est désactivée. |
+| Exigence « rien de simulé présenté comme réel » | Dans l'étape initiale, l'IHM étiquetait OPC-UA, BACnet/IP et S7 comme simulés. Désormais, les cinq protocoles sont réels (§12.8) et seul le simulateur GTB est réservé à la simulation active. |
 
 ### 12.2 État des vérifications
 
@@ -378,12 +378,12 @@ Deux audits indépendants ont relu tout le code de la refonte. Chaque anomalie a
 |---|---|---|
 | A1 (critique) | XSS stockée par un SVG de symbole ou de synoptique | Analyse XML réelle (quick-xml) et reconstruction par liste blanche côté serveur. L'IHM reconstruit l'arbre par le DOM, sans `innerHTML`. |
 | A2 (critique) | `migrate-legacy --force` pouvait perdre la base en place (journal WAL) | Sauvegarde complète par `VACUUM INTO` avant tout remplacement ; checkpoint WAL à l'arrêt. |
-| A3 | Auto-Découverte inventant des variables fictives (dont une inscriptible) sur les drivers réels Modbus TCP et MQTT | Réservée aux protocoles simulés ; erreur 400 sinon. |
+| A3 | Auto-Découverte inventant des variables fictives (dont une inscriptible) sur les drivers réels Modbus TCP et MQTT | Refusée sans auto-découverte (erreur 400) ; auto-découverte réelle sur BACnet/IP. |
 | A4 | Écriture Modbus INT32 refusée, et une exception coupait la liaison | INT32 inscriptible ; un refus est tracé (`WRITE_REJECTED`) sans couper la liaison. |
 | A5 | Valeurs hors plage saturées en silence | Refus 400. |
 | A6 | Verrouillage de connexion non atomique, Argon2 sans borne | Réservation atomique, 4 vérifications simultanées, attente bornée (503). |
 | A7 | Le jeton de contrôle local ouvrait une session administrateur | Limité à l'arrêt propre et à l'état, sous l'acteur « Utilitaire local ». |
-| A8 | L'import de projet enregistrait des drivers simulés alors que la simulation est désactivée | Drivers simulés et leurs variables écartés (`ignored_drivers`, `ignored_tags`). |
+| A8 | L'import de projet enregistrait des drivers simulés alors que la simulation est désactivée | Driver simulateur GTB et ses variables écartés (`ignored_drivers`, `ignored_tags`). |
 | A9 | Escalade HH/LL retardée par la bande morte | La bande morte ne retarde que la disparition. |
 | A10 | Énumération des comptes par le temps de réponse | Vérification à coût constant (hachage factice). |
 | A11 | Script Rhai invalide accepté, erreur journalisée à chaque cycle | Refus à l'enregistrement, avertissement unique. |
@@ -396,7 +396,7 @@ Deux audits indépendants ont relu tout le code de la refonte. Chaque anomalie a
 **Régressions trouvées par les vérificateurs, corrigées :**
 - écriture de flux perdue lors d'une coupure : la sortie est réécrite après un refus ou un changement d'état de la liaison ;
 - refus d'écriture effacé de la carte du driver dès la scrutation suivante ;
-- succès partiel présenté comme une erreur à la modification d'un driver simulé ;
+- succès partiel présenté comme une erreur à la modification d'un driver Simulator ;
 - dessins perdus pour des exports Illustrator (`<style>`), draw.io (`<switch>`, `<a>`) et pour certains filtres ;
 - course entre connexion et réinitialisation du mot de passe (A16).
 
@@ -483,3 +483,36 @@ Cinq des six recommandations du §12.6 ont été tranchées et appliquées :
 Reste ouvert : les fenêtres `alert()` natives de l'IHM. La fenêtre de confirmation créée pour l'acquittement (`confirmDialog`) pourra servir à leur remplacement.
 
 Vérifications : 146 tests (deux nouveaux tests d'intégration et un test du mode sûr étendu), clippy sans avertissement, scénario fonctionnel 90/90, contrôle dans le navigateur (sélection, exécution, annulation, expiration, impulsion, acquittement par le profil Visualisation, session reprise après redémarrage, badge suspendu).
+
+### 12.8 Protocoles réels (Modbus TCP, MQTT, Siemens S7, OPC-UA, BACnet/IP)
+
+Dans les étapes précédentes, seuls Modbus TCP et MQTT communiquaient réellement avec le matériel ; OPC-UA, BACnet/IP et Siemens S7 étaient des générateurs de valeurs fictives réservés à la simulation. Cette étape parachève l'implémentation industrielle : **les cinq protocoles sont désormais réels** et dialoguent directement avec de vrais équipements (code dans `crates/apex-core/src/drivers/` : `s7.rs`, `opc_ua.rs`, `bacnet.rs`, `mod.rs`). Le seul driver restant réservé à la démonstration est le **simulateur GTB** (`Simulator`, pour lequel `ProtocolType::is_simulated()` est le seul à renvoyer `true`).
+
+#### Réalisations par protocole
+
+| Protocole | Endpoint | Adresses supportées | Fonctionnement et limites |
+|---|---|---|---|
+| **Modbus TCP** | `IP:port` (502 par défaut) | `COIL:n`, `DI:n`, `IR:n[:FLOAT32]`, `HR:n[:INT16\|UINT16\|INT32\|FLOAT32\|FLOAT32_SWAP]` | Délai de réponse maximal de 3 s par requête. Liaison déclarée établie à la première réponse. Pas d'auto-découverte. |
+| **MQTT** | `mqtt://hôte:port` (1883 par défaut) | `sujet` ou `sujet#clé` (extraction JSON) ; jokers `+` et `#` en lecture | Publication de consigne avec QoS 1. Identifiant client `apex-scada-<id>`. Pas encore d'authentification (utilisateur/mot de passe) ni de chiffrement TLS. Pas d'auto-découverte. |
+| **Siemens S7** (S7-300, 400, 1200, 1500) | `IP[:port][?rack=R&slot=S]` (port 102, rack 0, slot 1 par défaut ; S7-300 : slot 2) | `DB10.DBD0:REAL`, `DB10.DBX4.0`, `DB10.DBW2:INT`, `MW10`, `MD20`, `M0.1`, `I0.0`/`E0.0`, `IW64`, `Q0.0`/`A0.0` ; types BOOL, BYTE, INT, WORD, DINT, DWORD, REAL | Communication native ISO-on-TCP. Pour S7-1200/1500 : autoriser l'accès PUT/GET dans TIA Portal et blocs DB configurés en accès standard (non optimisé). Entrées physiques non inscriptibles. Pas d'auto-découverte. |
+| **OPC-UA** | `opc.tcp://hôte:4840[/chemin]` | NodeId : `ns=2;s=Nom`, `ns=3;i=1002` | Client binaire natif. Connexion sans chiffrement et session anonyme uniquement pour l'instant. Lors de l'écriture d'une consigne, la valeur est convertie automatiquement dans le type du nœud (appris lors de la lecture). Certificats PKI rangés dans `<données>/opcua-pki`. Pas d'auto-découverte. |
+| **BACnet/IP** | `IP[:port]` (47808 par défaut) | `BACNET:type:instance[:propriété][:priorité]` ; types AI, AO, AV, BI, BO, BV, MSI, MSO, MSV ; priorité 1–16 (8 par défaut) | Équipement joint directement par son IP (pas de routage MS/TP). **Auto-découverte réelle** opérationnelle (interroge en direct l'automate pour lister ses objets, noms et unités). Entrées physiques non inscriptibles. |
+
+#### Comportements communs et garde-fous
+
+- **Gestion des déconnexions** : lorsqu'un équipement ne répond plus sur le réseau, la liaison passe à l'état déconnecté, la qualité des variables passe en `BadDisconnect` et le moteur tente automatiquement la reconnexion à chaque cycle d'acquisition.
+- **Isolation des erreurs** : une adresse inconnue ou rejetée par l'équipement ne dégrade que sa propre variable, sans affecter les autres tags ni couper la liaison du driver.
+- **Validation stricte des consignes** : toute commande hors de la plage admissible de son type de données est refusée immédiatement (erreur HTTP 400) avant tout envoi sur le bus.
+- **Mode sûr** (`safety.safe_mode`) : bloque systématiquement toute écriture vers l'ensemble de ces cinq protocoles réels.
+- **Synoptiques** : nouveau champ facultatif `canvas_width` / `canvas_height` définissant la résolution cible du canevas de supervision (plage supportée de 320×240 à 7680×4320).
+
+#### Bancs de test réels et résultats
+
+Les cinq drivers ont été validés face à de vrais serveurs de test industriels :
+- **Modbus TCP** : 19/19 tests passés.
+- **MQTT** : 13/13 tests passés.
+- **Siemens S7** : 26/26 tests passés.
+- **OPC-UA** : 23/23 tests passés.
+- **BACnet/IP** : 20/20 tests passés.
+
+L'ensemble de la suite de tests automatisés du workspace compte désormais **158 tests**, tous validés au vert (`cargo test --workspace`).

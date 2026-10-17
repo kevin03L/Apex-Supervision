@@ -362,16 +362,10 @@ pub enum ProtocolType {
 }
 
 impl ProtocolType {
-    /// Protocoles sans implémentation réelle : simulateur GTB et drivers OPC-UA, BACnet/IP et
-    /// Siemens S7 (qui génèrent des valeurs fictives). Ils ne démarrent qu'avec la simulation active.
+    /// Driver de démonstration (simulateur GTB) : il ne démarre qu'avec la simulation active.
+    /// Tous les autres protocoles dialoguent avec de vrais équipements.
     pub fn is_simulated(&self) -> bool {
-        matches!(
-            self,
-            ProtocolType::Simulator
-                | ProtocolType::OpcUa
-                | ProtocolType::BacnetIp
-                | ProtocolType::SiemensS7
-        )
+        matches!(self, ProtocolType::Simulator)
     }
 }
 
@@ -495,6 +489,12 @@ pub struct DashboardLayout {
     pub description: String,
     pub grid_size: u32,
     pub widgets: Vec<DashboardWidget>,
+    /// Taille de l'écran cible (px) sur lequel la vue est dessinée ; l'IHM met cette fenêtre à
+    /// l'échelle de l'écran réel. Absente (vues antérieures) : déduite du contenu par l'IHM.
+    #[serde(default)]
+    pub canvas_width: Option<u32>,
+    #[serde(default)]
+    pub canvas_height: Option<u32>,
     /// Fixée par le serveur à chaque enregistrement : facultative dans les requêtes.
     #[serde(default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
@@ -766,7 +766,7 @@ pub struct SystemStatus {
     /// Mode sûr : aucune commande vers les équipements réels.
     #[serde(default)]
     pub safe_mode: bool,
-    /// Simulation active (automate embarqué, simulateur, protocoles simulés).
+    /// Simulation active (automate embarqué, simulateur GTB, données de démonstration).
     #[serde(default)]
     pub simulation_enabled: bool,
     /// Points d'historique écartés car la file d'écriture était saturée.

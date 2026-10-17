@@ -7,8 +7,8 @@ Plateforme de supervision industrielle **GTC / SCADA / GTB** écrite en Rust : u
 ## Fonctionnalités
 
 - **Temps réel** : base de variables en mémoire, filtrage par bande morte (COV) et diffusion WebSocket.
-- **Communications** : Modbus TCP maître (lecture par blocs de registres) et MQTT (TLS), avec des paramètres modifiables à chaud. **OPC-UA, BACnet/IP et Siemens S7 sont simulés** : ils servent à la démonstration et l'IHM les signale comme tels.
-- **Simulation** (option) : simulateur physique CVC / chaufferie / TGBT et automate Modbus TCP embarqué, pour tester sans matériel.
+- **Communications** : cinq protocoles industriels réels opérationnels — Modbus TCP maître (lecture par blocs de registres), MQTT, Siemens S7 (S7-300/400/1200/1500), OPC-UA et BACnet/IP (avec auto-découverte réelle des objets). Paramètres de communication modifiables à chaud.
+- **Simulation** (option) : simulateur physique GTB (CVC / CTA, chaufferie, TGBT) et automate Modbus TCP embarqué, pour tester sans matériel ni risque physique.
 - **Synoptiques** : studio glisser-déposer, 28 types de widgets, import de symboles SVG / Draw.io / JSON.
 - **Flux logiques** : seuil, hystérésis, PID, portes logiques, temporisation TON, formule, script Rhai.
 - **Alarmes ISA-18.2** à 4 états : journal, état conservé au redémarrage, bande morte anti-bagotement, mise en sommeil désactivable.

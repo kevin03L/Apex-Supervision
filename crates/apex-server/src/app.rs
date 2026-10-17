@@ -255,7 +255,7 @@ pub async fn run(
     // 6. Moteur
     if cfg.simulation.enabled {
         spawn_embedded_modbus_plc(cfg.simulation.modbus_slave_port).await;
-        warn!("SIMULATION active : automate Modbus embarqué, simulateur GTB et protocoles simulés disponibles");
+        warn!("SIMULATION active : automate Modbus embarqué, simulateur GTB et données de démonstration disponibles");
     }
     if cfg.safety.safe_mode {
         warn!("MODE SÛR actif : aucune commande ne sera envoyée aux équipements réels");
@@ -267,6 +267,7 @@ pub async fn run(
         safe_mode: cfg.safety.safe_mode,
         simulation_enabled: cfg.simulation.enabled,
         modbus_slave_port: cfg.simulation.modbus_slave_port,
+        data_dir: Some(eff.layout.data_dir.clone()),
     };
     // Le pool est partagé avec le moteur ; cette copie sert à le fermer à l'arrêt propre.
     let core = ScadaCore::new(Some(pool.clone()), &options);

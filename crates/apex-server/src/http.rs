@@ -1296,12 +1296,7 @@ mod tests {
 
     #[test]
     fn refus_hors_simulation_sur_une_ligne_et_adapte_au_protocole() {
-        for protocol in [
-            ProtocolType::Simulator,
-            ProtocolType::OpcUa,
-            ProtocolType::BacnetIp,
-            ProtocolType::SiemensS7,
-        ] {
+        for protocol in [ProtocolType::Simulator, ProtocolType::BacnetIp] {
             let message = simulation_only_message(&protocol);
             assert!(!message.contains('\n'), "{message}");
             assert!(!message.contains("  "), "{message}");
@@ -1310,6 +1305,6 @@ mod tests {
         let simulator = simulation_only_message(&ProtocolType::Simulator);
         assert!(simulator.contains("simulateur GTB"), "{simulator}");
         assert!(!simulator.contains("driver réel"), "{simulator}");
-        assert!(simulation_only_message(&ProtocolType::OpcUa).contains("OpcUa"));
+        assert!(simulation_only_message(&ProtocolType::BacnetIp).contains("BacnetIp"));
     }
 }
