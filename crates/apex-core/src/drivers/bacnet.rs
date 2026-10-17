@@ -504,42 +504,83 @@ impl BacnetClient {
                 Ok(Ok(n)) => n,
             };
             if let Some(apdu) = Self::parse_reply(&buf[..n]) {
-                let pdu_type = apdu[0] >> 4;
-                if apdu.len() < 2 || apdu[1] != invoke {
-                    continue; // réponse tardive à une requête précédente
+                if let Some(res) = Self::handle_apdu_reply(apdu, invoke, service) {
+                    return res;
                 }
-                return match pdu_type {
-                    2 => Ok(Vec::new()),                            // SimpleACK
-                    3 if apdu.len() >= 3 => Ok(apdu[3..].to_vec()), // ComplexACK
-                    5 => {
-                        let mut r = Reader::new(apdu.get(3..).unwrap_or(&[]));
-                        let class = match r.app_value() {
-                            Ok(AppValue::Enumerated(c)) => c,
-                            _ => u32::MAX,
-                        };
-                        let code = match r.app_value() {
-                            Ok(AppValue::Enumerated(c)) => c,
-                            _ => u32::MAX,
-                        };
-                        Err(RequestError::Device(error_text(class, code)))
-                    }
-                    6 => Err(RequestError::Device(format!(
-                        "requête rejetée par l'équipement (motif {})",
-                        apdu.get(2).copied().unwrap_or(0)
-                    ))),
-                    7 => Err(RequestError::Device(format!(
-                        "requête abandonnée par l'équipement (motif {}{})",
-                        apdu.get(2).copied().unwrap_or(0),
-                        if apdu.get(2) == Some(&4) {
-                            " : réponse segmentée non prise en charge"
-                        } else {
-                            ""
-                        }
-                    ))),
-                    _ => continue,
-                };
             }
         }
+    }
+
+    /// Décode la réponse APDU reçue suite à une requête confirmée.
+    /// Renvoie `None` s'il s'agit d'une réponse tardive ou hors séquence,
+    /// `Some(Ok(payload))` en cas de succès, ou `Some(Err(e))` en cas d'erreur/rejet/anomalie.
+    pub(crate) fn handle_apdu_reply(
+        apdu: &[u8],
+        invoke: u8,
+        service: u8,
+    ) -> Option<Result<Vec<u8>, RequestError>> {
+        if apdu.len() < 2 || apdu[1] != invoke {
+            return None; // réponse tardive à une requête précédente
+        }
+        let pdu_type = apdu[0] >> 4;
+        Some(match pdu_type {
+            2 => {
+                // SimpleACK
+                if apdu.len() >= 3 && apdu[2] != service {
+                    Err(RequestError::Device(format!(
+                        "service BACnet inattendu (reçu {}, attendu {})",
+                        apdu[2], service
+                    )))
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            3 => {
+                // ComplexACK : vérification du bit de segmentation SEG et du code de service (S-34)
+                if (apdu[0] & 0x08) != 0 {
+                    Err(RequestError::Device(
+                        "réponse segmentée non prise en charge".to_string(),
+                    ))
+                } else if apdu.len() < 3 {
+                    Err(RequestError::Device(
+                        "trame ComplexACK tronquée".to_string(),
+                    ))
+                } else if apdu[2] != service {
+                    Err(RequestError::Device(format!(
+                        "service BACnet inattendu (reçu {}, attendu {})",
+                        apdu[2], service
+                    )))
+                } else {
+                    Ok(apdu[3..].to_vec())
+                }
+            }
+            5 => {
+                let mut r = Reader::new(apdu.get(3..).unwrap_or(&[]));
+                let class = match r.app_value() {
+                    Ok(AppValue::Enumerated(c)) => c,
+                    _ => u32::MAX,
+                };
+                let code = match r.app_value() {
+                    Ok(AppValue::Enumerated(c)) => c,
+                    _ => u32::MAX,
+                };
+                Err(RequestError::Device(error_text(class, code)))
+            }
+            6 => Err(RequestError::Device(format!(
+                "requête rejetée par l'équipement (motif {})",
+                apdu.get(2).copied().unwrap_or(0)
+            ))),
+            7 => Err(RequestError::Device(format!(
+                "requête abandonnée par l'équipement (motif {}{})",
+                apdu.get(2).copied().unwrap_or(0),
+                if apdu.get(2) == Some(&4) {
+                    " : réponse segmentée non prise en charge"
+                } else {
+                    ""
+                }
+            ))),
+            _ => return None,
+        })
     }
 
     /// Numéro d'instance de l'objet Device : Who-Is envoyé à l'équipement, réponse I-Am.
@@ -1188,5 +1229,40 @@ mod tests {
         // Message réseau : ignoré
         let net = [0x81, 0x0A, 0x00, 0x07, 0x01, 0x80, 0x00];
         assert!(BacnetClient::parse_reply(&net).is_none());
+    }
+
+    #[test]
+    fn complex_ack_header_and_service_validation() {
+        let invoke = 42u8;
+        let service = 12u8; // ReadProperty
+        let payload = vec![0x3E, 0x44, 0x41, 0xAC, 0x00, 0x00, 0x3F];
+
+        // 1. ComplexACK valide et non segmenté avec le bon service
+        let mut valid_apdu = vec![0x30, invoke, service];
+        valid_apdu.extend_from_slice(&payload);
+        let res = BacnetClient::handle_apdu_reply(&valid_apdu, invoke, service).unwrap();
+        assert_eq!(res.unwrap(), payload);
+
+        // 2. ComplexACK avec bit SEG activé (0x38) -> rejeté comme réponse segmentée
+        let mut seg_apdu = vec![0x38, invoke, service];
+        seg_apdu.extend_from_slice(&payload);
+        let res = BacnetClient::handle_apdu_reply(&seg_apdu, invoke, service).unwrap();
+        assert!(matches!(res, Err(RequestError::Device(ref msg)) if msg.contains("segmentée")));
+
+        // 3. ComplexACK avec mauvais numéro de service (ex: 15 WriteProperty au lieu de 12) -> rejeté
+        let bad_service_apdu = vec![0x30, invoke, 15, 0x01, 0x02];
+        let res = BacnetClient::handle_apdu_reply(&bad_service_apdu, invoke, service).unwrap();
+        assert!(
+            matches!(res, Err(RequestError::Device(ref msg)) if msg.contains("service BACnet inattendu"))
+        );
+
+        // 4. ComplexACK tronqué (< 3 octets) -> rejeté
+        let trunc_apdu = vec![0x30, invoke];
+        let res = BacnetClient::handle_apdu_reply(&trunc_apdu, invoke, service).unwrap();
+        assert!(matches!(res, Err(RequestError::Device(ref msg)) if msg.contains("tronquée")));
+
+        // 5. Invoke ID différent -> ignoré (None)
+        let other_apdu = vec![0x30, invoke + 1, service, 0x00];
+        assert!(BacnetClient::handle_apdu_reply(&other_apdu, invoke, service).is_none());
     }
 }

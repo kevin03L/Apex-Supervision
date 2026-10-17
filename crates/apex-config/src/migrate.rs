@@ -9,11 +9,28 @@ use crate::{model::CONFIG_VERSION, store::ConfigError};
 /// Applique les migrations nécessaires. Renvoie la valeur migrée et la version d'origine si
 /// une migration a eu lieu.
 pub fn migrate(mut value: toml::Value) -> Result<(toml::Value, Option<u32>), ConfigError> {
-    let found = value
-        .get("config_version")
-        .and_then(|v| v.as_integer())
-        .map(|v| v.clamp(0, u32::MAX as i64) as u32)
-        .unwrap_or(0);
+    let found = match value.get("config_version") {
+        None => 0,
+        Some(v) => match v.as_integer() {
+            Some(i) if i >= 1 && i <= u32::MAX as i64 => i as u32,
+            Some(i) => {
+                return Err(ConfigError::Schema {
+                    path: std::path::PathBuf::new(),
+                    message: format!(
+                        "« config_version » invalide ({i}) : attendu un entier positif >= 1"
+                    ),
+                });
+            }
+            None => {
+                return Err(ConfigError::Schema {
+                    path: std::path::PathBuf::new(),
+                    message: format!(
+                        "« config_version » invalide ({v}) : attendu un entier positif >= 1"
+                    ),
+                });
+            }
+        },
+    };
 
     if found > CONFIG_VERSION {
         return Err(ConfigError::TooNew {
@@ -71,5 +88,22 @@ mod tests {
             migrate(v),
             Err(ConfigError::TooNew { found: 99, .. })
         ));
+    }
+
+    #[test]
+    fn invalid_versions_are_rejected() {
+        for bad in [
+            "config_version = -1\n",
+            "config_version = 0\n",
+            "config_version = '1'\n",
+            "config_version = 1.5\n",
+            "config_version = false\n",
+        ] {
+            let v: toml::Value = toml::from_str(bad).unwrap();
+            assert!(
+                matches!(migrate(v), Err(ConfigError::Schema { .. })),
+                "devrait rejeter {bad}"
+            );
+        }
     }
 }

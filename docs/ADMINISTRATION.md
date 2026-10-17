@@ -11,7 +11,7 @@ Ce guide s'adresse à la personne chargée d'installer et d'exploiter le moteur.
 | Réseau, port, emplacements, journalisation, rétention, sessions, mode sûr, simulation | Fichier `apex-scada.toml`, via l'**utilitaire desktop** ou la CLI | Au **redémarrage** du moteur |
 | Démarrage automatique du service | Utilitaire (onglet « État du moteur ») ou gestionnaire de services | Immédiate |
 | Comptes, mots de passe, rôles | IHM web (Administrateur) | Immédiate |
-| Mise en sommeil des alarmes (activation, durée maximale) | IHM web, onglet « Historian & Système » | Immédiate |
+| Mise en sommeil des alarmes (activation, durée maximale) | IHM web, onglet « Système » | Immédiate |
 | Drivers, variables, synoptiques, flux, plannings | IHM web | Immédiate |
 
 Le fichier de configuration a **un seul rédacteur à la fois**. Le moteur le lit sans jamais le réécrire. L'utilitaire et la CLI l'écrivent sous verrou, en écriture atomique (fichier temporaire, puis renommage), après une sauvegarde horodatée.
@@ -230,7 +230,7 @@ Les cinq protocoles industriels réels (Modbus TCP, MQTT, Siemens S7, OPC-UA, BA
 
 ## 6 bis. Drivers et automatismes : règles de contrôle
 
-- **Commandes depuis les synoptiques** : elles se font en deux temps. Un clic sur une commande (marche/arrêt, ouverture, curseur, consigne) la **sélectionne** : l'équipement s'encadre en orange et un bandeau indique la variable et la valeur, avec « Exécuter » et « Annuler ». Rien n'est envoyé tant que l'opérateur ne clique pas sur « Exécuter », dans les 10 secondes. Passé ce délai, sur « Annuler », sur Échap ou en changeant de synoptique ou d'onglet, la sélection est abandonnée. Un bouton impulsionnel s'arme au premier appui, puis envoie une seule impulsion (1 puis 0) tant qu'il est maintenu. L'écriture directe depuis l'écran Drivers & Tags et les boutons « Forcer » du planning restent immédiats.
+- **Commandes depuis les synoptiques** : elles se font en deux temps. Un clic sur une commande (marche/arrêt, ouverture, curseur, consigne) la **sélectionne** : l'équipement s'encadre en orange et un bandeau indique la variable et la valeur, avec « Exécuter » et « Annuler ». Rien n'est envoyé tant que l'opérateur ne clique pas sur « Exécuter », dans les 10 secondes. Passé ce délai, sur « Annuler », sur Échap ou en changeant de synoptique ou d'onglet, la sélection est abandonnée. Un bouton impulsionnel s'arme au premier appui, puis envoie une seule impulsion (1 puis 0) tant qu'il est maintenu. L'écriture directe depuis l'écran Équipements et les boutons « Forcer » du planning restent immédiats.
 - **Profil Visualisation** : il consulte la liste et le journal des alarmes et peut **acquitter une alarme à la fois**, après une fenêtre de confirmation. L'acquittement est tracé à son nom. L'acquittement global, la mise en sommeil et l'effacement des alarmes résolues restent réservés aux profils Superviseur et Administrateur. Il lit aussi les derniers points d'historique des variables affichées par une courbe de tendance, pour la pré-remplir.
 - **Courbes de tendance** : au chargement de la page, elles sont pré-remplies avec les 55 derniers points de l'historique. Une variable non historisée démarre vide, avec la mention « non historisée ».
 
@@ -269,7 +269,7 @@ Les cinq protocoles industriels réels (Modbus TCP, MQTT, Siemens S7, OPC-UA, BA
 | Quoi | Comment |
 |---|---|
 | Configuration (`apex-scada.toml`) | Automatique à chaque modification (20 versions dans `…/config/backups/`). Restauration depuis l'onglet « Sauvegardes ». |
-| Projet (drivers, variables, synoptiques, flux, plannings) | IHM web, onglet « Historian & Système » : export et import JSON (fichier `apex_supervision_projet_<date>.json`, 64 Mo au plus à l'import). |
+| Projet (drivers, variables, synoptiques, flux, plannings) | IHM web, onglet « Système » : export et import JSON (fichier `apex_supervision_projet_<date>.json`, 64 Mo au plus à l'import). |
 | Base complète (historique, comptes, audit) | Moteur arrêté : copie du fichier `apex-scada.db`, ainsi que des fichiers `-wal` et `-shm` s'ils existent (après un arrêt propre, le journal est reporté dans `apex-scada.db`, qui se suffit alors à lui-même). |
 
 ---

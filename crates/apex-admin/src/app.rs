@@ -571,9 +571,8 @@ impl AdminApp {
         let service = control::service_query();
         let has_service =
             self.base_layout.kind == LayoutKind::System && service.state.is_installed();
-        // Reprise proposée seulement si la base actuelle n'existe pas encore. Sous Linux, en
-        // installation système, elle exige root puis l'utilisateur apex-scada : elle passe par
-        // la procédure documentée et non par l'utilitaire.
+        // Sous Linux, en installation système, la reprise exige root puis l'utilisateur apex-scada :
+        // elle passe par la procédure documentée et non par l'utilitaire.
         let legacy_possible = cfg!(windows) || self.base_layout.kind == LayoutKind::Portable;
         // Proposée même si la base actuelle existe : le moteur la crée dès son premier démarrage.
         // Elle est alors décochée par défaut, et la reprise la sauvegarde avant de la remplacer.

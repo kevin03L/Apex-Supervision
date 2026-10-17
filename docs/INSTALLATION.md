@@ -50,7 +50,7 @@ Contenu installé :
 | Menu Démarrer | « Apex Supervision — Administration », « Assistant de configuration », « Documentation » |
 
 Permissions posées par l'installation, et réappliquées à chaque mise à jour (`apex-scada service permissions`) :
-- toute l'arborescence `C:ProgramDataApex Supervision` appartient au groupe Administrateurs, et l'héritage des droits de `C:ProgramData` (où tout utilisateur peut créer des fichiers) est coupé ;
+- toute l'arborescence `C:\ProgramData\Apex Supervision` appartient au groupe Administrateurs, et l'héritage des droits de `C:\ProgramData` (où tout utilisateur peut créer des fichiers) est coupé ;
 - `config` et `backups` : lecture par les utilisateurs et le service, modification par les administrateurs seulement ;
 - `logs` : écriture par le service, lecture par les utilisateurs (utilitaire desktop) ;
 - `data` et `run` : SYSTEM, Administrateurs et le service uniquement.

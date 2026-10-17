@@ -79,6 +79,32 @@ fn variable_modbus_inscriptible_en_lecture_seule_refusee() {
 }
 
 #[test]
+fn adresse_modbus_invalide_refusee_meme_en_lecture_seule() {
+    let srv = Server::start("tag-modbus-syntaxe");
+    let admin = srv.login(ADMIN);
+    let tag = |address: &str| -> Value {
+        json!({
+            "id": "MODBUS.GF01.Test_Syntaxe",
+            "label": "Test Syntaxe",
+            "module_source": MODBUS_DRIVER,
+            "protocol_address": address,
+            "data_type": "Float",
+            "unit": null,
+            "writable": false,
+            "deadband": 0.0,
+            "scale_factor": 1.0,
+            "scale_offset": 0.0,
+            "historize": false,
+            "alarm_config": { "enabled": false }
+        })
+    };
+    for bad in ["HR:0:FLOAT", "INVALIDE:0"] {
+        let r = srv.call("POST", "/api/tags", Some(&admin), Some(&tag(bad)));
+        assert_eq!(r.status, 400, "{bad} : {}", r.text());
+    }
+}
+
+#[test]
 fn flux_avec_script_rhai_invalide_refuse() {
     let srv = Server::start("rhai");
     let admin = srv.login(ADMIN);

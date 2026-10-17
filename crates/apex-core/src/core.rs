@@ -165,9 +165,12 @@ pub struct ScadaCore {
     driver_tx: broadcast::Sender<Vec<DriverConfig>>,
     flow_trace_tx: broadcast::Sender<FlowExecutionTrace>,
     ingest_tx: mpsc::Sender<TagState>,
-    history_tx: mpsc::Sender<TagState>,
+    history_tx: std::sync::Mutex<Option<mpsc::Sender<TagState>>>,
     /// Écrivain unique de l'état des alarmes (ordre des écritures garanti).
-    alarm_persist_tx: mpsc::UnboundedSender<AlarmPersistOp>,
+    alarm_persist_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<AlarmPersistOp>>>,
+    /// Écrivain unique du journal d'audit (ordre chronologique et vidage garanti à l'arrêt).
+    audit_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<AuditEntry>>>,
+    sqlite_writer_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Réglages système (mise en sommeil des alarmes...).
     settings: std::sync::RwLock<SystemSettings>,
     settings_tx: broadcast::Sender<SystemSettings>,
@@ -176,6 +179,16 @@ pub struct ScadaCore {
     pub shutdown_notify: Arc<Notify>,
     pub restart_requested: AtomicBool,
     db_pool: Option<SqlitePool>,
+}
+
+#[derive(Debug)]
+struct AuditEntry {
+    timestamp: String,
+    actor: String,
+    category: String,
+    action: String,
+    target: String,
+    details: String,
 }
 
 impl ScadaCore {
@@ -187,6 +200,7 @@ impl ScadaCore {
         let (ingest_tx, ingest_rx) = mpsc::channel::<TagState>(4096);
         let (history_tx, history_rx) = mpsc::channel::<TagState>(HISTORY_QUEUE_CAPACITY);
         let (alarm_persist_tx, alarm_persist_rx) = mpsc::unbounded_channel::<AlarmPersistOp>();
+        let (audit_tx, audit_rx) = mpsc::unbounded_channel::<AuditEntry>();
         let (settings_tx, _) = broadcast::channel::<SystemSettings>(16);
         let (session_revoke_tx, _) = broadcast::channel::<String>(256);
         let (snapshot_notify_tx, _) = broadcast::channel::<()>(64);
@@ -228,8 +242,10 @@ impl ScadaCore {
             driver_tx,
             flow_trace_tx,
             ingest_tx,
-            history_tx,
-            alarm_persist_tx,
+            history_tx: std::sync::Mutex::new(Some(history_tx)),
+            alarm_persist_tx: std::sync::Mutex::new(Some(alarm_persist_tx)),
+            audit_tx: std::sync::Mutex::new(Some(audit_tx)),
+            sqlite_writer_handles: tokio::sync::Mutex::new(Vec::new()),
             settings: std::sync::RwLock::new(SystemSettings::default()),
             settings_tx,
             session_revoke_tx,
@@ -244,12 +260,22 @@ impl ScadaCore {
         security::prepare_dummy_password_hash();
 
         Self::spawn_ingestion_worker(Arc::clone(&core), ingest_rx);
-        Self::spawn_history_writer(Arc::clone(&core), history_rx);
+        let mut handles = Vec::new();
+        if let Some(h) = Self::spawn_history_writer(Arc::clone(&core), history_rx) {
+            handles.push(h);
+        }
+        if let Some(h) = Self::spawn_alarm_persist_writer(Arc::clone(&core), alarm_persist_rx) {
+            handles.push(h);
+        }
+        if let Some(h) = Self::spawn_audit_writer(Arc::clone(&core), audit_rx) {
+            handles.push(h);
+        }
+        *core.sqlite_writer_handles.try_lock().expect("init lock") = handles;
+
         Self::spawn_history_retention_worker(Arc::clone(&core));
         Self::spawn_session_cleanup_worker(Arc::clone(&core));
         Self::spawn_driver_stats_broadcaster(Arc::clone(&core));
         Self::spawn_shelve_expiry_worker(Arc::clone(&core));
-        Self::spawn_alarm_persist_writer(Arc::clone(&core), alarm_persist_rx);
 
         core
     }
@@ -761,6 +787,25 @@ impl ScadaCore {
         self.stop_all_drivers();
     }
 
+    /// Ferme formellement les canaux des écrivains SQLite (historique, alarmes, audit)
+    /// et attend la fin complète de l'écriture de leurs files en mémoire avant la fermeture du pool (S-37).
+    pub async fn drain_sqlite_writers(&self) {
+        if let Ok(mut tx) = self.history_tx.lock() {
+            tx.take();
+        }
+        if let Ok(mut tx) = self.alarm_persist_tx.lock() {
+            tx.take();
+        }
+        if let Ok(mut tx) = self.audit_tx.lock() {
+            tx.take();
+        }
+
+        let mut handles = self.sqlite_writer_handles.lock().await;
+        for handle in handles.drain(..) {
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        }
+    }
+
     /// Met le moteur SCADA complet hors tension (arrêt de tous les drivers + pause acquisition) tout en gardant l'IHM disponible pour un rallumage à distance.
     pub fn power_off_all_systems(&self, actor: &str) {
         self.set_acquisition_paused(actor, true);
@@ -1051,6 +1096,7 @@ impl ScadaCore {
 
     /// Retire un tag de toutes les structures temps réel (sans toucher à la base).
     fn forget_tag(&self, tag_id: &str) -> Option<RegisteredTag> {
+        self.flow_runtime.forget_outputs_for_tag(tag_id);
         let removed = self.tags_registry.remove(tag_id).map(|(_, t)| t);
         self.tags_state.remove(tag_id);
         self.last_good_values.remove(tag_id);
@@ -1168,7 +1214,13 @@ impl ScadaCore {
 
             if historize && self.db_pool.is_some() {
                 // File bornée et non bloquante : l'écrivain groupé gère la persistance.
-                if self.history_tx.try_send(incoming).is_err() {
+                let sent_ok = self
+                    .history_tx
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|tx| tx.try_send(incoming).is_ok()))
+                    .unwrap_or(false);
+                if !sent_ok {
                     self.history_dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -1677,17 +1729,19 @@ impl ScadaCore {
             Some(a) => AlarmPersistOp::Upsert(Box::new(a.clone())),
             None => AlarmPersistOp::Delete(alarm_id.to_string()),
         };
-        let _ = self.alarm_persist_tx.send(op);
+        if let Ok(guard) = self.alarm_persist_tx.lock() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(op);
+            }
+        }
     }
 
     fn spawn_alarm_persist_writer(
         core: Arc<Self>,
         mut rx: mpsc::UnboundedReceiver<AlarmPersistOp>,
-    ) {
-        let Some(pool) = core.db_pool.clone() else {
-            return;
-        };
-        tokio::spawn(async move {
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let pool = core.db_pool.clone()?;
+        Some(tokio::spawn(async move {
             while let Some(op) = rx.recv().await {
                 match op {
                     AlarmPersistOp::Upsert(alarm) => match serde_json::to_string(&alarm) {
@@ -1714,7 +1768,7 @@ impl ScadaCore {
                     ),
                 }
             }
-        });
+        }))
     }
 
     pub fn acknowledge_all_alarms(&self, operator: &str) -> Vec<AlarmInstance> {
@@ -2555,31 +2609,48 @@ impl ScadaCore {
         target: &str,
         details: &str,
     ) {
-        if let Some(pool) = &self.db_pool {
-            let pool_c = pool.clone();
-            let a = actor.to_string();
-            let c = category.to_string();
-            let act = action.to_string();
-            let tgt = target.to_string();
-            let det = details.to_string();
-            tokio::spawn(async move {
+        if self.db_pool.is_none() {
+            return;
+        }
+        let entry = AuditEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: actor.to_string(),
+            category: category.to_string(),
+            action: action.to_string(),
+            target: target.to_string(),
+            details: details.to_string(),
+        };
+        if let Ok(guard) = self.audit_tx.lock() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(entry);
+            }
+        }
+    }
+
+    fn spawn_audit_writer(
+        core: Arc<Self>,
+        mut rx: mpsc::UnboundedReceiver<AuditEntry>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let pool = core.db_pool.clone()?;
+        Some(tokio::spawn(async move {
+            while let Some(e) = rx.recv().await {
                 log_db_error(
                     "journal d'audit",
                     sqlx::query(
                         "INSERT INTO audit_logs (timestamp, actor, category, action, target, details)
                          VALUES (?, ?, ?, ?, ?, ?)",
                     )
-                    .bind(Utc::now().to_rfc3339())
-                    .bind(a)
-                    .bind(c)
-                    .bind(act)
-                    .bind(tgt)
-                    .bind(det)
-                    .execute(&pool_c)
+                    .bind(&e.timestamp)
+                    .bind(&e.actor)
+                    .bind(&e.category)
+                    .bind(&e.action)
+                    .bind(&e.target)
+                    .bind(&e.details)
+                    .execute(&pool)
                     .await,
                 );
-            });
-        }
+            }
+        }))
     }
 
     pub async fn query_audit_logs(&self, limit: u32) -> Result<Vec<AuditLogEntry>, ScadaError> {
@@ -3261,11 +3332,12 @@ impl ScadaCore {
 
     /// Écrivain unique de l'historique : regroupe les points (500 max ou 1 s) en une seule
     /// requête `INSERT` multi-lignes, au lieu d'une écriture disque par changement de valeur.
-    fn spawn_history_writer(core: Arc<Self>, mut rx: mpsc::Receiver<TagState>) {
-        let Some(pool) = core.db_pool.clone() else {
-            return;
-        };
-        tokio::spawn(async move {
+    fn spawn_history_writer(
+        core: Arc<Self>,
+        mut rx: mpsc::Receiver<TagState>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let pool = core.db_pool.clone()?;
+        Some(tokio::spawn(async move {
             let mut batch: Vec<TagState> = Vec::with_capacity(HISTORY_BATCH_MAX);
             loop {
                 let Some(first) = rx.recv().await else {
@@ -3282,7 +3354,7 @@ impl ScadaCore {
                 write_history_batch(&pool, &batch).await;
                 batch.clear();
             }
-        });
+        }))
     }
 
     /// Purge périodique (toutes les 6 h) des points d'historique plus anciens que la rétention.
@@ -3929,6 +4001,13 @@ impl ScadaCore {
         };
 
         if !account.enabled {
+            self.record_audit(
+                &key,
+                "AUTH",
+                "LOGIN_REFUSED",
+                &key,
+                "Connexion refusée : compte désactivé",
+            );
             return Err(ScadaError::Forbidden(
                 "Ce compte utilisateur est désactivé par l'administrateur".to_string(),
             ));
@@ -3952,6 +4031,14 @@ impl ScadaCore {
                 ));
             }
             if !current.enabled {
+                drop(current);
+                self.record_audit(
+                    &key,
+                    "AUTH",
+                    "LOGIN_REFUSED",
+                    &key,
+                    "Connexion refusée : compte désactivé",
+                );
                 return Err(ScadaError::Forbidden(
                     "Ce compte utilisateur est désactivé par l'administrateur".to_string(),
                 ));
@@ -5512,6 +5599,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_account_login_rejected_and_drained() {
+        let core = core_with_user("visu_disabled", "visu123");
+        if let Some(mut user) = core.users.get_mut("visu_disabled") {
+            user.enabled = false;
+        }
+        let res = core
+            .login(login_req("visu_disabled", "visu123"), None)
+            .await;
+        assert!(matches!(res, Err(ScadaError::Forbidden(_))));
+        assert_eq!(res.unwrap_err().http_status(), 403);
+        // Le vidage des writers sqlite se déroule sans erreur
+        core.drain_sqlite_writers().await;
+    }
+
+    #[tokio::test]
     async fn password_reset_by_admin_revokes_sessions() {
         let core = core_with_user("visu", "visu123");
         let session = core
@@ -6364,5 +6466,21 @@ mod tests {
         core.upsert_tag("admin", tag).await.unwrap();
         let al = core.alarms.get("UP_ALARM_TAG").unwrap().clone();
         assert_eq!(al.state, AlarmLifecycleState::ClearedUnack);
+    }
+
+    #[tokio::test]
+    async fn forget_tag_clears_flow_runtime_outputs() {
+        let core = ScadaCore::new(None, &engine_options(true));
+        core.register_tag(tag(1.0, 0.0), None);
+        core.flow_runtime.last_outputs.insert(
+            "flow_node_1".to_string(),
+            ("T".to_string(), TagValue::Float(42.0)),
+        );
+        assert_eq!(core.flow_runtime.last_outputs.len(), 1);
+        core.delete_tag("admin", "T").await.unwrap();
+        assert!(
+            core.flow_runtime.last_outputs.is_empty(),
+            "last_outputs non vidé à la suppression du tag"
+        );
     }
 }
