@@ -383,9 +383,11 @@ pub fn run_elevated(exe: &Path, args: &[&str], wait: bool) -> Result<i32, String
         })
         .collect::<Vec<_>>()
         .join(",");
+    let window_style = if wait { " -WindowStyle Hidden" } else { "" };
     let mut script = format!(
-        "$ErrorActionPreference='Stop'; $p = Start-Process -FilePath {} -Verb RunAs -WindowStyle Hidden -PassThru",
-        ps_quote(&exe.to_string_lossy())
+        "$ErrorActionPreference='Stop'; $p = Start-Process -FilePath {} -Verb RunAs{} -PassThru",
+        ps_quote(&exe.to_string_lossy()),
+        window_style
     );
     if !args.is_empty() {
         script.push_str(&format!(" -ArgumentList {arg_list}"));
@@ -406,9 +408,7 @@ pub fn run_elevated(exe: &Path, args: &[&str], wait: bool) -> Result<i32, String
         return Err("élévation refusée : l'action n'a pas été effectuée".into());
     }
     match out.status.code() {
-        Some(code) if !stderr.trim().is_empty() && code != 0 && !wait => {
-            Err(stderr.trim().to_string())
-        }
+        Some(code) if !stderr.trim().is_empty() && code != 0 => Err(stderr.trim().to_string()),
         Some(code) => Ok(code),
         None => Err("élévation interrompue".into()),
     }

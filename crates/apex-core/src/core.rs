@@ -171,6 +171,8 @@ pub struct ScadaCore {
     /// Réglages système (mise en sommeil des alarmes...).
     settings: std::sync::RwLock<SystemSettings>,
     settings_tx: broadcast::Sender<SystemSettings>,
+    session_revoke_tx: broadcast::Sender<String>,
+    snapshot_notify_tx: broadcast::Sender<()>,
     pub shutdown_notify: Arc<Notify>,
     pub restart_requested: AtomicBool,
     db_pool: Option<SqlitePool>,
@@ -186,6 +188,8 @@ impl ScadaCore {
         let (history_tx, history_rx) = mpsc::channel::<TagState>(HISTORY_QUEUE_CAPACITY);
         let (alarm_persist_tx, alarm_persist_rx) = mpsc::unbounded_channel::<AlarmPersistOp>();
         let (settings_tx, _) = broadcast::channel::<SystemSettings>(16);
+        let (session_revoke_tx, _) = broadcast::channel::<String>(256);
+        let (snapshot_notify_tx, _) = broadcast::channel::<()>(64);
 
         let core = Arc::new(Self {
             started_at: Utc::now(),
@@ -228,6 +232,8 @@ impl ScadaCore {
             alarm_persist_tx,
             settings: std::sync::RwLock::new(SystemSettings::default()),
             settings_tx,
+            session_revoke_tx,
+            snapshot_notify_tx,
             shutdown_notify: Arc::new(Notify::new()),
             restart_requested: AtomicBool::new(false),
             db_pool,
@@ -366,6 +372,11 @@ impl ScadaCore {
         self.ensure_protocol_available(&config.protocol)?;
         for tag in &config.tags {
             security::validate_id("tag", &tag.id)?;
+            if !tag.scale_factor.is_finite() || tag.scale_factor.abs() < 1e-9 {
+                return Err(ScadaError::BadRequest(
+                    "Le facteur d'échelle doit être un nombre non nul".to_string(),
+                ));
+            }
             validate_tag_for_protocol(&config.protocol, tag)?;
         }
         let driver_id = config.id.clone();
@@ -1026,6 +1037,15 @@ impl ScadaCore {
             ),
         );
 
+        // S-31: Réévaluation ou clôture de l'alarme active lors du changement de seuils ou désactivation
+        if let Some(state) = self.tags_state.get(&tag.id).map(|s| s.clone()) {
+            if !tag.alarm_config.enabled {
+                self.apply_alarm_transition(&tag.id, &tag.id, &tag.label, None, None, state.value);
+            } else {
+                self.evaluate_alarm_for_tag(&tag, &state);
+            }
+        }
+
         Ok(view)
     }
 
@@ -1085,13 +1105,23 @@ impl ScadaCore {
         if let Some(meta) = &tag_meta_opt {
             let has_scaling =
                 (meta.scale_factor - 1.0).abs() > 1e-9 || meta.scale_offset.abs() > 1e-9;
-            if from_device && has_scaling && meta.data_type == crate::models::TagDataType::Float {
-                if let (TagValue::Float(_) | TagValue::Int(_), Some(raw)) =
-                    (&incoming.value, incoming.value.as_f64())
-                {
-                    let scaled =
-                        ((raw * meta.scale_factor + meta.scale_offset) * 1000.0).round() / 1000.0;
-                    incoming.value = TagValue::Float(scaled);
+            if from_device && has_scaling {
+                if meta.data_type == crate::models::TagDataType::Float {
+                    if let (TagValue::Float(_) | TagValue::Int(_), Some(raw)) =
+                        (&incoming.value, incoming.value.as_f64())
+                    {
+                        let scaled = ((raw * meta.scale_factor + meta.scale_offset) * 1000.0)
+                            .round()
+                            / 1000.0;
+                        incoming.value = TagValue::Float(scaled);
+                    }
+                } else if meta.data_type == crate::models::TagDataType::Int {
+                    if let (TagValue::Float(_) | TagValue::Int(_), Some(raw)) =
+                        (&incoming.value, incoming.value.as_f64())
+                    {
+                        let scaled = (raw * meta.scale_factor + meta.scale_offset).round() as i64;
+                        incoming.value = TagValue::Int(scaled);
+                    }
                 }
             }
         }
@@ -1219,12 +1249,25 @@ impl ScadaCore {
                     existing.acked_by = None;
                     changed = true;
                     journal_event = Some(("AGGRAVATION", sev, msg.clone()));
+                } else if severity_rank(sev) < severity_rank(existing.severity) {
+                    // S-25: Désescalade (ex. HH → H) : journalisation explicite de la transition
+                    if existing.level != level {
+                        journal_event = Some(("DESESCALADE", sev, msg.clone()));
+                        changed = true;
+                    }
                 } else if existing.message != msg {
                     changed = true;
                 }
                 existing.message = msg;
                 existing.level = level;
-                existing.severity = sev;
+                // S-25: Conserver la gravité maximale atteinte tant que l'alarme n'est pas acquittée
+                if existing.state == AlarmLifecycleState::ActiveUnack {
+                    if severity_rank(sev) >= severity_rank(existing.severity) {
+                        existing.severity = sev;
+                    }
+                } else {
+                    existing.severity = sev;
+                }
             }
             (Some((msg, sev)), None) => {
                 let instance = AlarmInstance {
@@ -1487,6 +1530,18 @@ impl ScadaCore {
 
     pub fn subscribe_settings(&self) -> broadcast::Receiver<SystemSettings> {
         self.settings_tx.subscribe()
+    }
+
+    pub fn subscribe_session_revocation(&self) -> broadcast::Receiver<String> {
+        self.session_revoke_tx.subscribe()
+    }
+
+    pub fn subscribe_snapshot_notify(&self) -> broadcast::Receiver<()> {
+        self.snapshot_notify_tx.subscribe()
+    }
+
+    pub fn notify_snapshot(&self) {
+        let _ = self.snapshot_notify_tx.send(());
     }
 
     /// Modifie les réglages système. Désactiver la mise en sommeil réveille immédiatement
@@ -2568,10 +2623,12 @@ impl ScadaCore {
             dashboards: self.get_all_dashboards(),
             flows: self.get_all_flows(),
             schedules: self.get_all_schedules(),
+            symbols: self.get_all_symbols(),
+            settings: Some(self.get_settings()),
         }
     }
 
-    /// Restaure une archive projet complète (drivers, tags, synoptiques, flux, plannings)
+    /// Restaure une archive projet complète (drivers, tags, synoptiques, flux, plannings, symboles, réglages)
     /// et renvoie un rapport détaillé, erreurs comprises.
     pub async fn import_project_bundle(
         self: &Arc<Self>,
@@ -2580,6 +2637,7 @@ impl ScadaCore {
     ) -> Result<serde_json::Value, ScadaError> {
         let mut errors: Vec<String> = Vec::new();
         let mut counts = [0usize; 5];
+        let mut symbols_imported = 0usize;
         // Drivers non importés (simulateur GTB sans simulation, configuration invalide) :
         // leurs variables sont écartées elles aussi.
         let mut ignored_drivers: std::collections::HashSet<String> = Default::default();
@@ -2598,18 +2656,27 @@ impl ScadaCore {
                 ignored_drivers.insert(id);
                 continue;
             }
-            // Une variable invalide pour le protocole (ex. registre d'entrée Modbus déclaré
-            // inscriptible) est écartée seule, sans faire échouer l'import de tout le driver.
+            // S-23: Une variable avec identifiant invalide ou non supportée par le protocole
+            // est écartée seule, sans faire échouer l'import de tout le driver.
             let protocol = drv.protocol.clone();
-            drv.tags
-                .retain(|tag| match validate_tag_for_protocol(&protocol, tag) {
+            drv.tags.retain(|tag| {
+                if let Err(e) = security::validate_id("tag", &tag.id) {
+                    errors.push(format!(
+                        "Tag '{}' ignoré (identifiant invalide) : {}",
+                        tag.id, e
+                    ));
+                    ignored_tag_ids.insert(tag.id.clone());
+                    return false;
+                }
+                match validate_tag_for_protocol(&protocol, tag) {
                     Ok(()) => true,
                     Err(e) => {
                         errors.push(format!("Tag '{}' ignoré : {}", tag.id, e));
                         ignored_tag_ids.insert(tag.id.clone());
                         false
                     }
-                });
+                }
+            });
             match self.register_and_start_driver(actor, drv).await {
                 Ok(_) => counts[0] += 1,
                 // Un driver déclaré mais non démarrable (équipement absent) reste importé
@@ -2632,6 +2699,17 @@ impl ScadaCore {
             if ignored_tag_ids.contains(&tag.id) {
                 continue;
             }
+            // S-23: Si la variable référence un driver inexistant (ni interne ni connu)
+            if tag.module_source != "internal"
+                && !self.drivers_config.contains_key(&tag.module_source)
+            {
+                errors.push(format!(
+                    "Tag '{}' ignoré : driver source '{}' introuvable",
+                    tag.id, tag.module_source
+                ));
+                ignored_tags += 1;
+                continue;
+            }
             let id = tag.id.clone();
             match self.upsert_tag(actor, tag).await {
                 Ok(_) => counts[1] += 1,
@@ -2640,7 +2718,7 @@ impl ScadaCore {
         }
         if ignored_tags > 0 {
             errors.push(format!(
-                "{} variable(s) rattachée(s) à un driver non importé, ignorée(s)",
+                "{} variable(s) rattachée(s) à un driver non importé ou manquant, ignorée(s)",
                 ignored_tags
             ));
         }
@@ -2665,14 +2743,32 @@ impl ScadaCore {
                 Err(e) => errors.push(format!("Planning '{}' : {}", id, e)),
             }
         }
+        // S-20: Restauration des symboles personnalisés et des paramètres système
+        for sym in bundle.symbols {
+            let id = sym.id.clone();
+            let mut imp = Vec::new();
+            let mut rej = Vec::new();
+            self.store_symbol(sym, &mut imp, &mut rej).await;
+            if !imp.is_empty() {
+                symbols_imported += 1;
+            }
+            for r in rej {
+                errors.push(format!("Symbole '{}' : {}", id, r));
+            }
+        }
+        if let Some(sett) = bundle.settings {
+            if let Err(e) = self.update_settings(actor, sett).await {
+                errors.push(format!("Réglages système : {}", e));
+            }
+        }
         self.record_audit(
             actor,
             "SYSTÈME",
             "IMPORT_PROJECT",
             "Backup JSON",
             &format!(
-                "Restauration : {} drivers, {} tags, {} synoptiques, {} flux, {} plannings, {} erreur(s)",
-                counts[0], counts[1], counts[2], counts[3], counts[4], errors.len()
+                "Restauration : {} drivers, {} tags, {} synoptiques, {} flux, {} plannings, {} symboles, {} erreur(s)",
+                counts[0], counts[1], counts[2], counts[3], counts[4], symbols_imported, errors.len()
             ),
         );
         Ok(serde_json::json!({
@@ -2682,6 +2778,7 @@ impl ScadaCore {
             "dashboards": counts[2],
             "flows": counts[3],
             "schedules": counts[4],
+            "symbols": symbols_imported,
             "ignored_drivers": ignored_drivers.len(),
             "ignored_tags": ignored_tags,
             "errors": errors,
@@ -3050,9 +3147,11 @@ impl ScadaCore {
         // Écritures sérialisées, et toujours avec l'état courant du compte en mémoire : deux
         // modifications concurrentes ne peuvent pas laisser en base une copie périmée.
         let _guard = self.users_persist_lock.lock().await;
-        let current = self.users.get(&account.username).map(|u| u.clone());
-        let account = current.as_ref().unwrap_or(account);
-        match serde_json::to_string(account) {
+        let Some(account) = self.users.get(&account.username).map(|u| u.clone()) else {
+            // S-21: Le compte a été supprimé entre-temps ou n'existe plus en mémoire : on ne réinsère rien
+            return;
+        };
+        match serde_json::to_string(&account) {
             Ok(json) => log_db_error(
                 "persistance utilisateur",
                 sqlx::query(
@@ -3959,6 +4058,7 @@ impl ScadaCore {
         let clean = token.strip_prefix("Bearer ").unwrap_or(token).trim();
         if let Some((_, session)) = self.sessions.remove(&security::session_key(clean)) {
             self.persist_sessions().await;
+            let _ = self.session_revoke_tx.send(session.username.clone());
             self.record_audit(
                 &session.username,
                 "AUTH",
@@ -4102,6 +4202,7 @@ impl ScadaCore {
         self.sessions
             .retain(|key, s| s.username != username || keep.as_deref() == Some(key.as_str()));
         self.persist_sessions().await;
+        let _ = self.session_revoke_tx.send(username.to_string());
     }
 
     fn active_admin_count_excluding(&self, username: &str) -> usize {
@@ -4228,6 +4329,9 @@ impl ScadaCore {
                 "Vous ne pouvez pas supprimer votre propre compte".to_string(),
             ));
         }
+
+        let _guard = self.users_persist_lock.lock().await;
+
         self.users.remove(&uname).ok_or_else(|| {
             ScadaError::BadRequest(format!("Utilisateur '{}' introuvable", uname))
         })?;
@@ -4824,13 +4928,17 @@ pub(crate) fn log_db_error<T>(context: &str, res: Result<T, sqlx::Error>) {
 /// Convertit une valeur d'ingénierie en valeur brute équipement (inverse de la mise à l'échelle).
 fn to_device_value(meta: &RegisteredTag, value: &TagValue) -> TagValue {
     let has_scaling = (meta.scale_factor - 1.0).abs() > 1e-9 || meta.scale_offset.abs() > 1e-9;
-    if has_scaling
-        && meta.data_type == crate::models::TagDataType::Float
-        && meta.scale_factor.abs() > 1e-9
-    {
-        if let Some(f) = value.as_f64() {
-            let raw = (f - meta.scale_offset) / meta.scale_factor;
-            return TagValue::Float((raw * 1_000_000.0).round() / 1_000_000.0);
+    if has_scaling && meta.scale_factor.abs() > 1e-9 {
+        if meta.data_type == crate::models::TagDataType::Float {
+            if let Some(f) = value.as_f64() {
+                let raw = (f - meta.scale_offset) / meta.scale_factor;
+                return TagValue::Float((raw * 1_000_000.0).round() / 1_000_000.0);
+            }
+        } else if meta.data_type == crate::models::TagDataType::Int {
+            if let Some(f) = value.as_f64() {
+                let raw = ((f - meta.scale_offset) / meta.scale_factor).round() as i64;
+                return TagValue::Int(raw);
+            }
         }
     }
     value.clone()
@@ -5800,6 +5908,8 @@ mod tests {
             dashboards: vec![],
             flows: vec![],
             schedules: vec![],
+            symbols: vec![],
+            settings: None,
         };
         let report = core.import_project_bundle("test", bundle).await.unwrap();
         assert_eq!(report["drivers"], 1);
@@ -6042,5 +6152,217 @@ mod tests {
         for f in core.get_all_flows() {
             assert!(validate_flow(&f).is_ok(), "{}", f.id);
         }
+    }
+
+    #[tokio::test]
+    async fn test_s19_int_scaling_in_ingest_and_device_value() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        let mut tag = driver_tag("INT_SCALE_TAG", "internal", "mem", true);
+        tag.data_type = crate::models::TagDataType::Int;
+        tag.scale_factor = 10.0;
+        tag.scale_offset = 5.0;
+        core.register_tag(tag.clone(), None);
+
+        // Ingestion depuis driver : raw = 2 -> (2 * 10 + 5) = 25
+        let incoming = TagState {
+            tag_id: "INT_SCALE_TAG".into(),
+            value: TagValue::Int(2),
+            quality: Quality::Good,
+            timestamp: Utc::now(),
+        };
+        core.ingest_state(incoming, true);
+        assert_eq!(
+            core.tags_state
+                .get("INT_SCALE_TAG")
+                .map(|s| s.value.clone())
+                .unwrap(),
+            TagValue::Int(25)
+        );
+
+        // Conversion inverse vers l'équipement : val = 25 -> ((25 - 5) / 10) = 2
+        let to_dev = to_device_value(&tag, &TagValue::Int(25));
+        assert_eq!(to_dev, TagValue::Int(2));
+    }
+
+    #[tokio::test]
+    async fn test_s20_bundle_symbols_and_settings_export_import() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        let sym = SymbolLibraryItem {
+            id: "custom_pump".into(),
+            name: "Pompe sur mesure".into(),
+            category: "custom".into(),
+            standard: "custom".into(),
+            svg_content:
+                r#"<svg xmlns="http://www.w3.org/2000/svg"><circle cx="10" cy="10" r="5"/></svg>"#
+                    .into(),
+            default_width: 50.0,
+            default_height: 50.0,
+            animate_rotation: false,
+            colorize_on_state: true,
+            created_at: Utc::now(),
+        };
+        let mut imp = Vec::new();
+        let mut rej = Vec::new();
+        core.store_symbol(sym.clone(), &mut imp, &mut rej).await;
+        assert_eq!(imp.len(), 1);
+
+        let mut sett = core.get_settings();
+        sett.alarm_shelve_max_minutes = 120;
+        core.update_settings("admin", sett.clone()).await.unwrap();
+
+        // Export bundle
+        let bundle = core.export_project_bundle();
+        assert!(bundle.symbols.iter().any(|s| s.id == "custom_pump"));
+        assert_eq!(
+            bundle.settings.as_ref().map(|s| s.alarm_shelve_max_minutes),
+            Some(120)
+        );
+
+        // Import dans une autre instance
+        let core2 = ScadaCore::new(None, &engine_options(false));
+        let res = core2.import_project_bundle("admin", bundle).await.unwrap();
+        assert_eq!(res["symbols"], 5);
+        assert!(core2.symbols_library.contains_key("custom_pump"));
+        assert_eq!(core2.get_settings().alarm_shelve_max_minutes, 120);
+    }
+
+    #[tokio::test]
+    async fn test_s21_user_persistence_lock_and_deleted_user() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        let user = UserAccount {
+            username: "operator_test".into(),
+            display_name: "Test Operator".into(),
+            role: UserRole::Supervisor,
+            password_hash: "hash".into(),
+            department: "IT".into(),
+            enabled: true,
+            created_at: Utc::now(),
+            last_login_at: None,
+        };
+        core.users.insert(user.username.clone(), user.clone());
+        assert!(core.users.contains_key("operator_test"));
+
+        // Suppression de l'utilisateur
+        core.delete_user("admin", "operator_test").await.unwrap();
+        assert!(!core.users.contains_key("operator_test"));
+
+        // Persist concurrent tardif ne doit pas le réinsérer
+        core.persist_user(&user).await;
+        assert!(!core.users.contains_key("operator_test"));
+    }
+
+    #[tokio::test]
+    async fn test_s23_import_tag_validation_and_orphan_rejection() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        let drv = driver(
+            "DRV_VALID",
+            ProtocolType::ModbusTcp,
+            vec![
+                driver_tag("DRV_VALID.T1", "DRV_VALID", "HR:0:FLOAT32", false),
+                driver_tag("DRV_VALID.INVALID ID!!", "DRV_VALID", "HR:1:FLOAT32", false),
+            ],
+        );
+        let bundle = ProjectBackupBundle {
+            exported_at: Utc::now(),
+            version: APP_VERSION.to_string(),
+            drivers: vec![drv],
+            tags: vec![
+                driver_tag("DRV_VALID.T1", "DRV_VALID", "HR:0:FLOAT32", false),
+                // Tag orphelin rattaché à un driver inexistant
+                driver_tag("ORPHAN_TAG", "NON_EXISTENT_DRV", "HR:0:FLOAT32", false),
+            ],
+            dashboards: vec![],
+            flows: vec![],
+            schedules: vec![],
+            symbols: vec![],
+            settings: None,
+        };
+        let rep = core.import_project_bundle("admin", bundle).await.unwrap();
+        assert_eq!(rep["drivers"], 1);
+        assert_eq!(rep["tags"], 1);
+        assert_eq!(rep["ignored_tags"], 1); // ORPHAN_TAG ignoré
+        assert!(core.tags_registry.contains_key("DRV_VALID.T1"));
+        assert!(!core.tags_registry.contains_key("DRV_VALID.INVALID ID!!"));
+        assert!(!core.tags_registry.contains_key("ORPHAN_TAG"));
+    }
+
+    #[tokio::test]
+    async fn test_s25_alarm_deescalation_preserves_unack_critical() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        let mut tag = driver_tag("ALARM_TAG", "internal", "mem", true);
+        tag.alarm_config.enabled = true;
+        tag.alarm_config.high = Some(50.0);
+        tag.alarm_config.high_high = Some(80.0);
+        core.register_tag(tag.clone(), None);
+
+        // 1. Passage en HighHigh (Critical, ActiveUnack)
+        let s1 = TagState {
+            tag_id: "ALARM_TAG".into(),
+            value: TagValue::Float(85.0),
+            quality: Quality::Good,
+            timestamp: Utc::now(),
+        };
+        core.evaluate_alarm_for_tag(&tag, &s1);
+        let al = core.alarms.get("ALARM_TAG").unwrap().clone();
+        assert_eq!(al.severity, AlarmSeverity::Critical);
+        assert_eq!(al.state, AlarmLifecycleState::ActiveUnack);
+
+        // 2. Désescalade vers High (Warning) avant acquittement
+        let s2 = TagState {
+            tag_id: "ALARM_TAG".into(),
+            value: TagValue::Float(60.0),
+            quality: Quality::Good,
+            timestamp: Utc::now(),
+        };
+        core.evaluate_alarm_for_tag(&tag, &s2);
+        let al2 = core.alarms.get("ALARM_TAG").unwrap().clone();
+        // Doit conserver la sévérité Critical non acquittée
+        assert_eq!(al2.severity, AlarmSeverity::Critical);
+        assert_eq!(al2.level, Some(AlarmLevel::High));
+    }
+
+    #[tokio::test]
+    async fn test_s31_scale_factor_validation_and_alarm_reeval_on_upsert() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        let mut drv = driver(
+            "MB_SCALE_TEST",
+            ProtocolType::ModbusTcp,
+            vec![driver_tag(
+                "MB_SCALE_TEST.T1",
+                "MB_SCALE_TEST",
+                "HR:0:FLOAT32",
+                false,
+            )],
+        );
+        drv.tags[0].scale_factor = 0.0;
+        let err = core
+            .register_and_start_driver("admin", drv)
+            .await
+            .unwrap_err();
+        assert_eq!(err.http_status(), 400);
+
+        // Réévaluation d'alarme sur upsert_tag
+        let mut tag = driver_tag("UP_ALARM_TAG", "internal", "mem", true);
+        tag.alarm_config.enabled = true;
+        tag.alarm_config.high = Some(50.0);
+        core.register_tag(tag.clone(), None);
+        core.tags_state.insert(
+            "UP_ALARM_TAG".into(),
+            TagState {
+                tag_id: "UP_ALARM_TAG".into(),
+                value: TagValue::Float(60.0),
+                quality: Quality::Good,
+                timestamp: Utc::now(),
+            },
+        );
+        let s = core.tags_state.get("UP_ALARM_TAG").unwrap().clone();
+        core.evaluate_alarm_for_tag(&tag, &s);
+        assert!(core.alarms.contains_key("UP_ALARM_TAG"));
+
+        // Désactivation de l'alarme lors d'un upsert_tag -> l'alarme active doit être clôturée
+        tag.alarm_config.enabled = false;
+        core.upsert_tag("admin", tag).await.unwrap();
+        let al = core.alarms.get("UP_ALARM_TAG").unwrap().clone();
+        assert_eq!(al.state, AlarmLifecycleState::ClearedUnack);
     }
 }

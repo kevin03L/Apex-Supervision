@@ -1,4 +1,4 @@
-﻿; =============================================================================
+; =============================================================================
 ; Installateur Windows d'Apex Supervision (Inno Setup 6.3 ou plus récent)
 ;
 ; Construction : packaging\windows\build-installer.ps1, qui compile les binaires en
@@ -107,17 +107,6 @@ Type: filesandordirs; Name: "{app}\exemples"
 Type: filesandordirs; Name: "{app}\docs"
 
 [Run]
-; Première installation : service (et répertoires de %ProgramData% avec leurs permissions)
-Filename: "{app}\{#EngineExe}"; Parameters: "service install"; StatusMsg: "Installation du service Windows..."; Flags: runhidden waituntilterminated; Check: not ServiceExists
-; Toute installation ou mise à jour : propriétaire et permissions de %ProgramData%\Apex Supervision
-; réappliqués (héritage coupé, écriture réservée aux administrateurs et au service)
-Filename: "{app}\{#EngineExe}"; Parameters: "service permissions"; StatusMsg: "Application des permissions..."; Flags: runhidden waituntilterminated
-; Mise à jour : configuration réécrite au format courant (valeurs conservées, sauvegarde préalable)
-Filename: "{app}\{#EngineExe}"; Parameters: "config migrate --config ""{#ConfigFile}"""; StatusMsg: "Mise à jour de la configuration..."; Flags: runhidden waituntilterminated; Check: ConfigExists
-; Mise à jour : le service est redémarré s'il fonctionnait avant
-Filename: "{app}\{#EngineExe}"; Parameters: "service start"; StatusMsg: "Redémarrage du service..."; Flags: runhidden waituntilterminated; Check: ServiceWasRunning
-; Réinstallation après une désinstallation qui a conservé la configuration : service démarré
-Filename: "{app}\{#EngineExe}"; Parameters: "service start"; StatusMsg: "Démarrage du service..."; Flags: runhidden waituntilterminated; Check: (not ServiceExisted) and ConfigExists
 ; Première installation : assistant de configuration (droits administrateur conservés pour
 ; écrire la configuration et régler le service)
 Filename: "{app}\{#AdminExe}"; Parameters: "--wizard"; Description: "Lancer l'assistant de configuration"; Flags: postinstall nowait skipifsilent runascurrentuser; Check: not ConfigExists
@@ -154,9 +143,58 @@ begin
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Code: Integer;
+  AppExe: String;
 begin
   if CurStep = ssPostInstall then
+  begin
+    AppExe := ExpandConstant('{app}\{#EngineExe}');
+
+    // 1. Installation ou mise à jour du service (sans condition not ServiceExists)
+    Log('Exécution : service install');
+    if Exec(AppExe, 'service install', '', SW_HIDE, ewWaitUntilTerminated, Code) then
+    begin
+      Log(Format('service install : code %d', [Code]));
+      if Code <> 0 then
+        Log('Avertissement : code de retour non nul pour service install');
+    end
+    else
+      Log('Échec du lancement de service install');
+
+    // 2. Application des permissions sur %ProgramData%
+    Log('Exécution : service permissions');
+    if Exec(AppExe, 'service permissions', '', SW_HIDE, ewWaitUntilTerminated, Code) then
+      Log(Format('service permissions : code %d', [Code]))
+    else
+      Log('Échec du lancement de service permissions');
+
+    // 3. Migration si configuration existante
+    if ConfigExists then
+    begin
+      Log('Exécution : config migrate');
+      if Exec(AppExe, ExpandConstant('config migrate --config "{#ConfigFile}"'), '', SW_HIDE, ewWaitUntilTerminated, Code) then
+        Log(Format('config migrate : code %d', [Code]))
+      else
+        Log('Échec du lancement de config migrate');
+    end;
+
+    // 4. Démarrage ou redémarrage du service
+    if ServiceWasRunning or ((not ServiceExisted) and ConfigExists) then
+    begin
+      Log('Exécution : service start');
+      if Exec(AppExe, 'service start', '', SW_HIDE, ewWaitUntilTerminated, Code) then
+      begin
+        Log(Format('service start : code %d', [Code]));
+        if Code <> 0 then
+          Log('Avertissement : le service n''a pas pu démarrer automatiquement (code ' + IntToStr(Code) + ')');
+      end
+      else
+        Log('Échec du lancement de service start');
+    end;
+
     InstallDone := True;
+  end;
 end;
 
 { Mise à jour annulée ou en échec après l'arrêt du service : la supervision est relancée

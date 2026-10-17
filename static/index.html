@@ -292,6 +292,13 @@
         <label class="field">Seuil d'alarme haut
           <input type="number" step="0.5" id="tagFormHigh" placeholder="Optionnel" />
         </label>
+        <label class="field" id="tagFormBoolAlarmField">Alarme TOR (booléen)
+          <select id="tagFormBoolAlarm">
+            <option value="">Aucune alarme</option>
+            <option value="true">Actif si VRAI (1)</option>
+            <option value="false">Actif si FAUX (0)</option>
+          </select>
+        </label>
         <label class="field full" title="Interdire la mise en sommeil des alarmes de sécurité (ISA-18.2)">Mise en sommeil de l'alarme
           <select id="tagFormShelve">
             <option value="false">Autorisée</option>
