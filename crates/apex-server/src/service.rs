@@ -203,22 +203,13 @@ fn install(config: Option<PathBuf>) -> Result<String, String> {
             );
             match open_res {
                 Ok(s) => {
-                    // Mise à jour de ImagePath / binPath via sc.exe config
-                    let mut bin_cmd = format!("\"{}\" service run", exe.display());
-                    if let Some(cfg) = &config {
-                        bin_cmd.push_str(&format!(" --config \"{}\"", cfg.display()));
-                    }
-                    let result = std::process::Command::new("sc.exe")
-                        .args([
-                            "config",
-                            version::SERVICE_NAME,
-                            &format!("binPath= {}", bin_cmd),
-                        ])
-                        .output()
-                        .map_err(|e| format!("Mise à jour du service impossible : {}", e))?;
-                    if !result.status.success() {
-                        return Err("Échec de mise à jour du service".into());
-                    }
+                    // Mise à jour du chemin, des arguments et du compte par l'API du gestionnaire de
+                    // services (ChangeServiceConfig), qui construit elle-même la ligne de commande :
+                    // un passage par sc.exe produisait un chemin préfixé d'une espace, que Windows
+                    // refuse ensuite de lancer (erreur 87).
+                    s.change_config(&info).map_err(|e| {
+                        format!("mise à jour du service impossible : {}", explain(&e))
+                    })?;
                     s
                 }
                 Err(_) => return Err(format!("création du service impossible : {}", explain(&e))),

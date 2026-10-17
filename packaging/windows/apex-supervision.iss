@@ -1,4 +1,4 @@
-; =============================================================================
+﻿; =============================================================================
 ; Installateur Windows d'Apex Supervision (Inno Setup 6.3 ou plus récent)
 ;
 ; Construction : packaging\windows\build-installer.ps1, qui compile les binaires en
