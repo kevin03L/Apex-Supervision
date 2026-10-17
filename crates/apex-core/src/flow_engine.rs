@@ -103,7 +103,7 @@ impl FlowEngineRuntime {
                     cov_res = cov_rx.recv() => {
                         match cov_res {
                             Ok(tag_state) => {
-                                if tag_state.quality == Quality::BadDisconnect || core.is_acquisition_paused() {
+                                if tag_state.quality != Quality::Good || core.is_acquisition_paused() {
                                     continue;
                                 }
                                 evaluate_flows_for_tag(&core, &tag_state, &rhai_engine).await;
@@ -164,27 +164,39 @@ pub fn build_industrial_rhai_engine(core: Arc<ScadaCore>) -> Engine {
 
     let core_for_num = Arc::clone(&core);
     engine.register_fn("tag", move |tag_id: &str| -> f64 {
+        if core_for_num.is_acquisition_paused() {
+            return 0.0;
+        }
         core_for_num
             .tags_state
             .get(tag_id)
+            .filter(|s| s.quality == Quality::Good)
             .and_then(|s| s.value.as_f64())
             .unwrap_or(0.0)
     });
 
     let core_for_bool = Arc::clone(&core);
     engine.register_fn("tag_bool", move |tag_id: &str| -> bool {
+        if core_for_bool.is_acquisition_paused() {
+            return false;
+        }
         core_for_bool
             .tags_state
             .get(tag_id)
+            .filter(|s| s.quality == Quality::Good)
             .and_then(|s| s.value.as_bool())
             .unwrap_or(false)
     });
 
     let core_for_text = Arc::clone(&core);
     engine.register_fn("tag_text", move |tag_id: &str| -> String {
+        if core_for_text.is_acquisition_paused() {
+            return String::new();
+        }
         core_for_text
             .tags_state
             .get(tag_id)
+            .filter(|s| s.quality == Quality::Good)
             .map(|s| match &s.value {
                 TagValue::Text(t) => t.clone(),
                 TagValue::Bool(b) => b.to_string(),
@@ -203,6 +215,10 @@ pub fn build_industrial_rhai_engine(core: Arc<ScadaCore>) -> Engine {
 
 /// Force l'exécution immédiate d'un flux spécifique (bouton "Tester le Flux" de l'IHM).
 pub async fn trigger_flow_now(core: &Arc<ScadaCore>, flow_id: &str) -> Result<usize, String> {
+    if core.is_acquisition_paused() {
+        return Err("Acquisition en pause : exécution impossible".to_string());
+    }
+
     let flow = core
         .flows
         .get(flow_id)
@@ -215,8 +231,10 @@ pub async fn trigger_flow_now(core: &Arc<ScadaCore>, flow_id: &str) -> Result<us
     for node in &flow.nodes {
         if let FlowNodeKind::TagInput { tag_id } = &node.kind {
             if let Some(st) = core.tags_state.get(tag_id).map(|s| s.clone()) {
-                run_flow_from_entry_node(core, &flow, node, &st, &rhai_engine).await;
-                executed += 1;
+                if st.quality == Quality::Good {
+                    run_flow_from_entry_node(core, &flow, node, &st, &rhai_engine).await;
+                    executed += 1;
+                }
             }
         }
     }
@@ -225,6 +243,9 @@ pub async fn trigger_flow_now(core: &Arc<ScadaCore>, flow_id: &str) -> Result<us
 }
 
 async fn evaluate_all_enabled_flows_once(core: &Arc<ScadaCore>, rhai_engine: &Arc<Engine>) {
+    if core.is_acquisition_paused() {
+        return;
+    }
     let active_flows: Vec<FlowGraph> = core
         .flows
         .iter()
@@ -236,7 +257,7 @@ async fn evaluate_all_enabled_flows_once(core: &Arc<ScadaCore>, rhai_engine: &Ar
         for node in &flow.nodes {
             if let FlowNodeKind::TagInput { tag_id } = &node.kind {
                 if let Some(st) = core.tags_state.get(tag_id).map(|s| s.clone()) {
-                    if st.quality != Quality::BadDisconnect {
+                    if st.quality == Quality::Good {
                         run_flow_from_entry_node(core, &flow, node, &st, rhai_engine).await;
                     }
                 }
@@ -250,6 +271,9 @@ async fn evaluate_flows_for_tag(
     tag_state: &TagState,
     rhai_engine: &Arc<Engine>,
 ) {
+    if tag_state.quality != Quality::Good || core.is_acquisition_paused() {
+        return;
+    }
     // Seuls les flux qui lisent ce tag sont copiés (évite de cloner tous les graphes à chaque COV)
     let listens_to_tag = |f: &FlowGraph| {
         f.nodes.iter().any(
@@ -281,6 +305,10 @@ async fn run_flow_from_entry_node(
     tag_state: &TagState,
     rhai_engine: &Arc<Engine>,
 ) {
+    if tag_state.quality != Quality::Good || core.is_acquisition_paused() {
+        return;
+    }
+
     let mut queue: Vec<(String, String, TagValue, usize)> = vec![(
         start_node.id.clone(),
         start_node.id.clone(),
@@ -380,11 +408,21 @@ async fn run_flow_from_entry_node(
                 let Some(pv) = current_val.as_f64() else {
                     continue;
                 };
-                let sp = core
-                    .tags_state
-                    .get(setpoint_tag_id)
-                    .and_then(|s| s.value.as_f64())
-                    .unwrap_or(21.0);
+                let sp = if !setpoint_tag_id.is_empty() {
+                    match core.tags_state.get(setpoint_tag_id) {
+                        Some(s) if s.quality == Quality::Good => match s.value.as_f64() {
+                            Some(val) => val,
+                            None => continue,
+                        },
+                        Some(_) => {
+                            // Consigne présente mais non Good (Uncertain ou BadDisconnect) : ne pas réguler
+                            continue;
+                        }
+                        None => 21.0,
+                    }
+                } else {
+                    21.0
+                };
 
                 let now = Utc::now();
                 let mut entry = core
@@ -443,7 +481,7 @@ async fn run_flow_from_entry_node(
             }
 
             FlowNodeKind::DelayTimer { delay_ms } => {
-                let active = current_val.as_bool().unwrap_or(true);
+                let active = current_val.as_bool().unwrap_or(false);
                 let now = Utc::now();
                 if active {
                     let mut entry = core
@@ -454,13 +492,15 @@ async fn run_flow_from_entry_node(
                     let start = entry.get_or_insert(now);
                     let elapsed = (now - *start).num_milliseconds().max(0) as u64;
                     if elapsed < *delay_ms {
-                        continue;
+                        next_value = TagValue::Bool(false);
+                    } else {
+                        next_value = TagValue::Bool(true);
                     }
                 } else {
                     core.flow_runtime
                         .timer_since
                         .insert(current_node.id.clone(), None);
-                    continue;
+                    next_value = TagValue::Bool(false);
                 }
             }
 
@@ -836,6 +876,23 @@ mod tests {
         }
     }
 
+    fn internal_bool_tag(id: &str) -> crate::models::RegisteredTag {
+        crate::models::RegisteredTag {
+            id: id.into(),
+            label: id.into(),
+            module_source: "INTERNE".into(),
+            protocol_address: String::new(),
+            data_type: crate::models::TagDataType::Bool,
+            unit: None,
+            writable: true,
+            deadband: 0.0,
+            scale_factor: 1.0,
+            scale_offset: 0.0,
+            historize: false,
+            alarm_config: Default::default(),
+        }
+    }
+
     fn node(id: &str, kind: FlowNodeKind) -> FlowNode {
         FlowNode {
             id: id.into(),
@@ -989,5 +1046,275 @@ mod tests {
         run_flow_from_entry_node(&core, &flow, &flow.nodes[0], &input("INT.In", 5.0), &engine)
             .await;
         assert!(!failing(&core), "retour à la normale");
+    }
+
+    #[tokio::test]
+    async fn flow_does_not_execute_on_uncertain_or_baddisconnect_tag_input() {
+        let core = ScadaCore::new(None, &crate::core::EngineOptions::default());
+        core.register_tag(internal_tag("INT.In", 0.0), None);
+        core.register_tag(internal_tag("INT.Out", 0.0), None);
+        let flow = FlowGraph {
+            id: "f_quality".into(),
+            name: "f_quality".into(),
+            description: String::new(),
+            enabled: true,
+            nodes: vec![
+                node(
+                    "in",
+                    FlowNodeKind::TagInput {
+                        tag_id: "INT.In".into(),
+                    },
+                ),
+                node(
+                    "out",
+                    FlowNodeKind::TagOutput {
+                        target_tag_id: "INT.Out".into(),
+                    },
+                ),
+            ],
+            edges: vec![edge("e", "in", "out")],
+        };
+        let engine = shared_engine(&core);
+
+        // Au démarrage, le tag est enregistré avec Quality::Uncertain et valeur 0.0
+        let uncertain_input = TagState {
+            tag_id: "INT.In".into(),
+            value: TagValue::Float(0.0),
+            quality: Quality::Uncertain,
+            timestamp: Utc::now(),
+        };
+        run_flow_from_entry_node(&core, &flow, &flow.nodes[0], &uncertain_input, &engine).await;
+        // La sortie ne doit PAS avoir été écrite par le flux
+        assert!(core.flow_runtime.last_outputs.is_empty());
+
+        // Avec Quality::BadDisconnect, le flux ne doit pas non plus s'exécuter
+        let bad_input = TagState {
+            tag_id: "INT.In".into(),
+            value: TagValue::Float(100.0),
+            quality: Quality::BadDisconnect,
+            timestamp: Utc::now(),
+        };
+        run_flow_from_entry_node(&core, &flow, &flow.nodes[0], &bad_input, &engine).await;
+        assert!(core.flow_runtime.last_outputs.is_empty());
+
+        // Avec Quality::Good, le flux s'exécute et propage la valeur
+        let good_input = TagState {
+            tag_id: "INT.In".into(),
+            value: TagValue::Float(25.0),
+            quality: Quality::Good,
+            timestamp: Utc::now(),
+        };
+        run_flow_from_entry_node(&core, &flow, &flow.nodes[0], &good_input, &engine).await;
+        assert_eq!(
+            core.tags_state.get("INT.Out").unwrap().value,
+            TagValue::Float(25.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn rhai_functions_and_pid_controller_respect_tag_quality_and_pause() {
+        let core = ScadaCore::new(None, &crate::core::EngineOptions::default());
+        // Tag avec qualité initiale Uncertain
+        core.register_tag(internal_tag("INT.Mesure", 0.0), None);
+        let engine = shared_engine(&core);
+
+        // 1. Rhai : tag() et tag_bool() renvoient les valeurs de repli tant que la qualité n'est pas Good
+        let val: f64 = engine.eval(r#"tag("INT.Mesure")"#).unwrap();
+        assert_eq!(val, 0.0);
+        let b: bool = engine.eval(r#"tag_bool("INT.Mesure")"#).unwrap();
+        assert!(!b);
+
+        // Mise à jour en Quality::Good
+        core.tags_state.insert(
+            "INT.Mesure".into(),
+            TagState {
+                tag_id: "INT.Mesure".into(),
+                value: TagValue::Float(42.5),
+                quality: Quality::Good,
+                timestamp: Utc::now(),
+            },
+        );
+        let val: f64 = engine.eval(r#"tag("INT.Mesure")"#).unwrap();
+        assert_eq!(val, 42.5);
+
+        // Pause de l'acquisition : tag() doit renvoyer 0.0
+        core.set_acquisition_paused("test", true);
+        let val: f64 = engine.eval(r#"tag("INT.Mesure")"#).unwrap();
+        assert_eq!(val, 0.0);
+        core.set_acquisition_paused("test", false);
+
+        // 2. PidController : ne régule pas si le tag de consigne est en Uncertain
+        core.register_tag(internal_tag("INT.SP", 0.0), None);
+        core.register_tag(internal_tag("INT.PID_Out", 0.0), None);
+        let flow_pid = FlowGraph {
+            id: "f_pid".into(),
+            name: "f_pid".into(),
+            description: String::new(),
+            enabled: true,
+            nodes: vec![
+                node(
+                    "in",
+                    FlowNodeKind::TagInput {
+                        tag_id: "INT.Mesure".into(),
+                    },
+                ),
+                node(
+                    "pid",
+                    FlowNodeKind::PidController {
+                        setpoint_tag_id: "INT.SP".into(),
+                        kp: 1.0,
+                        ki: 0.0,
+                        kd: 0.0,
+                        min_out: 0.0,
+                        max_out: 100.0,
+                        reverse_acting: false,
+                    },
+                ),
+                node(
+                    "out",
+                    FlowNodeKind::TagOutput {
+                        target_tag_id: "INT.PID_Out".into(),
+                    },
+                ),
+            ],
+            edges: vec![edge("e1", "in", "pid"), edge("e2", "pid", "out")],
+        };
+
+        // Entrée mesure Good, mais consigne Uncertain : le bloc PID doit sauter sans écrire
+        run_flow_from_entry_node(
+            &core,
+            &flow_pid,
+            &flow_pid.nodes[0],
+            &input("INT.Mesure", 42.5),
+            &engine,
+        )
+        .await;
+        assert!(core.flow_runtime.last_outputs.is_empty());
+
+        // Consigne passe en Good
+        core.tags_state.insert(
+            "INT.SP".into(),
+            TagState {
+                tag_id: "INT.SP".into(),
+                value: TagValue::Float(50.0),
+                quality: Quality::Good,
+                timestamp: Utc::now(),
+            },
+        );
+        run_flow_from_entry_node(
+            &core,
+            &flow_pid,
+            &flow_pid.nodes[0],
+            &input("INT.Mesure", 42.5),
+            &engine,
+        )
+        .await;
+        assert!(!core.flow_runtime.last_outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn trigger_flow_now_refuses_when_acquisition_paused() {
+        let core = ScadaCore::new(None, &crate::core::EngineOptions::default());
+        core.register_tag(internal_tag("INT.In", 0.0), None);
+        let flow = FlowGraph {
+            id: "f_trig".into(),
+            name: "f_trig".into(),
+            description: String::new(),
+            enabled: true,
+            nodes: vec![node(
+                "in",
+                FlowNodeKind::TagInput {
+                    tag_id: "INT.In".into(),
+                },
+            )],
+            edges: vec![],
+        };
+        core.flows.insert(flow.id.clone(), flow);
+
+        // Si acquisition en pause -> erreur immédiate
+        core.set_acquisition_paused("test", true);
+        let res = trigger_flow_now(&core, "f_trig").await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("pause"));
+
+        // Hors pause, mais tag en Uncertain (démarrage) -> 0 nœud exécuté
+        core.set_acquisition_paused("test", false);
+        let count = trigger_flow_now(&core, "f_trig").await.unwrap();
+        assert_eq!(count, 0);
+
+        // Une fois le tag Good -> 1 nœud exécuté
+        core.tags_state.insert(
+            "INT.In".into(),
+            TagState {
+                tag_id: "INT.In".into(),
+                value: TagValue::Float(10.0),
+                quality: Quality::Good,
+                timestamp: Utc::now(),
+            },
+        );
+        let count = trigger_flow_now(&core, "f_trig").await.unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn delay_timer_propagates_false_on_falling_edge_and_before_timeout() {
+        let core = ScadaCore::new(None, &crate::core::EngineOptions::default());
+        core.register_tag(internal_bool_tag("INT.InBool"), None);
+        core.register_tag(internal_bool_tag("INT.OutBool"), None);
+
+        let flow = FlowGraph {
+            id: "f_ton".into(),
+            name: "f_ton".into(),
+            description: String::new(),
+            enabled: true,
+            nodes: vec![
+                node(
+                    "in",
+                    FlowNodeKind::TagInput {
+                        tag_id: "INT.InBool".into(),
+                    },
+                ),
+                node("ton", FlowNodeKind::DelayTimer { delay_ms: 50 }),
+                node(
+                    "out",
+                    FlowNodeKind::TagOutput {
+                        target_tag_id: "INT.OutBool".into(),
+                    },
+                ),
+            ],
+            edges: vec![edge("e1", "in", "ton"), edge("e2", "ton", "out")],
+        };
+        let engine = shared_engine(&core);
+
+        let bool_input = |v: bool| TagState {
+            tag_id: "INT.InBool".into(),
+            value: TagValue::Bool(v),
+            quality: Quality::Good,
+            timestamp: Utc::now(),
+        };
+        let out_val = || {
+            core.tags_state
+                .get("INT.OutBool")
+                .map(|s| s.value.clone())
+                .unwrap_or(TagValue::Bool(false))
+        };
+
+        // 1. Front montant actif : le délai de 50 ms n'est pas écoulé -> sortie false propagée
+        run_flow_from_entry_node(&core, &flow, &flow.nodes[0], &bool_input(true), &engine).await;
+        assert_eq!(out_val(), TagValue::Bool(false));
+
+        // 2. Attente de l'écoulement du délai (> 50 ms)
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        run_flow_from_entry_node(&core, &flow, &flow.nodes[0], &bool_input(true), &engine).await;
+        // Le temporisateur a expiré : la sortie doit basculer à true
+        assert_eq!(out_val(), TagValue::Bool(true));
+
+        // 3. Front descendant (active = false) : la sortie doit IMMÉDIATEMENT retomber à false
+        run_flow_from_entry_node(&core, &flow, &flow.nodes[0], &bool_input(false), &engine).await;
+        assert_eq!(
+            out_val(),
+            TagValue::Bool(false),
+            "DelayTimer n'a pas propagé false lors de la retombée de l'entrée"
+        );
     }
 }

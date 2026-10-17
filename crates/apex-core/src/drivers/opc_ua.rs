@@ -107,8 +107,18 @@ fn from_variant(v: &Variant) -> Result<TagValue, String> {
             TagValue::Int(i64::try_from(*i).map_err(|_| "UInt64 hors plage".to_string())?)
         }
         // Représentation décimale la plus courte d'un Float (7,1 et non 7,099999904…)
-        Variant::Float(f) => TagValue::Float(f.to_string().parse::<f64>().unwrap_or(*f as f64)),
-        Variant::Double(f) => TagValue::Float(*f),
+        Variant::Float(f) => {
+            if !f.is_finite() {
+                return Err("valeur Float non finie".to_string());
+            }
+            TagValue::Float(f.to_string().parse::<f64>().unwrap_or(*f as f64))
+        }
+        Variant::Double(f) => {
+            if !f.is_finite() {
+                return Err("valeur Double non finie".to_string());
+            }
+            TagValue::Float(*f)
+        }
         Variant::String(s) => TagValue::Text(s.as_ref().to_string()),
         Variant::LocalizedText(t) => TagValue::Text(t.text.as_ref().to_string()),
         Variant::Empty => return Err("valeur vide".to_string()),
@@ -637,5 +647,16 @@ mod tests {
             Quality::BadDisconnect
         );
         assert_eq!(quality_of(Some(StatusCode::Uncertain)), Quality::Uncertain);
+    }
+
+    #[test]
+    fn opc_ua_from_variant_rejects_nan_and_infinity() {
+        assert!(from_variant(&Variant::Float(f32::NAN)).is_err());
+        assert!(from_variant(&Variant::Float(f32::INFINITY)).is_err());
+        assert!(from_variant(&Variant::Float(f32::NEG_INFINITY)).is_err());
+
+        assert!(from_variant(&Variant::Double(f64::NAN)).is_err());
+        assert!(from_variant(&Variant::Double(f64::INFINITY)).is_err());
+        assert!(from_variant(&Variant::Double(f64::NEG_INFINITY)).is_err());
     }
 }

@@ -175,6 +175,9 @@ impl TagValue {
     pub fn has_significant_change(&self, previous: &Self, deadband: f64) -> bool {
         match (self, previous) {
             (TagValue::Float(new_v), TagValue::Float(old_v)) => {
+                if !new_v.is_finite() || !old_v.is_finite() {
+                    return new_v.to_bits() != old_v.to_bits();
+                }
                 (new_v - old_v).abs() >= deadband.max(1e-6)
             }
             _ => self != previous,
@@ -1089,6 +1092,20 @@ mod tests {
         assert!(TagValue::Float(20.06).has_significant_change(&old, 0.05));
         assert!(TagValue::Bool(true).has_significant_change(&TagValue::Bool(false), 0.5));
         assert!(!TagValue::Int(4).has_significant_change(&TagValue::Int(4), 0.0));
+    }
+
+    #[test]
+    fn cov_filtering_handles_non_finite_floats_without_locking() {
+        let nan_val = TagValue::Float(f64::NAN);
+        let normal_val = TagValue::Float(20.0);
+        let inf_val = TagValue::Float(f64::INFINITY);
+        let neg_inf_val = TagValue::Float(f64::NEG_INFINITY);
+
+        assert!(normal_val.has_significant_change(&nan_val, 0.05));
+        assert!(nan_val.has_significant_change(&normal_val, 0.05));
+        assert!(normal_val.has_significant_change(&inf_val, 0.05));
+        assert!(neg_inf_val.has_significant_change(&inf_val, 0.05));
+        assert!(!normal_val.has_significant_change(&normal_val, 0.05));
     }
 
     fn rule(start: &str, end: &str, days: Vec<u8>) -> ScheduleRule {
