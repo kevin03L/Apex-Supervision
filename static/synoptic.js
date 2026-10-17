@@ -696,6 +696,7 @@ function buildWidgetBodyHtml(w) {
   const unit = tag && tag.unit ? esc(tag.unit) : '';
   const numVal = typeof val === 'number' ? val : 0;
   const boolVal = Boolean(val);
+  const allowWrite = Boolean(canWrite() && tag && tag.writable);
 
   if (w.widget_type === 'Gauge') {
     const min = Number((w.properties && w.properties.min) ?? 0);
@@ -728,9 +729,13 @@ function buildWidgetBodyHtml(w) {
           <circle cx="50" cy="54" r="8" fill="${color}"/>
         </g>
       </svg>
+      ${allowWrite ? `
       <button class="btn" style="margin-top:6px;" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!boolVal})">
         ${boolVal ? 'MARCHE (Arrêter)' : 'ARRÊT (Démarrer)'}
-      </button>
+      </button>` : `
+      <div class="badge-qual q-${boolVal ? 'Good' : 'Uncertain'}" style="margin-top:6px;">
+        ${boolVal ? 'MARCHE' : 'ARRÊT'}
+      </div>`}
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
   }
@@ -748,9 +753,13 @@ function buildWidgetBodyHtml(w) {
           <circle cx="50" cy="50" r="8" fill="#fff"/>
         </g>
       </svg>
+      ${allowWrite ? `
       <button class="btn" style="margin-top:6px;" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!boolVal})">
         ${boolVal ? 'SOUFFLAGE ACTIF' : 'VENTILATEUR ARRÊTÉ'}
-      </button>
+      </button>` : `
+      <div class="badge-qual q-${boolVal ? 'Good' : 'Uncertain'}" style="margin-top:6px;">
+        ${boolVal ? 'SOUFFLAGE ACTIF' : 'VENTILATEUR ARRÊTÉ'}
+      </div>`}
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
   }
@@ -766,7 +775,7 @@ function buildWidgetBodyHtml(w) {
         <line x1="85" y1="12" x2="85" y2="54" stroke="#38bdf8" stroke-width="4" transform="rotate(${angle} 85 33)"/>
       </svg>
       <div style="font-weight:800;color:#38bdf8;font-size:14px;">Ouverture : ${pct.toFixed(0)} %</div>
-      <input type="range" min="0" max="100" value="${pct}" aria-label="${esc(w.title || w.bound_tag_id || 'Commande')}" onchange="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, parseFloat(this.value))" />
+      <input type="range" min="0" max="100" value="${pct}" ${allowWrite ? '' : 'disabled'} aria-label="${esc(w.title || w.bound_tag_id || 'Commande')}" onchange="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, parseFloat(this.value))" />
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
   }
@@ -819,21 +828,27 @@ function buildWidgetBodyHtml(w) {
         <rect x="44" y="3" width="32" height="10" rx="3" fill="#f59e0b"/>
       </svg>
       <div style="font-weight:800;font-size:15px;color:#38bdf8;">${pct.toFixed(1)} %</div>
-      <input type="range" min="0" max="100" value="${pct}" aria-label="${esc(w.title || w.bound_tag_id || 'Commande')}" onchange="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, parseFloat(this.value))" />
+      <input type="range" min="0" max="100" value="${pct}" ${allowWrite ? '' : 'disabled'} aria-label="${esc(w.title || w.bound_tag_id || 'Commande')}" onchange="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, parseFloat(this.value))" />
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
   }
 
   if (w.widget_type === 'SetpointButton') {
+    const min = (w.properties && typeof w.properties.min === 'number') ? w.properties.min : 0;
+    const max = (w.properties && typeof w.properties.max === 'number') ? w.properties.max : 100;
     const step = Number(w.properties && w.properties.step) || 0.5;
+    const nextDown = Math.max(min, Math.min(max, numVal - step));
+    const nextUp = Math.max(min, Math.min(max, numVal + step));
     return `
       <div class="big-num" style="color:#38bdf8;">${numVal.toFixed(1)} ${unit}</div>
+      ${allowWrite ? `
       <div class="setpoint-controls">
-        <button class="btn" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${(numVal - step).toFixed(2)})">-${step}</button>
-        <input type="number" step="${step}" value="${numVal}" id="sp-in-${cssSafe(w.id)}" aria-label="Nouvelle consigne : ${esc(w.title || w.bound_tag_id || '')}" />
-        <button class="btn" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${(numVal + step).toFixed(2)})">+${step}</button>
+        <button class="btn" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${nextDown.toFixed(2)})">-${step}</button>
+        <input type="number" min="${min}" max="${max}" step="${step}" value="${numVal}" id="sp-in-${cssSafe(w.id)}" aria-label="Nouvelle consigne : ${esc(w.title || w.bound_tag_id || '')}" />
+        <button class="btn" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${nextUp.toFixed(2)})">+${step}</button>
         <button class="btn btn-primary" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, parseFloat(document.getElementById(${jsArg('sp-in-' + cssSafe(w.id))}).value))">OK</button>
-      </div>
+      </div>` : `
+      <div class="badge-qual q-Good" style="margin-top:6px;">Consigne : ${numVal.toFixed(1)} ${unit} (lecture seule)</div>`}
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
   }
@@ -841,10 +856,14 @@ function buildWidgetBodyHtml(w) {
   if (w.widget_type === 'SwitchButton') {
     return `
       <div style="margin:8px 0;">
+        ${allowWrite ? `
         <button class="btn ${boolVal ? 'btn-primary' : ''}" style="padding:10px 18px;font-size:13px;"
                 onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!boolVal})">
           ${boolVal ? 'COMMUTATEUR : ON (1)' : 'COMMUTATEUR : OFF (0)'}
-        </button>
+        </button>` : `
+        <div class="badge-qual q-${boolVal ? 'Good' : 'Uncertain'}" style="padding:8px 16px;">
+          ${boolVal ? 'COMMUTATEUR : ON (1)' : 'COMMUTATEUR : OFF (0)'}
+        </div>`}
       </div>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
@@ -915,9 +934,13 @@ function buildWidgetBodyHtml(w) {
         <circle cx="60" cy="11" r="9" fill="#0b1120" stroke="#f59e0b" stroke-width="2.5"/>
         <text x="60" y="15" text-anchor="middle" fill="#f59e0b" font-size="10" font-weight="bold">M</text>
       </svg>
+      ${allowWrite ? `
       <button class="btn" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!open})">
         ${open ? 'VANNE OUVERTE' : 'VANNE FERMÉE'}
-      </button>
+      </button>` : `
+      <div class="badge-qual q-${open ? 'Good' : 'Uncertain'}" style="margin-top:4px;">
+        ${open ? 'VANNE OUVERTE' : 'VANNE FERMÉE'}
+      </div>`}
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
   }
@@ -1002,9 +1025,13 @@ function buildWidgetBodyHtml(w) {
         <circle cx="50" cy="66" r="4" fill="#fff"/>
         <line x1="50" y1="66" x2="${closed ? 50 : 28}" y2="${closed ? 30 : 34}" stroke="${col}" stroke-width="5"/>
       </svg>
+      ${allowWrite ? `
       <button class="btn" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!closed})">
         ${closed ? 'ENCLENCHÉ (FERMÉ)' : 'OUVERT (ISOLÉ)'}
-      </button>
+      </button>` : `
+      <div class="badge-qual q-${closed ? 'Good' : 'Uncertain'}" style="margin-top:4px;">
+        ${closed ? 'ENCLENCHÉ (FERMÉ)' : 'OUVERT (ISOLÉ)'}
+      </div>`}
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Disjoncteur'}</div>
     `;
   }
@@ -1202,16 +1229,34 @@ function findDashboardWidget(widgetId) {
 function selectCommand(widgetId, tagId, value, momentary = false) {
   // En Studio, un clic sert à éditer l'élément, jamais à commander l'équipement
   if (!tagId || state.mode === 'studio') return;
+  const tag = state.tags[tagId];
+  if (!tag || !tag.writable) {
+    notify('Cette variable est en lecture seule (écriture non autorisée).', 'error');
+    return;
+  }
   if (!canWrite()) {
     notify('Votre profil ne permet pas l\'envoi de consignes.', 'error');
     return;
   }
-  if (typeof value === 'number' && !Number.isFinite(value)) {
-    notify('Valeur de consigne invalide', 'error');
-    return;
+  const w = findDashboardWidget(widgetId);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      notify('Valeur de consigne invalide', 'error');
+      return;
+    }
+    // S-18: Contrôle des bornes min et max configurées
+    const min = (w && w.properties && typeof w.properties.min === 'number') ? w.properties.min : null;
+    const max = (w && w.properties && typeof w.properties.max === 'number') ? w.properties.max : null;
+    if (min !== null && value < min) {
+      notify(`La consigne ne peut pas être inférieure au minimum configuré (${min})`, 'error');
+      return;
+    }
+    if (max !== null && value > max) {
+      notify(`La consigne ne peut pas être supérieure au maximum configuré (${max})`, 'error');
+      return;
+    }
   }
   cancelCommand(false);
-  const w = findDashboardWidget(widgetId);
   state.armedCommand = {
     widgetId,
     tagId,

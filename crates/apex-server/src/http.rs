@@ -633,6 +633,7 @@ async fn api_system_import(
         .core
         .import_project_bundle(&user.0.username, bundle)
         .await?;
+    state.core.notify_snapshot();
     Ok(Json(report))
 }
 
@@ -1186,6 +1187,8 @@ async fn handle_realtime_socket(
     let mut drv_rx = state.core.subscribe_drivers();
     let mut trace_rx = state.core.subscribe_flow_traces();
     let mut settings_rx = state.core.subscribe_settings();
+    let mut revoke_rx = state.core.subscribe_session_revocation();
+    let mut snapshot_rx = state.core.subscribe_snapshot_notify();
     // Vérifie périodiquement que la session est toujours valide (déconnexion, compte désactivé)
     let mut session_check = tokio::time::interval(Duration::from_secs(30));
     session_check.tick().await;
@@ -1244,7 +1247,16 @@ async fn handle_realtime_socket(
                             break;
                         }
                     }
-                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Ok(_) => {}
+                    // S-24: Réémission de l'état complet lors d'un RecvError::Lagged
+                    Err(RecvError::Lagged(_)) => {
+                        drv_rx = drv_rx.resubscribe();
+                        if !viewer
+                            && !send_ws(&mut socket, &WsServerMessage::DriverListUpdate(state.core.get_all_drivers())).await
+                        {
+                            break;
+                        }
+                    }
                     Err(RecvError::Closed) => break,
                 }
             }
@@ -1266,7 +1278,51 @@ async fn handle_realtime_socket(
                             break;
                         }
                     }
-                    Err(RecvError::Lagged(_)) => {}
+                    // S-24: Réémission des réglages complets lors d'un RecvError::Lagged
+                    Err(RecvError::Lagged(_)) => {
+                        settings_rx = settings_rx.resubscribe();
+                        if !send_ws(&mut socket, &WsServerMessage::SettingsUpdate(state.core.get_settings())).await {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            // S-20: Rafraîchissement complet du snapshot lors d'une importation de projet
+            snapshot_res = snapshot_rx.recv() => {
+                match snapshot_res {
+                    Ok(()) => {
+                        if !send_ws(&mut socket, &build_snapshot(&state, viewer)).await {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        snapshot_rx = snapshot_rx.resubscribe();
+                        if !send_ws(&mut socket, &build_snapshot(&state, viewer)).await {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            // S-24: Fermeture immédiate du socket lors de la révocation de session
+            revoke_res = revoke_rx.recv() => {
+                match revoke_res {
+                    Ok(revoked_user) => {
+                        if revoked_user == user.0.username
+                            && state.core.resolve_user(Some(&token)).is_none()
+                        {
+                            let _ = socket.send(Message::Close(None)).await;
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        revoke_rx = revoke_rx.resubscribe();
+                        if state.core.resolve_user(Some(&token)).is_none() {
+                            let _ = socket.send(Message::Close(None)).await;
+                            break;
+                        }
+                    }
                     Err(RecvError::Closed) => break,
                 }
             }

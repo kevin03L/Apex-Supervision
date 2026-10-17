@@ -439,12 +439,41 @@ fn write_control_token(path: &std::path::Path, token: &str) -> std::io::Result<(
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, token)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        // Lecture : propriétaire (service) et groupe apex-scada (administrateurs du poste)
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        // S-22: Création atomique sans fenêtre TOCTOU avec mode 0o640
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o640)
+            .open(path)?;
+        file.write_all(token.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, token)?;
+    }
+    #[cfg(windows)]
+    {
+        // S-22: Sous Windows (mode manuel/portable), restreindre les ACL à SYSTEM, Administrateurs et compte courant
+        let path_str = path.display().to_string();
+        let username = std::env::var("USERNAME").unwrap_or_default();
+        let mut grant_args = vec![
+            path_str,
+            "/inheritance:r".to_string(),
+            "/grant:r".to_string(),
+            "*S-1-5-18:(F)".to_string(),     // NT AUTHORITY\SYSTEM
+            "*S-1-5-32-544:(F)".to_string(), // Builtin\Administrators
+        ];
+        if !username.is_empty() {
+            grant_args.push(format!("{}:(F)", username));
+        }
+        let _ = std::process::Command::new("icacls")
+            .args(&grant_args)
+            .output();
     }
     Ok(())
 }
@@ -510,5 +539,17 @@ mod tests {
         let system = Layout::system();
         let command = legacy_command(&found, &system);
         assert!(!command.contains("--config"), "{command}");
+    }
+
+    #[test]
+    fn test_s22_write_control_token() {
+        let temp_dir = std::env::temp_dir().join(format!("apex-s22-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let token_path = temp_dir.join("control.token");
+        let token_value = "secret-token-test-1234567890";
+        write_control_token(&token_path, token_value).expect("écriture du jeton");
+        let read = std::fs::read_to_string(&token_path).expect("lecture du jeton");
+        assert_eq!(read, token_value);
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

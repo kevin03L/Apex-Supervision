@@ -1932,6 +1932,7 @@ function openNewTagModal() {
   document.getElementById('tagFormScale').value = '1.0';
   document.getElementById('tagFormLow').value = '';
   document.getElementById('tagFormHigh').value = '';
+  if (document.getElementById('tagFormBoolAlarm')) document.getElementById('tagFormBoolAlarm').value = '';
   document.getElementById('tagFormShelve').value = 'false';
   refreshTagAddressHint();
   openModal('tag', 'Nouvelle variable');
@@ -1952,6 +1953,12 @@ async function saveTagFromForm() {
   const low = lowRaw !== '' ? parseFloat(lowRaw) : null;
   const high = highRaw !== '' ? parseFloat(highRaw) : null;
 
+  const boolAlarmEl = document.getElementById('tagFormBoolAlarm');
+  const boolAlarmVal = boolAlarmEl ? boolAlarmEl.value : '';
+  const trigger_on_bool = (data_type === 'Bool')
+    ? (boolAlarmVal !== '' ? (boolAlarmVal === 'true') : null)
+    : null;
+
   const existing = state.tags[id];
   const prevAlarm = (existing && existing.alarm_config) || {};
 
@@ -1968,9 +1975,12 @@ async function saveTagFromForm() {
     scale_offset: existing ? existing.scale_offset : 0.0,
     historize: existing ? existing.historize : true,
     alarm_config: Object.assign({}, prevAlarm, {
-      enabled: (low !== null || high !== null || prevAlarm.low_low != null || prevAlarm.high_high != null || prevAlarm.trigger_on_bool != null),
-      low,
-      high,
+      enabled: (data_type === 'Bool')
+        ? (trigger_on_bool !== null)
+        : (low !== null || high !== null || prevAlarm.low_low != null || prevAlarm.high_high != null),
+      low: (data_type === 'Bool') ? null : low,
+      high: (data_type === 'Bool') ? null : high,
+      trigger_on_bool,
       severity: prevAlarm.severity || 'High',
       shelving_disabled: document.getElementById('tagFormShelve').value === 'true'
     })
@@ -2009,6 +2019,11 @@ function editTagInForm(tagId) {
   document.getElementById('tagFormScale').value = t.scale_factor || 1.0;
   document.getElementById('tagFormLow').value = (t.alarm_config && t.alarm_config.low) ?? '';
   document.getElementById('tagFormHigh').value = (t.alarm_config && t.alarm_config.high) ?? '';
+  if (document.getElementById('tagFormBoolAlarm')) {
+    document.getElementById('tagFormBoolAlarm').value = (t.alarm_config && t.alarm_config.trigger_on_bool != null)
+      ? String(t.alarm_config.trigger_on_bool)
+      : '';
+  }
   document.getElementById('tagFormShelve').value = String(!!(t.alarm_config && t.alarm_config.shelving_disabled));
   refreshTagAddressHint();
   openModal('tag', `Modifier ${t.id}`);
@@ -2056,6 +2071,39 @@ function populateScheduleTagSelect(selectedTagId) {
   sel.innerHTML = writableTags.map(t =>
     `<option value="${esc(t.id)}" ${t.id === current ? 'selected' : ''}>${esc(t.id)} (${esc(t.label)})</option>`
   ).join('');
+  sel.onchange = updateScheduleValueInputs;
+}
+
+function updateScheduleValueInputs() {
+  const sel = document.getElementById('schedTagSelect');
+  if (!sel) return;
+  const tagId = sel.value;
+  const t = state.tags[tagId];
+  const isBool = t && t.data_type === 'Bool';
+  const isInt = t && t.data_type === 'Int';
+  const aIn = document.getElementById('schedActiveVal');
+  const iIn = document.getElementById('schedInactiveVal');
+  if (!aIn || !iIn) return;
+  if (isBool) {
+    aIn.type = 'text';
+    iIn.type = 'text';
+    aIn.placeholder = 'true / false';
+    iIn.placeholder = 'true / false';
+  } else if (isInt) {
+    aIn.type = 'number';
+    aIn.step = '1';
+    iIn.type = 'number';
+    iIn.step = '1';
+    aIn.placeholder = '0';
+    iIn.placeholder = '0';
+  } else {
+    aIn.type = 'number';
+    aIn.step = '0.5';
+    iIn.type = 'number';
+    iIn.step = '0.5';
+    aIn.placeholder = '21.5';
+    iIn.placeholder = '17.5';
+  }
 }
 
 /** État d'un planning : actif, inactif, ou suspendu par le mode sûr. */
@@ -2104,8 +2152,15 @@ function openNewScheduleModal() {
   document.getElementById('schedName').value = '';
   document.getElementById('schedStart').value = '07:00';
   document.getElementById('schedEnd').value = '19:00';
-  document.getElementById('schedActiveVal').value = '21.5';
-  document.getElementById('schedInactiveVal').value = '17.5';
+  updateScheduleValueInputs();
+  const selTag = state.tags[document.getElementById('schedTagSelect').value];
+  if (selTag && selTag.data_type === 'Bool') {
+    document.getElementById('schedActiveVal').value = 'true';
+    document.getElementById('schedInactiveVal').value = 'false';
+  } else {
+    document.getElementById('schedActiveVal').value = '21.5';
+    document.getElementById('schedInactiveVal').value = '17.5';
+  }
   renderScheduleDaysPicker([1, 2, 3, 4, 5]);
   openModal('schedule', 'Nouveau planning');
 }
@@ -2118,10 +2173,11 @@ function editScheduleInForm(id) {
   populateScheduleTagSelect(s.target_tag_id);
   document.getElementById('schedName').value = s.name;
   document.getElementById('schedTagSelect').value = s.target_tag_id;
+  updateScheduleValueInputs();
   document.getElementById('schedStart').value = s.start_time;
   document.getElementById('schedEnd').value = s.end_time;
-  document.getElementById('schedActiveVal').value = s.active_value;
-  document.getElementById('schedInactiveVal').value = s.inactive_value;
+  document.getElementById('schedActiveVal').value = String(s.active_value);
+  document.getElementById('schedInactiveVal').value = String(s.inactive_value);
   renderScheduleDaysPicker(Array.isArray(s.days) ? s.days : [1, 2, 3, 4, 5, 6, 7]);
   openModal('schedule', `Modifier le planning ${s.name}`);
 }
@@ -2149,15 +2205,43 @@ async function createScheduleRule() {
     notify('Sélectionnez au moins un jour de la semaine.', 'error');
     return;
   }
+  const tagId = document.getElementById('schedTagSelect').value;
+  const targetTag = state.tags[tagId];
+  const isBool = targetTag && targetTag.data_type === 'Bool';
+  const isInt = targetTag && targetTag.data_type === 'Int';
+  const rawActive = document.getElementById('schedActiveVal').value.trim();
+  const rawInactive = document.getElementById('schedInactiveVal').value.trim();
+
+  let active_value;
+  let inactive_value;
+  if (isBool) {
+    active_value = (rawActive.toLowerCase() === 'true' || rawActive === '1');
+    inactive_value = (rawInactive.toLowerCase() === 'true' || rawInactive === '1');
+  } else if (isInt) {
+    active_value = parseInt(rawActive, 10);
+    inactive_value = parseInt(rawInactive, 10);
+    if (isNaN(active_value) || isNaN(inactive_value)) {
+      notify('Valeur de consigne entière invalide.', 'error');
+      return;
+    }
+  } else {
+    active_value = parseFloat(rawActive);
+    inactive_value = parseFloat(rawInactive);
+    if (isNaN(active_value) || isNaN(inactive_value)) {
+      notify('Valeur de consigne numérique invalide.', 'error');
+      return;
+    }
+  }
+
   const existing = editingScheduleId && state.schedules.find(s => s.id === editingScheduleId);
   const saved = await postSchedule({
     id: editingScheduleId || ('sched-' + Date.now()),
     name: document.getElementById('schedName').value.trim(),
-    target_tag_id: document.getElementById('schedTagSelect').value,
+    target_tag_id: tagId,
     start_time: document.getElementById('schedStart').value,
     end_time: document.getElementById('schedEnd').value,
-    active_value: parseFloat(document.getElementById('schedActiveVal').value),
-    inactive_value: parseFloat(document.getElementById('schedInactiveVal').value),
+    active_value,
+    inactive_value,
     enabled: existing ? existing.enabled : true,
     days
   });
@@ -2528,7 +2612,7 @@ function switchTab(tab, btn) {
   if (tab === 'users' && !perms.can_manage_users) {
     return;
   }
-  if (tab === 'system' && !perms.can_manage_system) {
+  if (tab === 'system' && !perms.can_manage_system && !perms.can_view_historian) {
     return;
   }
 
@@ -2634,11 +2718,11 @@ function applyUserPermissionsToUi() {
   showEl('navBtn-schedules', perms.can_manage_schedules, 'flex');
   showEl('navBtn-historian', perms.can_view_historian, 'flex');
   showEl('navBtn-users', perms.can_manage_users, 'flex');
-  showEl('navBtn-system', perms.can_manage_system, 'flex');
+  showEl('navBtn-system', perms.can_manage_system || perms.can_view_historian, 'flex');
 
   // Masquer les en-têtes de rubriques vides selon le profil
   showEl('navGrpAuto', !!(perms.can_manage_flows || perms.can_manage_schedules), 'block');
-  showEl('navGrpConfig', !!(perms.can_manage_drivers_tags || perms.can_manage_users || perms.can_manage_system), 'block');
+  showEl('navGrpConfig', !!(perms.can_manage_drivers_tags || perms.can_manage_users || perms.can_manage_system || perms.can_view_historian), 'block');
 
   // Contrôles d'alimentation & Paramètres Système (Admin uniquement), Journal d'audit selon droits actuels
   showEl('adminPowerControls', perms.can_manage_system, 'flex');
@@ -2667,7 +2751,7 @@ function applyUserPermissionsToUi() {
     schedules: perms.can_manage_schedules,
     historian: perms.can_view_historian,
     users: perms.can_manage_users,
-    system: perms.can_manage_system
+    system: perms.can_manage_system || perms.can_view_historian
   };
   if (!tabAllowed[state.activeTab]) {
     switchTab('synoptic', document.getElementById('navBtn-synoptic'));

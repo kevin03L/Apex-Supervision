@@ -137,7 +137,15 @@ impl TagValue {
             (TagValue::Float(f), TagDataType::Float) => Ok(TagValue::Float(*f)),
             (TagValue::Text(s), TagDataType::Text) => Ok(TagValue::Text(s.clone())),
             (TagValue::Int(i), TagDataType::Float) => Ok(TagValue::Float(*i as f64)),
-            (TagValue::Float(f), TagDataType::Int) => Ok(TagValue::Int(f.round() as i64)),
+            (TagValue::Float(f), TagDataType::Int) => {
+                if !f.is_finite() {
+                    return Err(ScadaError::TypeMismatch {
+                        expected: "Int (fini)".to_string(),
+                        actual: format!("{:?}", f),
+                    });
+                }
+                Ok(TagValue::Int(f.round() as i64))
+            }
             (other, TagDataType::Bool) => {
                 other
                     .as_bool()
@@ -158,9 +166,10 @@ impl TagValue {
             }
             (other, TagDataType::Int) => other
                 .as_f64()
+                .filter(|v| v.is_finite())
                 .map(|v| TagValue::Int(v.round() as i64))
                 .ok_or_else(|| ScadaError::TypeMismatch {
-                    expected: "Int".to_string(),
+                    expected: "Int (fini)".to_string(),
                     actual: format!("{:?}", other),
                 }),
             (other, TagDataType::Text) => Ok(TagValue::Text(match other {
@@ -789,6 +798,10 @@ pub struct ProjectBackupBundle {
     pub dashboards: Vec<DashboardLayout>,
     pub flows: Vec<FlowGraph>,
     pub schedules: Vec<ScheduleRule>,
+    #[serde(default)]
+    pub symbols: Vec<SymbolLibraryItem>,
+    #[serde(default)]
+    pub settings: Option<SystemSettings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1079,6 +1092,22 @@ mod tests {
         );
         assert!(TagValue::Text("abc".into())
             .coerce_to(TagDataType::Float)
+            .is_err());
+        // S-32 : rejet systématique de NaN et ±Inf vers Int
+        assert!(TagValue::Float(f64::NAN)
+            .coerce_to(TagDataType::Int)
+            .is_err());
+        assert!(TagValue::Float(f64::INFINITY)
+            .coerce_to(TagDataType::Int)
+            .is_err());
+        assert!(TagValue::Float(f64::NEG_INFINITY)
+            .coerce_to(TagDataType::Int)
+            .is_err());
+        assert!(TagValue::Text("NaN".into())
+            .coerce_to(TagDataType::Int)
+            .is_err());
+        assert!(TagValue::Text("inf".into())
+            .coerce_to(TagDataType::Int)
             .is_err());
     }
 

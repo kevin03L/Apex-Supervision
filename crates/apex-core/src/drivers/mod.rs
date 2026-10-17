@@ -824,7 +824,7 @@ pub fn decode_registers_f32_be(regs: &[u16], word_swap: bool) -> Result<f64, Str
         BigEndian::write_u16(&mut buf[0..2], regs[0]);
         BigEndian::write_u16(&mut buf[2..4], regs[1]);
     }
-    Ok(round2(BigEndian::read_f32(&buf) as f64))
+    Ok(BigEndian::read_f32(&buf) as f64)
 }
 
 pub fn encode_f32_to_registers_be(val: f32, word_swap: bool) -> [u16; 2] {
@@ -907,7 +907,11 @@ impl IndustrialDriver for ModbusTcpDriver {
                     Ok(Err(e)) => {
                         let msg = format!("Connexion refusée : {}", e);
                         core_ref.record_driver_poll(&config.id, false, 0, Some(msg));
-                        publish_bad_disconnect_for_all(&config.tags, &core_tx).await;
+                        publish_bad_disconnect_for_all(
+                            &core_ref.get_tags_for_driver(&config.id),
+                            &core_tx,
+                        )
+                        .await;
                         tokio::time::sleep(Duration::from_secs(4)).await;
                         continue;
                     }
@@ -918,7 +922,11 @@ impl IndustrialDriver for ModbusTcpDriver {
                             3000,
                             Some("Timeout TCP 3000ms".to_string()),
                         );
-                        publish_bad_disconnect_for_all(&config.tags, &core_tx).await;
+                        publish_bad_disconnect_for_all(
+                            &core_ref.get_tags_for_driver(&config.id),
+                            &core_tx,
+                        )
+                        .await;
                         tokio::time::sleep(Duration::from_secs(4)).await;
                         continue;
                     }
@@ -962,7 +970,7 @@ impl IndustrialDriver for ModbusTcpDriver {
                                 // Défaut de transport : reconnexion
                                 Err(err) => {
                                     core_ref.record_driver_poll(&config.id, false, 0, Some(err));
-                                    publish_bad_disconnect_for_all(&config.tags, &core_tx).await;
+                                    publish_bad_disconnect_for_all(&core_ref.get_tags_for_driver(&config.id), &core_tx).await;
                                     break;
                                 }
                             }
@@ -1286,23 +1294,69 @@ async fn poll_modbus_tags(
                 }
             }
             Err(exc) => {
-                let key = format!("{:?}:{}:{}", block.area, block.start, block.count);
-                if warned.insert(key) {
-                    warn!(
-                        "Lecture Modbus {:?} {}..{} refusée par l'équipement : {}",
-                        block.area,
-                        block.start,
-                        block.start as u32 + block.count as u32,
-                        exc
-                    );
-                }
-                for &i in &block.members {
-                    let tag = readable[i];
-                    out.push((
-                        tag.id.clone(),
-                        fallback_value(tag.data_type),
-                        Quality::BadDisconnect,
-                    ));
+                if block.members.len() > 1 {
+                    for &i in &block.members {
+                        let tag = readable[i];
+                        let spec = specs[i];
+                        let single_block = ReadBlock {
+                            area: spec.area(),
+                            start: spec.address(),
+                            count: spec.width().min(65_536 - spec.address() as u32) as u16,
+                            members: vec![i],
+                        };
+                        match read_block(ctx, &single_block).await? {
+                            Ok(data) => match decode_from_block(&spec, single_block.start, &data) {
+                                Ok(v) => {
+                                    let v = v.coerce_to(tag.data_type).unwrap_or(v);
+                                    out.push((tag.id.clone(), v, Quality::Good));
+                                }
+                                Err(_) => out.push((
+                                    tag.id.clone(),
+                                    fallback_value(tag.data_type),
+                                    Quality::BadDisconnect,
+                                )),
+                            },
+                            Err(single_exc) => {
+                                let key = format!(
+                                    "{:?}:{}:{}",
+                                    single_block.area, single_block.start, single_block.count
+                                );
+                                if warned.insert(key) {
+                                    warn!(
+                                        "Lecture Modbus unitaire {:?} {}..{} refusée par l'équipement : {}",
+                                        single_block.area,
+                                        single_block.start,
+                                        single_block.start as u32 + single_block.count as u32,
+                                        single_exc
+                                    );
+                                }
+                                out.push((
+                                    tag.id.clone(),
+                                    fallback_value(tag.data_type),
+                                    Quality::BadDisconnect,
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    let key = format!("{:?}:{}:{}", block.area, block.start, block.count);
+                    if warned.insert(key) {
+                        warn!(
+                            "Lecture Modbus {:?} {}..{} refusée par l'équipement : {}",
+                            block.area,
+                            block.start,
+                            block.start as u32 + block.count as u32,
+                            exc
+                        );
+                    }
+                    for &i in &block.members {
+                        let tag = readable[i];
+                        out.push((
+                            tag.id.clone(),
+                            fallback_value(tag.data_type),
+                            Quality::BadDisconnect,
+                        ));
+                    }
                 }
             }
         }
@@ -1762,6 +1816,15 @@ mod tests {
         assert_eq!(encode_f32_to_registers_be(7.5, true), [0x0000, 0x40F0]);
         assert!(decode_registers_f32_be(&[1], false).is_err());
     }
+
+    #[test]
+    fn float32_preserves_precision_without_round2() {
+        // S-29 : une petite valeur brute (ex. 0.004) ne doit pas être tronquée à 0.00
+        let regs = encode_f32_to_registers_be(0.004, false);
+        let decoded = decode_registers_f32_be(&regs, false).unwrap();
+        assert!((decoded - 0.004).abs() < 1e-6);
+        assert!(decoded > 0.0039 && decoded < 0.0041);
+    }
     fn specs(addrs: &[&str]) -> Vec<ModbusAddressSpec> {
         addrs
             .iter()
@@ -1931,5 +1994,71 @@ mod tests {
         assert!(mqtt_topic_matches("bat/#", "bat/ta01/temp"));
         assert!(mqtt_topic_matches("bat/#", "bat"));
         assert!(!mqtt_topic_matches("bat/ta01", "bat/ta01/temp"));
+    }
+
+    #[tokio::test]
+    async fn modbus_block_failure_falls_back_to_individual_reads() {
+        // S-30 : Un bloc fusionné refusé par l'équipement décompose la lecture en requêtes unitaires
+        use super::modbus_slave::spawn_embedded_modbus_plc;
+        use std::net::SocketAddr;
+        use tokio_modbus::client::tcp;
+
+        // Port temporaire non standard conforme AGENTS.md (autre que 3000 et 5502)
+        let port = 5518;
+        spawn_embedded_modbus_plc(port).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let socket_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let mut ctx = tcp::connect_slave(socket_addr, tokio_modbus::Slave(1))
+            .await
+            .expect("connexion esclave modbus test");
+
+        // HR:126 est valide (PlcMemory a 128 registres : 0..127)
+        // HR:130 est hors mémoire (start 130 > 128)
+        // L'écart entre 126 et 130 est 4 (<= MODBUS_MAX_GAP 8), ils sont donc fusionnés en un bloc 126..131 (count = 5).
+        // Le bloc fusionné dépasse 128 et reçoit l'exception 0x02 Illegal Data Address.
+        // Avec S-30, il retente unitairement : HR:126 réussit (Good), HR:130 échoue (BadDisconnect).
+        let tags = vec![
+            RegisteredTag {
+                id: "TAG_OK".into(),
+                label: "TAG_OK".into(),
+                module_source: "MODBUS_TEST".into(),
+                protocol_address: "HR:126:INT16".into(),
+                data_type: TagDataType::Int,
+                unit: None,
+                writable: false,
+                deadband: 0.0,
+                scale_factor: 1.0,
+                scale_offset: 0.0,
+                historize: false,
+                alarm_config: Default::default(),
+            },
+            RegisteredTag {
+                id: "TAG_ERR".into(),
+                label: "TAG_ERR".into(),
+                module_source: "MODBUS_TEST".into(),
+                protocol_address: "HR:130:INT16".into(),
+                data_type: TagDataType::Int,
+                unit: None,
+                writable: false,
+                deadband: 0.0,
+                scale_factor: 1.0,
+                scale_offset: 0.0,
+                historize: false,
+                alarm_config: Default::default(),
+            },
+        ];
+
+        let mut warned = std::collections::HashSet::new();
+        let results = poll_modbus_tags(&mut ctx, &tags, &mut warned)
+            .await
+            .expect("poll_modbus_tags réussit sans erreur de transport");
+
+        assert_eq!(results.len(), 2);
+        let ok_tag = results.iter().find(|(id, _, _)| id == "TAG_OK").unwrap();
+        let err_tag = results.iter().find(|(id, _, _)| id == "TAG_ERR").unwrap();
+
+        assert_eq!(ok_tag.2, Quality::Good);
+        assert_eq!(err_tag.2, Quality::BadDisconnect);
     }
 }

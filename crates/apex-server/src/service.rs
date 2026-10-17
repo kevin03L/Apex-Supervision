@@ -184,18 +184,43 @@ fn install(config: Option<PathBuf>) -> Result<String, String> {
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
-        executable_path: exe,
+        executable_path: exe.clone(),
         launch_arguments,
         dependencies: vec![],
         account_name: Some(OsString::from(r"NT AUTHORITY\LocalService")),
         account_password: None,
     };
-    let service = mgr
-        .create_service(
-            &info,
-            ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_STATUS,
-        )
-        .map_err(|e| format!("création du service impossible : {}", explain(&e)))?;
+    let service = match mgr.create_service(
+        &info,
+        ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_STATUS,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            // S-28: Si le service existe déjà, on ouvre le service pour mettre à jour son chemin binaire et ses réglages
+            let open_res = mgr.open_service(
+                version::SERVICE_NAME,
+                ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_STATUS,
+            );
+            match open_res {
+                Ok(s) => {
+                    // Mise à jour de ImagePath / binPath via sc.exe config
+                    let mut bin_cmd = format!("\"{}\" service run", exe.display());
+                    if let Some(cfg) = &config {
+                        bin_cmd.push_str(&format!(" --config \"{}\"", cfg.display()));
+                    }
+                    let _ = std::process::Command::new("sc.exe")
+                        .args([
+                            "config",
+                            version::SERVICE_NAME,
+                            &format!("binPath= {}", bin_cmd),
+                        ])
+                        .output();
+                    s
+                }
+                Err(_) => return Err(format!("création du service impossible : {}", explain(&e))),
+            }
+        }
+    };
     let _ = service.set_description(DESCRIPTION);
     // Redémarrage automatique après un échec (10 s, 3 fois, compteur remis à zéro chaque jour)
     let _ = service.update_failure_actions(ServiceFailureActions {
@@ -219,7 +244,7 @@ fn install(config: Option<PathBuf>) -> Result<String, String> {
     });
     let _ = service.set_failure_actions_on_non_crash_failures(true);
     Ok(format!(
-        "Service « {} » installé (démarrage automatique, compte LocalService).",
+        "Service « {} » installé ou mis à jour (démarrage automatique, compte LocalService).",
         version::SERVICE_NAME
     ))
 }
