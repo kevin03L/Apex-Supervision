@@ -1289,10 +1289,20 @@ async fn poll_modbus_tags(
                 for &i in &block.members {
                     let tag = readable[i];
                     match decode_from_block(&specs[i], block.start, &data) {
-                        Ok(v) => {
-                            let v = v.coerce_to(tag.data_type).unwrap_or(v);
-                            out.push((tag.id.clone(), v, Quality::Good));
-                        }
+                        Ok(v) => match v.coerce_to(tag.data_type) {
+                            Ok(coerced) => out.push((tag.id.clone(), coerced, Quality::Good)),
+                            Err(e) => {
+                                warn!(
+                                    "Valeur brute Modbus incompatible pour '{}' ({:?} attendu) : {}",
+                                    tag.id, tag.data_type, e
+                                );
+                                out.push((
+                                    tag.id.clone(),
+                                    fallback_value(tag.data_type),
+                                    Quality::BadDisconnect,
+                                ));
+                            }
+                        },
                         Err(_) => out.push((
                             tag.id.clone(),
                             fallback_value(tag.data_type),
@@ -1314,10 +1324,22 @@ async fn poll_modbus_tags(
                         };
                         match read_block(ctx, &single_block).await? {
                             Ok(data) => match decode_from_block(&spec, single_block.start, &data) {
-                                Ok(v) => {
-                                    let v = v.coerce_to(tag.data_type).unwrap_or(v);
-                                    out.push((tag.id.clone(), v, Quality::Good));
-                                }
+                                Ok(v) => match v.coerce_to(tag.data_type) {
+                                    Ok(coerced) => {
+                                        out.push((tag.id.clone(), coerced, Quality::Good))
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Valeur brute Modbus incompatible pour '{}' ({:?} attendu) : {}",
+                                            tag.id, tag.data_type, e
+                                        );
+                                        out.push((
+                                            tag.id.clone(),
+                                            fallback_value(tag.data_type),
+                                            Quality::BadDisconnect,
+                                        ));
+                                    }
+                                },
                                 Err(_) => out.push((
                                     tag.id.clone(),
                                     fallback_value(tag.data_type),
@@ -1763,7 +1785,9 @@ impl IndustrialDriver for MqttDriver {
                                 for tag in core_ref.get_tags_for_driver(&config.id) {
                                     let (topic, _) = mqtt_split_address(&tag.protocol_address);
                                     if mqtt_topic_matches(topic, &publish.topic) {
-                                        let _ = core_tx.send(mqtt_state(&tag, &payload_str)).await;
+                                        if let Some(state) = mqtt_state(&tag, &payload_str) {
+                                            let _ = core_tx.send(state).await;
+                                        }
                                     }
                                 }
                             }
@@ -1830,19 +1854,54 @@ pub async fn discover_driver_tags(config: &DriverConfig) -> Result<Vec<Registere
     bacnet::discover(&config.id, &config.endpoint).await
 }
 
-/// Un message invalide dégrade immédiatement la qualité, y compris une clé JSON absente.
-fn mqtt_state(tag: &RegisteredTag, payload: &str) -> TagState {
-    let value = extract_mqtt_tag_value(&tag.protocol_address, payload)
-        .and_then(|v| v.coerce_to(tag.data_type).ok());
-    TagState {
-        tag_id: tag.id.clone(),
-        quality: if value.is_some() {
-            Quality::Good
-        } else {
-            Quality::BadDisconnect
-        },
-        value: value.unwrap_or_else(|| fallback_value(tag.data_type)),
-        timestamp: Utc::now(),
+/// Traite un message MQTT pour une variable donnée.
+/// Si l'adresse spécifie une clé JSON (`sujet#clé`) et que le message reçu est un objet JSON valide
+/// ne contenant pas cette clé (message partiel pour d'autres variables), renvoie `None` afin de ne pas
+/// dégrader ni écraser cette variable saine.
+/// Si le message est corrompu (non-JSON) ou que la valeur de la clé est incompatible, dégrade en `Quality::BadDisconnect`.
+fn mqtt_state(tag: &RegisteredTag, payload: &str) -> Option<TagState> {
+    let (_topic, json_key) = mqtt_split_address(&tag.protocol_address);
+    if let Some(key) = json_key {
+        match serde_json::from_str::<serde_json::Value>(payload) {
+            Ok(serde_json::Value::Object(map)) => {
+                if let Some(field) = map.get(key) {
+                    let value = serde_json::from_value::<TagValue>(field.clone())
+                        .ok()
+                        .and_then(|v| v.coerce_to(tag.data_type).ok());
+                    Some(TagState {
+                        tag_id: tag.id.clone(),
+                        quality: if value.is_some() {
+                            Quality::Good
+                        } else {
+                            Quality::BadDisconnect
+                        },
+                        value: value.unwrap_or_else(|| fallback_value(tag.data_type)),
+                        timestamp: Utc::now(),
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => Some(TagState {
+                tag_id: tag.id.clone(),
+                quality: Quality::BadDisconnect,
+                value: fallback_value(tag.data_type),
+                timestamp: Utc::now(),
+            }),
+        }
+    } else {
+        let value = extract_mqtt_tag_value(&tag.protocol_address, payload)
+            .and_then(|v| v.coerce_to(tag.data_type).ok());
+        Some(TagState {
+            tag_id: tag.id.clone(),
+            quality: if value.is_some() {
+                Quality::Good
+            } else {
+                Quality::BadDisconnect
+            },
+            value: value.unwrap_or_else(|| fallback_value(tag.data_type)),
+            timestamp: Utc::now(),
+        })
     }
 }
 
@@ -2204,13 +2263,94 @@ mod tests {
         tag.protocol_address = "capteur/temperature".into();
         tag.data_type = TagDataType::Float;
         for payload in ["NaN", "inf", "SENSOR_FAULT"] {
-            assert_eq!(mqtt_state(&tag, payload).quality, Quality::BadDisconnect);
+            assert_eq!(
+                mqtt_state(&tag, payload).unwrap().quality,
+                Quality::BadDisconnect
+            );
         }
-        assert_eq!(mqtt_state(&tag, "12.5").quality, Quality::Good);
+        assert_eq!(mqtt_state(&tag, "12.5").unwrap().quality, Quality::Good);
         for address in ["", "bat/+/cmd", "bat/#", "nul\0cmd"] {
             assert!(check_mqtt_write(address).is_err());
         }
         assert!(check_mqtt_write("bat/cmd").is_ok());
+    }
+
+    #[test]
+    fn vague3_mqtt_message_json_partiel_ne_degrade_pas_variables_saines() {
+        let mut tag_consigne = build_local_modbus_plc_config(15502).tags[0].clone();
+        tag_consigne.id = "GTB.CTA01.Consigne".into();
+        tag_consigne.protocol_address = "bat/cta01#consigne".into();
+        tag_consigne.data_type = TagDataType::Float;
+
+        let mut tag_defaut = tag_consigne.clone();
+        tag_defaut.id = "GTB.CTA01.Defaut".into();
+        tag_defaut.protocol_address = "bat/cta01#defaut".into();
+        tag_defaut.data_type = TagDataType::Bool;
+
+        // Message partiel contenant uniquement defaut : consigne ne doit PAS être dégradée (retourne None)
+        let payload_partiel = r#"{"defaut": true}"#;
+        assert!(
+            mqtt_state(&tag_consigne, payload_partiel).is_none(),
+            "Une variable saine ne doit pas recevoir de TagState lors d'un message JSON partiel"
+        );
+        let res_defaut = mqtt_state(&tag_defaut, payload_partiel).unwrap();
+        assert_eq!(res_defaut.quality, Quality::Good);
+        assert_eq!(res_defaut.value, TagValue::Bool(true));
+
+        // Message avec la clé présente mais valeur non convertible : dégradation en BadDisconnect
+        let payload_incompatible = r#"{"consigne": "TEXTE_NON_FLOAT"}"#;
+        let res_invalide = mqtt_state(&tag_consigne, payload_incompatible).unwrap();
+        assert_eq!(res_invalide.quality, Quality::BadDisconnect);
+        assert_eq!(res_invalide.value, TagValue::Float(0.0));
+
+        // Trame corrompue (non-JSON) : dégradation en BadDisconnect
+        let res_corrompu = mqtt_state(&tag_consigne, "PAS_DU_JSON").unwrap();
+        assert_eq!(res_corrompu.quality, Quality::BadDisconnect);
+    }
+
+    #[tokio::test]
+    async fn vague3_modbus_valeur_brute_incompatible_degradee_en_baddisconnect() {
+        use super::modbus_slave::spawn_embedded_modbus_plc;
+        use std::net::SocketAddr;
+        use tokio_modbus::client::tcp;
+
+        let port = 15506;
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let _server_task = spawn_embedded_modbus_plc(port).await;
+
+        let mut ctx = tcp::connect(addr)
+            .await
+            .expect("Connexion au simulateur Modbus");
+
+        use tokio_modbus::client::Writer;
+        let regs = encode_f32_to_registers_be(1e25, false);
+        ctx.write_multiple_registers(2, &regs)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let drv_cfg = build_local_modbus_plc_config(port);
+        // On configure une variable sur un registre FLOAT32 (HR:2:FLOAT32, qui contient 1e25)
+        // avec un type métier Int qui ne peut pas convertir un float hors plage i64 !
+        let mut bad_type_tag = drv_cfg.tags[0].clone();
+        bad_type_tag.id = "BAD_COERCE_TAG".into();
+        bad_type_tag.protocol_address = "HR:2:FLOAT32".into();
+        bad_type_tag.data_type = TagDataType::Int;
+
+        let mut warned = std::collections::HashSet::new();
+        let results = poll_modbus_tags(&mut ctx, &[bad_type_tag], &mut warned)
+            .await
+            .expect("poll_modbus_tags réussit");
+
+        assert_eq!(results.len(), 1);
+        let (id, val, quality) = &results[0];
+        assert_eq!(id, "BAD_COERCE_TAG");
+        assert_eq!(
+            *quality,
+            Quality::BadDisconnect,
+            "Une valeur brute non convertible doit être dégradée en BadDisconnect"
+        );
+        assert_eq!(*val, TagValue::Int(0));
     }
     #[test]
     fn vague2_mqtt_publication_file_pleine_non_bloquante() {

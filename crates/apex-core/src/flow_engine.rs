@@ -427,11 +427,14 @@ async fn run_flow_from_entry_node(
                 let Some(pv) = current_val.as_f64() else {
                     continue;
                 };
+                if !pv.is_finite() {
+                    continue;
+                }
                 let sp = if !setpoint_tag_id.is_empty() {
                     match core.tags_state.get(setpoint_tag_id) {
                         Some(s) if s.quality == Quality::Good => match s.value.as_f64() {
-                            Some(val) => val,
-                            None => continue,
+                            Some(val) if val.is_finite() => val,
+                            _ => continue,
                         },
                         Some(_) => {
                             // Consigne présente mais non Good (Uncertain ou BadDisconnect) : ne pas réguler
@@ -442,6 +445,9 @@ async fn run_flow_from_entry_node(
                 } else {
                     21.0
                 };
+                if !sp.is_finite() {
+                    continue;
+                }
 
                 let now = Utc::now();
                 let mut entry = core
@@ -454,8 +460,19 @@ async fn run_flow_from_entry_node(
                         last_eval: now,
                     });
 
-                let dt = (now - entry.last_eval).num_milliseconds().max(100) as f64 / 1000.0;
-                let dt = dt.clamp(0.1, 10.0);
+                if !entry.integral.is_finite() {
+                    entry.integral = 0.0;
+                }
+                if !entry.prev_error.is_finite() {
+                    entry.prev_error = 0.0;
+                }
+
+                let dt = ((now - entry.last_eval)
+                    .num_microseconds()
+                    .unwrap_or(0)
+                    .max(1000) as f64
+                    / 1_000_000.0)
+                    .clamp(0.001, 10.0);
 
                 let raw_err = sp - pv;
                 let error = if *reverse_acting { -raw_err } else { raw_err };
@@ -467,6 +484,9 @@ async fn run_flow_from_entry_node(
 
                 let output = (*kp * error + *ki * entry.integral + *kd * derivative)
                     .clamp(*min_out, *max_out);
+                if !output.is_finite() {
+                    continue;
+                }
                 next_value = TagValue::Float((output * 100.0).round() / 100.0);
             }
 
@@ -536,7 +556,13 @@ async fn run_flow_from_entry_node(
                 let Some(num) = current_val.as_f64() else {
                     continue;
                 };
+                if !num.is_finite() || !factor.is_finite() || !offset.is_finite() {
+                    continue;
+                }
                 let res = ((num * *factor + *offset) * 100.0).round() / 100.0;
+                if !res.is_finite() {
+                    continue;
+                }
                 next_value = TagValue::Float(res);
             }
 
@@ -776,19 +802,15 @@ fn eval_rhai_script(
         }
     }
 
-    let consigne_val = core
-        .tags_state
-        .get("GTB.CTA01.Consigne_Temp")
-        .and_then(|s| s.value.as_f64())
-        .unwrap_or(21.0);
-    scope.push("consigne", consigne_val);
-
     let ast = compiled_script(engine, core, script)?;
     let result: Dynamic = engine
         .eval_ast_with_scope(&mut scope, &ast)
         .map_err(|e| e.to_string())?;
 
     if let Ok(f) = result.as_float() {
+        if !f.is_finite() {
+            return Err("Résultat Rhai non fini (NaN ou infini)".to_string());
+        }
         Ok(TagValue::Float((f * 100.0).round() / 100.0))
     } else if let Ok(i) = result.as_int() {
         Ok(TagValue::Int(i))
@@ -1491,4 +1513,5 @@ mod tests {
         assert_eq!(out(&core), TagValue::Bool(false));
     }
     include!("flow_vague2_tests.rs");
+    include!("flow_vague3_tests.rs");
 }

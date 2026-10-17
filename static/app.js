@@ -1034,7 +1034,14 @@ function renderFlowEdges(flow) {
     if (!fromN || !toN) return;
 
     const x1 = fromN.x + 235;
-    const y1 = fromN.y + (edge.from_port === 'false' ? 75 : 52);
+    let y1 = fromN.y + 52;
+    if (fromN.kind.node_type === 'Threshold' || fromN.kind.node_type === 'Hysteresis') {
+      if (edge.from_port === 'true') y1 = fromN.y + 50;
+      else if (edge.from_port === 'false') y1 = fromN.y + 70;
+      else if (edge.from_port === 'out') y1 = fromN.y + 90;
+    } else if (edge.from_port === 'false') {
+      y1 = fromN.y + 75;
+    }
     const x2 = toN.x;
     const y2 = toN.y + 52;
     const cx1 = x1 + 70;
@@ -1084,11 +1091,11 @@ function renderFlowEditor() {
     } else if (k.node_type === 'Threshold') {
       headerColor = '#9333ea';
       bodySummary = `Si val ${k.operator} ${k.threshold} (hyst ${k.hysteresis})`;
-      outPorts = ['true', 'false'];
+      outPorts = ['true', 'false', 'out'];
     } else if (k.node_type === 'Hysteresis') {
       headerColor = '#7c3aed';
       bodySummary = `ON <= ${k.low_threshold} | OFF >= ${k.high_threshold}`;
-      outPorts = ['true', 'false'];
+      outPorts = ['true', 'false', 'out'];
     } else if (k.node_type === 'LogicGate') {
       headerColor = '#6366f1';
       bodySummary = `Porte combinatoire : ${k.gate}`;

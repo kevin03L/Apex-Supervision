@@ -835,10 +835,20 @@ async fn poll_s7_tags(
     for ((tag, addr), res) in readable.into_iter().zip(results) {
         let decoded = res.and_then(|bytes| addr.decode(&bytes));
         match decoded {
-            Ok(v) => {
-                let v = v.coerce_to(tag.data_type).unwrap_or(v);
-                out.push((tag.id.clone(), v, Quality::Good));
-            }
+            Ok(v) => match v.coerce_to(tag.data_type) {
+                Ok(coerced) => out.push((tag.id.clone(), coerced, Quality::Good)),
+                Err(e) => {
+                    warn!(
+                        "Valeur brute S7 incompatible pour '{}' ({:?} attendu) : {}",
+                        tag.id, tag.data_type, e
+                    );
+                    out.push((
+                        tag.id.clone(),
+                        fallback_value(tag.data_type),
+                        Quality::BadDisconnect,
+                    ));
+                }
+            },
             Err(e) => {
                 if warned.insert(format!("{}|{}|{}", tag.id, tag.protocol_address, e)) {
                     warn!(
@@ -1029,5 +1039,22 @@ mod tests {
         let res = S7Client::parse_s7_response(&valid_resp, pdu_ref);
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("PUT/GET"));
+    }
+
+    #[test]
+    fn vague3_s7_valeur_brute_incompatible_degradee_en_baddisconnect() {
+        let addr = S7Address::parse("DB1.DBD0", TagDataType::Float).unwrap();
+        // 4 octets correspondant à 1e25f32 en IEEE-754 big-endian
+        let bytes = 1e25f32.to_be_bytes().to_vec();
+        let decoded = addr.decode(&bytes).unwrap();
+        assert!(matches!(decoded, TagValue::Float(f) if f > 1e24));
+
+        // Un tag configuré avec TagDataType::Int ne peut pas coercer Float(1e25) :
+        // la valeur doit échouer à la coercition et être dégradée en BadDisconnect.
+        let coerced = decoded.coerce_to(TagDataType::Int);
+        assert!(
+            coerced.is_err(),
+            "Float(1e25) ne doit pas être coercible en Int"
+        );
     }
 }

@@ -2051,6 +2051,7 @@ impl ScadaCore {
             let _ = tx.send(result);
             if started {
                 tokio::time::sleep(Duration::from_millis(1000)).await;
+                let mut attempts: usize = 0;
                 loop {
                     match core.write_tag(&id, TagValue::Bool(false)).await {
                         Ok(_) => break,
@@ -2066,6 +2067,20 @@ impl ScadaCore {
                                 &id,
                                 &e.to_string(),
                             );
+                            if matches!(
+                                e,
+                                ScadaError::TagNotFound(_) | ScadaError::TagNotWritable(_)
+                            ) {
+                                break;
+                            }
+                            attempts += 1;
+                            if attempts >= 10 {
+                                warn!(
+                                    "Abandon de la remise à zéro de l'impulsion '{}' après 10 tentatives",
+                                    id
+                                );
+                                break;
+                            }
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
@@ -4326,7 +4341,7 @@ impl ScadaCore {
     }
 
     pub async fn logout(&self, token: &str) {
-        let clean = token.strip_prefix("Bearer ").unwrap_or(token).trim();
+        let clean = security::bearer_token(token);
         if let Some((_, session)) = self.sessions.remove(&security::session_key(clean)) {
             self.persist_sessions().await;
             let _ = self.session_revoke_tx.send(session.username.clone());
@@ -4468,8 +4483,7 @@ impl ScadaCore {
     /// son propre compte : il n'est pas déconnecté par sa propre action). La fermeture est
     /// écrite en base avant de rendre la main : elle survit à un redémarrage.
     async fn revoke_user_sessions_except(&self, username: &str, keep: Option<&str>) {
-        let keep =
-            keep.map(|t| security::session_key(t.strip_prefix("Bearer ").unwrap_or(t).trim()));
+        let keep = keep.map(|t| security::session_key(security::bearer_token(t)));
         self.sessions
             .retain(|key, s| s.username != username || keep.as_deref() == Some(key.as_str()));
         self.persist_sessions().await;
@@ -6680,4 +6694,5 @@ mod tests {
         );
     }
     include!("core_vague2_tests.rs");
+    include!("core_vague3_tests.rs");
 }
