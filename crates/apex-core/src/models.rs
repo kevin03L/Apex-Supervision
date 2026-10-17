@@ -131,13 +131,25 @@ impl TagValue {
     }
 
     pub fn coerce_to(&self, target: TagDataType) -> Result<TagValue, ScadaError> {
+        if matches!(self, TagValue::Float(f) if !f.is_finite()) {
+            return Err(ScadaError::BadRequest("Valeur non finie interdite".into()));
+        }
         match (self, target) {
             (TagValue::Bool(b), TagDataType::Bool) => Ok(TagValue::Bool(*b)),
             (TagValue::Int(i), TagDataType::Int) => Ok(TagValue::Int(*i)),
             (TagValue::Float(f), TagDataType::Float) => Ok(TagValue::Float(*f)),
             (TagValue::Text(s), TagDataType::Text) => Ok(TagValue::Text(s.clone())),
             (TagValue::Int(i), TagDataType::Float) => Ok(TagValue::Float(*i as f64)),
-            (TagValue::Float(f), TagDataType::Int) => Ok(TagValue::Int(f.round() as i64)),
+            (TagValue::Float(f), TagDataType::Int) => {
+                if !f.is_finite() || f.round() < i64::MIN as f64 || f.round() >= -(i64::MIN as f64)
+                {
+                    return Err(ScadaError::TypeMismatch {
+                        expected: "Int (fini)".to_string(),
+                        actual: format!("{:?}", f),
+                    });
+                }
+                Ok(TagValue::Int(f.round() as i64))
+            }
             (other, TagDataType::Bool) => {
                 other
                     .as_bool()
@@ -147,20 +159,22 @@ impl TagValue {
                         actual: format!("{:?}", other),
                     })
             }
-            (other, TagDataType::Float) => {
-                other
-                    .as_f64()
-                    .map(TagValue::Float)
-                    .ok_or_else(|| ScadaError::TypeMismatch {
-                        expected: "Float".to_string(),
-                        actual: format!("{:?}", other),
-                    })
-            }
+            (other, TagDataType::Float) => other
+                .as_f64()
+                .filter(|v| v.is_finite())
+                .map(TagValue::Float)
+                .ok_or_else(|| ScadaError::TypeMismatch {
+                    expected: "Float".to_string(),
+                    actual: format!("{:?}", other),
+                }),
             (other, TagDataType::Int) => other
                 .as_f64()
+                .filter(|v| {
+                    v.is_finite() && v.round() >= i64::MIN as f64 && v.round() < -(i64::MIN as f64)
+                })
                 .map(|v| TagValue::Int(v.round() as i64))
                 .ok_or_else(|| ScadaError::TypeMismatch {
-                    expected: "Int".to_string(),
+                    expected: "Int (fini)".to_string(),
                     actual: format!("{:?}", other),
                 }),
             (other, TagDataType::Text) => Ok(TagValue::Text(match other {
@@ -175,6 +189,9 @@ impl TagValue {
     pub fn has_significant_change(&self, previous: &Self, deadband: f64) -> bool {
         match (self, previous) {
             (TagValue::Float(new_v), TagValue::Float(old_v)) => {
+                if !new_v.is_finite() || !old_v.is_finite() {
+                    return new_v.to_bits() != old_v.to_bits();
+                }
                 (new_v - old_v).abs() >= deadband.max(1e-6)
             }
             _ => self != previous,
@@ -362,16 +379,10 @@ pub enum ProtocolType {
 }
 
 impl ProtocolType {
-    /// Protocoles sans implémentation réelle : simulateur GTB et drivers OPC-UA, BACnet/IP et
-    /// Siemens S7 (qui génèrent des valeurs fictives). Ils ne démarrent qu'avec la simulation active.
+    /// Driver de démonstration (simulateur GTB) : il ne démarre qu'avec la simulation active.
+    /// Tous les autres protocoles dialoguent avec de vrais équipements.
     pub fn is_simulated(&self) -> bool {
-        matches!(
-            self,
-            ProtocolType::Simulator
-                | ProtocolType::OpcUa
-                | ProtocolType::BacnetIp
-                | ProtocolType::SiemensS7
-        )
+        matches!(self, ProtocolType::Simulator)
     }
 }
 
@@ -495,6 +506,12 @@ pub struct DashboardLayout {
     pub description: String,
     pub grid_size: u32,
     pub widgets: Vec<DashboardWidget>,
+    /// Taille de l'écran cible (px) sur lequel la vue est dessinée ; l'IHM met cette fenêtre à
+    /// l'échelle de l'écran réel. Absente (vues antérieures) : déduite du contenu par l'IHM.
+    #[serde(default)]
+    pub canvas_width: Option<u32>,
+    #[serde(default)]
+    pub canvas_height: Option<u32>,
     /// Fixée par le serveur à chaque enregistrement : facultative dans les requêtes.
     #[serde(default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
@@ -618,6 +635,9 @@ pub struct ScheduleRule {
     pub start_time: String,
     /// Heure de fin au format `"HH:MM"` (ex: `"19:00"`).
     pub end_time: String,
+    /// Journée complète explicite, sans modifier le sens des anciens créneaux vides.
+    #[serde(default)]
+    pub full_day: bool,
     /// Valeur appliquée pendant la plage active (Mode Confort).
     pub active_value: TagValue,
     /// Valeur appliquée hors plage (Mode Réduit / Nuit).
@@ -660,6 +680,9 @@ impl ScheduleRule {
     /// et une heure `"HH:MM"` donnés. Une plage qui passe minuit (ex. 22:00 → 06:00) est
     /// rattachée à son jour de début.
     pub fn is_active_at(&self, weekday: u8, hhmm: &str) -> bool {
+        if self.full_day {
+            return self.days.contains(&weekday);
+        }
         let yesterday = if weekday <= 1 { 7 } else { weekday - 1 };
         let today_on = self.days.contains(&weekday);
         if self.start_time <= self.end_time {
@@ -766,7 +789,7 @@ pub struct SystemStatus {
     /// Mode sûr : aucune commande vers les équipements réels.
     #[serde(default)]
     pub safe_mode: bool,
-    /// Simulation active (automate embarqué, simulateur, protocoles simulés).
+    /// Simulation active (automate embarqué, simulateur GTB, données de démonstration).
     #[serde(default)]
     pub simulation_enabled: bool,
     /// Points d'historique écartés car la file d'écriture était saturée.
@@ -789,6 +812,10 @@ pub struct ProjectBackupBundle {
     pub dashboards: Vec<DashboardLayout>,
     pub flows: Vec<FlowGraph>,
     pub schedules: Vec<ScheduleRule>,
+    #[serde(default)]
+    pub symbols: Vec<SymbolLibraryItem>,
+    #[serde(default)]
+    pub settings: Option<SystemSettings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1080,6 +1107,22 @@ mod tests {
         assert!(TagValue::Text("abc".into())
             .coerce_to(TagDataType::Float)
             .is_err());
+        // S-32 : rejet systématique de NaN et ±Inf vers Int
+        assert!(TagValue::Float(f64::NAN)
+            .coerce_to(TagDataType::Int)
+            .is_err());
+        assert!(TagValue::Float(f64::INFINITY)
+            .coerce_to(TagDataType::Int)
+            .is_err());
+        assert!(TagValue::Float(f64::NEG_INFINITY)
+            .coerce_to(TagDataType::Int)
+            .is_err());
+        assert!(TagValue::Text("NaN".into())
+            .coerce_to(TagDataType::Int)
+            .is_err());
+        assert!(TagValue::Text("inf".into())
+            .coerce_to(TagDataType::Int)
+            .is_err());
     }
 
     #[test]
@@ -1091,6 +1134,20 @@ mod tests {
         assert!(!TagValue::Int(4).has_significant_change(&TagValue::Int(4), 0.0));
     }
 
+    #[test]
+    fn cov_filtering_handles_non_finite_floats_without_locking() {
+        let nan_val = TagValue::Float(f64::NAN);
+        let normal_val = TagValue::Float(20.0);
+        let inf_val = TagValue::Float(f64::INFINITY);
+        let neg_inf_val = TagValue::Float(f64::NEG_INFINITY);
+
+        assert!(normal_val.has_significant_change(&nan_val, 0.05));
+        assert!(nan_val.has_significant_change(&normal_val, 0.05));
+        assert!(normal_val.has_significant_change(&inf_val, 0.05));
+        assert!(neg_inf_val.has_significant_change(&inf_val, 0.05));
+        assert!(!normal_val.has_significant_change(&normal_val, 0.05));
+    }
+
     fn rule(start: &str, end: &str, days: Vec<u8>) -> ScheduleRule {
         ScheduleRule {
             id: "r".into(),
@@ -1098,6 +1155,7 @@ mod tests {
             target_tag_id: "t".into(),
             start_time: start.into(),
             end_time: end.into(),
+            full_day: false,
             active_value: TagValue::Float(1.0),
             inactive_value: TagValue::Float(0.0),
             enabled: true,
@@ -1163,5 +1221,20 @@ mod tests {
         let cfg: TagAlarmConfig = serde_json::from_str(r#"{"enabled":true,"high":27.0}"#).unwrap();
         assert!(!cfg.shelving_disabled);
         assert!(cfg.deadband.is_none());
+    }
+
+    #[test]
+    fn vague2_conversions_refusent_non_finis_et_saturation() {
+        for v in [
+            TagValue::Text("NaN".into()),
+            TagValue::Text("inf".into()),
+            TagValue::Float(f64::INFINITY),
+        ] {
+            assert!(v.coerce_to(TagDataType::Float).is_err());
+            assert!(v.coerce_to(TagDataType::Int).is_err());
+        }
+        for v in [1e30, -1e30, -(i64::MIN as f64)] {
+            assert!(TagValue::Float(v).coerce_to(TagDataType::Int).is_err());
+        }
     }
 }

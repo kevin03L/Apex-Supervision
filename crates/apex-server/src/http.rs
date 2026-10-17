@@ -148,6 +148,7 @@ pub fn router(state: AppState, web_dir: &FsPath) -> Router {
         .route("/api/tags", get(api_get_tags).post(api_upsert_tag))
         .route("/api/tags/:id", delete(api_delete_tag))
         .route("/api/tags/:id/write", post(api_write_tag))
+        .route("/api/tags/:id/pulse", post(api_pulse_tag))
         // --- DRIVERS ---
         .route("/api/drivers", get(api_get_drivers).post(api_add_driver))
         .route(
@@ -326,7 +327,7 @@ async fn security_headers_middleware(req: Request, next: Next) -> Response {
             "content-security-policy",
             HeaderValue::from_static(
                 "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; \
-                 img-src 'self' data: blob:; connect-src 'self' ws: wss:; object-src 'none'; \
+                 img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; \
                  base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
             ),
         );
@@ -406,9 +407,11 @@ async fn api_health(
 
 async fn api_auth_login(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
-    let resp = state.core.login(req).await?;
+    let client_ip = peer.ip().to_string();
+    let resp = state.core.login(req, Some(&client_ip)).await?;
     Ok(Json(resp))
 }
 
@@ -633,6 +636,7 @@ async fn api_system_import(
         .core
         .import_project_bundle(&user.0.username, bundle)
         .await?;
+    state.core.notify_snapshot();
     Ok(Json(report))
 }
 
@@ -676,6 +680,23 @@ async fn api_delete_tag(
     require_supervisor(&user)?;
     state.core.delete_tag(&user.0.username, &tag_id).await?;
     Ok(Json(serde_json::json!({ "deleted": tag_id })))
+}
+
+async fn api_pulse_tag(
+    Path(tag_id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<TagState>, ApiError> {
+    require_supervisor(&user)?;
+    let updated = state.core.pulse_tag(&tag_id).await?;
+    state.core.record_audit(
+        &user.0.username,
+        "CONSIGNE",
+        "PULSE_TAG",
+        &tag_id,
+        "Impulsion de 1 seconde, extinction côté serveur",
+    );
+    Ok(Json(updated))
 }
 
 async fn api_write_tag(
@@ -735,15 +756,9 @@ async fn api_add_driver(
 }
 
 /// Refus d'un driver réservé à la simulation alors qu'elle est désactivée.
-fn simulation_only_message(protocol: &ProtocolType) -> String {
-    let what = match protocol {
-        ProtocolType::Simulator => "Le simulateur GTB est un driver de démonstration".to_string(),
-        other => format!("Le protocole {other:?} n'a pas encore de driver réel (valeurs simulées)"),
-    };
-    format!(
-        "{what} : il n'est disponible que lorsque la simulation est active \
-         ([simulation] enabled = true dans la configuration du moteur)"
-    )
+fn simulation_only_message(_protocol: &ProtocolType) -> String {
+    "Le simulateur GTB est un driver de démonstration : il n'est disponible que lorsque la simulation est active \
+     ([simulation] enabled = true dans la configuration du moteur)".to_string()
 }
 
 async fn api_update_driver(
@@ -1079,6 +1094,17 @@ async fn api_purge_history(
     Ok(Json(serde_json::json!({ "purged_rows": deleted })))
 }
 
+/// Neutralise l'injection de formules dans les tableurs (CSV injection : =, +, -, @),
+/// y compris lorsqu'elles sont précédées d'espaces, de tabulations ou de sauts de ligne (S-36).
+pub(crate) fn escape_csv_text(s: &str) -> String {
+    let s = s.replace([';', '\n', '\r', '\t'], " ");
+    if s.trim_start().starts_with(['=', '+', '-', '@']) {
+        format!("'{}", s)
+    } else {
+        s
+    }
+}
+
 async fn api_export_history_csv(
     Path(tag_id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
@@ -1097,15 +1123,7 @@ async fn api_export_history_csv(
             apex_core::models::TagValue::Float(f) => format!("{:.3}", f),
             apex_core::models::TagValue::Int(i) => i.to_string(),
             apex_core::models::TagValue::Bool(b) => (if b { 1 } else { 0 }).to_string(),
-            // Neutralise l'injection de formules dans Excel (=, +, -, @)
-            apex_core::models::TagValue::Text(s) => {
-                let s = s.replace([';', '\n', '\r'], " ");
-                if s.starts_with(['=', '+', '-', '@']) {
-                    format!("'{}", s)
-                } else {
-                    s
-                }
-            }
+            apex_core::models::TagValue::Text(s) => escape_csv_text(&s),
         };
         csv.push_str(&format!(
             "{};{};{};{}\n",
@@ -1186,6 +1204,8 @@ async fn handle_realtime_socket(
     let mut drv_rx = state.core.subscribe_drivers();
     let mut trace_rx = state.core.subscribe_flow_traces();
     let mut settings_rx = state.core.subscribe_settings();
+    let mut revoke_rx = state.core.subscribe_session_revocation();
+    let mut snapshot_rx = state.core.subscribe_snapshot_notify();
     // Vérifie périodiquement que la session est toujours valide (déconnexion, compte désactivé)
     let mut session_check = tokio::time::interval(Duration::from_secs(30));
     session_check.tick().await;
@@ -1244,7 +1264,16 @@ async fn handle_realtime_socket(
                             break;
                         }
                     }
-                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Ok(_) => {}
+                    // S-24: Réémission de l'état complet lors d'un RecvError::Lagged
+                    Err(RecvError::Lagged(_)) => {
+                        drv_rx = drv_rx.resubscribe();
+                        if !viewer
+                            && !send_ws(&mut socket, &WsServerMessage::DriverListUpdate(state.core.get_all_drivers())).await
+                        {
+                            break;
+                        }
+                    }
                     Err(RecvError::Closed) => break,
                 }
             }
@@ -1266,12 +1295,56 @@ async fn handle_realtime_socket(
                             break;
                         }
                     }
-                    Err(RecvError::Lagged(_)) => {}
+                    // S-24: Réémission des réglages complets lors d'un RecvError::Lagged
+                    Err(RecvError::Lagged(_)) => {
+                        settings_rx = settings_rx.resubscribe();
+                        if !send_ws(&mut socket, &WsServerMessage::SettingsUpdate(state.core.get_settings())).await {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            // S-20: Rafraîchissement complet du snapshot lors d'une importation de projet
+            snapshot_res = snapshot_rx.recv() => {
+                match snapshot_res {
+                    Ok(()) => {
+                        if !send_ws(&mut socket, &build_snapshot(&state, viewer)).await {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        snapshot_rx = snapshot_rx.resubscribe();
+                        if !send_ws(&mut socket, &build_snapshot(&state, viewer)).await {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            // S-24: Fermeture immédiate du socket lors de la révocation de session
+            revoke_res = revoke_rx.recv() => {
+                match revoke_res {
+                    Ok(revoked_user) => {
+                        if revoked_user == user.0.username
+                            && state.core.resolve_user(Some(&token)).is_none()
+                        {
+                            let _ = socket.send(Message::Close(None)).await;
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        revoke_rx = revoke_rx.resubscribe();
+                        if state.core.resolve_user(Some(&token)).is_none() {
+                            let _ = socket.send(Message::Close(None)).await;
+                            break;
+                        }
+                    }
                     Err(RecvError::Closed) => break,
                 }
             }
             _ = session_check.tick() => {
-                if state.core.resolve_user(Some(&token)).is_none() {
+                if !state.core.is_session_valid(Some(&token)) {
                     let _ = socket.send(Message::Close(None)).await;
                     break;
                 }
@@ -1295,21 +1368,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn refus_hors_simulation_sur_une_ligne_et_adapte_au_protocole() {
-        for protocol in [
-            ProtocolType::Simulator,
-            ProtocolType::OpcUa,
-            ProtocolType::BacnetIp,
-            ProtocolType::SiemensS7,
-        ] {
-            let message = simulation_only_message(&protocol);
-            assert!(!message.contains('\n'), "{message}");
-            assert!(!message.contains("  "), "{message}");
-            assert!(message.contains("[simulation] enabled = true"), "{message}");
-        }
-        let simulator = simulation_only_message(&ProtocolType::Simulator);
-        assert!(simulator.contains("simulateur GTB"), "{simulator}");
-        assert!(!simulator.contains("driver réel"), "{simulator}");
-        assert!(simulation_only_message(&ProtocolType::OpcUa).contains("OpcUa"));
+    fn refus_hors_simulation_sur_une_ligne() {
+        let message = simulation_only_message(&ProtocolType::Simulator);
+        assert!(!message.contains('\n'), "{message}");
+        assert!(!message.contains("  "), "{message}");
+        assert!(message.contains("[simulation] enabled = true"), "{message}");
+        assert!(message.contains("simulateur GTB"), "{message}");
+    }
+
+    #[test]
+    fn csv_anti_formula_escaping() {
+        assert_eq!(escape_csv_text("Texte normal"), "Texte normal");
+        assert_eq!(escape_csv_text("=1+1"), "'=1+1");
+        assert_eq!(escape_csv_text(" =1+1"), "' =1+1");
+        assert_eq!(escape_csv_text("\n=1+1"), "' =1+1");
+        assert_eq!(
+            escape_csv_text("\t=cmd|' /C calc'!A0"),
+            "' =cmd|' /C calc'!A0"
+        );
+        assert_eq!(escape_csv_text("+100"), "'+100");
+        assert_eq!(escape_csv_text("-50"), "'-50");
+        assert_eq!(escape_csv_text("@SUM(A1:A10)"), "'@SUM(A1:A10)");
+        assert_eq!(escape_csv_text("  @SUM(A1:A10)"), "'  @SUM(A1:A10)");
+        assert_eq!(escape_csv_text("a;b;c"), "a b c");
     }
 }

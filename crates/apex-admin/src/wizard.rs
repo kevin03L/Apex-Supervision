@@ -356,7 +356,7 @@ impl Wizard {
         );
         form::hint(
             ui,
-            "Automate Modbus embarqué, simulateur GTB et drivers OPC-UA / BACnet / S7 SIMULÉS. \
+            "Automate Modbus embarqué, simulateur GTB et données de démonstration. \
              À réserver à la démonstration et à la formation : désactivez-la en production.",
         );
         if self.cfg.simulation.enabled {

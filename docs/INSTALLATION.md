@@ -22,6 +22,8 @@ Les opérateurs utilisent l'IHM web depuis un navigateur, à l'adresse `http://<
 
 ### 1.2 Installation
 
+> **Smart App Control (Windows 11)** : un installateur non signé est bloqué si Smart App Control est actif ; utiliser un build signé.
+
 1. Vérifiez l'empreinte de l'installateur :
    `Get-FileHash apex-supervision-<version>-windows-x64-setup.exe` doit afficher la valeur du fichier `.sha256` publié avec lui.
 2. Lancez `apex-supervision-<version>-windows-x64-setup.exe` et acceptez l'élévation (UAC).
@@ -50,7 +52,7 @@ Contenu installé :
 | Menu Démarrer | « Apex Supervision — Administration », « Assistant de configuration », « Documentation » |
 
 Permissions posées par l'installation, et réappliquées à chaque mise à jour (`apex-scada service permissions`) :
-- toute l'arborescence `C:ProgramDataApex Supervision` appartient au groupe Administrateurs, et l'héritage des droits de `C:ProgramData` (où tout utilisateur peut créer des fichiers) est coupé ;
+- toute l'arborescence `C:\ProgramData\Apex Supervision` appartient au groupe Administrateurs, et l'héritage des droits de `C:\ProgramData` (où tout utilisateur peut créer des fichiers) est coupé ;
 - `config` et `backups` : lecture par les utilisateurs et le service, modification par les administrateurs seulement ;
 - `logs` : écriture par le service, lecture par les utilisateurs (utilitaire desktop) ;
 - `data` et `run` : SYSTEM, Administrateurs et le service uniquement.
@@ -58,6 +60,14 @@ Permissions posées par l'installation, et réappliquées à chaque mise à jour
 L'utilitaire s'exécute en utilisateur standard, avec la configuration en lecture seule. Pour la modifier, utilisez le bouton **« Relancer en administrateur »**. Les actions sur le service (démarrer, arrêter, démarrage automatique) demandent une confirmation UAC au moment où elles sont lancées.
 
 > L'assistant lancé à la fin de l'installation hérite des droits administrateur de l'installateur (il doit écrire la configuration et régler le service). Fermez-le une fois la configuration terminée ; relancez ensuite l'utilitaire normalement depuis le menu Démarrer.
+
+### 1.2.1 Première connexion et comptes d'usine
+
+Au premier démarrage sur une base vierge :
+- **En production (simulation désactivée)** : seul le compte administrateur `admin` est créé, avec son mot de passe initial `admin123`. Les comptes `superviseur` et `visu` ne sont pas créés.
+- **En démonstration (simulation active)** : les trois comptes d'usine `admin`/`admin123`, `superviseur`/`super123` et `visu`/`visu123` sont créés.
+
+**Obligation de sécurité** : connectez-vous immédiatement avec le compte `admin` et changez impérativement son mot de passe depuis l'IHM (clic sur le profil en haut à droite → « Changer mon mot de passe »). Le moteur émet un avertissement de sécurité dans ses journaux à chaque démarrage tant que le mot de passe d'usine reste actif. Une base existante n'est jamais modifiée lors des démarrages ultérieurs.
 
 ### 1.3 Installation silencieuse (déploiement)
 
@@ -242,3 +252,7 @@ sudo systemctl start apex-scada
 | Moteur joignable ? | `curl http://127.0.0.1:3000/api/health` |
 
 L'onglet « Diagnostics » de l'utilitaire enchaîne toutes ces vérifications et produit un rapport à joindre à une demande d'assistance.
+
+Si l'assistant de première configuration est annulé, le service reste arrêté.
+Terminez la configuration dans l'utilitaire d'administration, puis démarrez le service
+avec cet utilitaire ou la commande `apex-scada service start` avant de quitter le poste.

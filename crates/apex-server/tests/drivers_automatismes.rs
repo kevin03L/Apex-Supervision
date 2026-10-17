@@ -3,7 +3,7 @@
 //! actif) puis interrogé uniquement par HTTP.
 //!
 //! Aucune commande n'est envoyée à un équipement : les refus testés interviennent avant tout
-//! envoi, et le mode sûr bloque de toute façon les consignes vers les drivers non simulés.
+//! envoi, et le mode sûr bloque de toute façon les consignes vers les drivers réels (les cinq protocoles industriels).
 
 #[allow(dead_code)]
 mod common;
@@ -79,6 +79,32 @@ fn variable_modbus_inscriptible_en_lecture_seule_refusee() {
 }
 
 #[test]
+fn adresse_modbus_invalide_refusee_meme_en_lecture_seule() {
+    let srv = Server::start("tag-modbus-syntaxe");
+    let admin = srv.login(ADMIN);
+    let tag = |address: &str| -> Value {
+        json!({
+            "id": "MODBUS.GF01.Test_Syntaxe",
+            "label": "Test Syntaxe",
+            "module_source": MODBUS_DRIVER,
+            "protocol_address": address,
+            "data_type": "Float",
+            "unit": null,
+            "writable": false,
+            "deadband": 0.0,
+            "scale_factor": 1.0,
+            "scale_offset": 0.0,
+            "historize": false,
+            "alarm_config": { "enabled": false }
+        })
+    };
+    for bad in ["HR:0:FLOAT", "INVALIDE:0"] {
+        let r = srv.call("POST", "/api/tags", Some(&admin), Some(&tag(bad)));
+        assert_eq!(r.status, 400, "{bad} : {}", r.text());
+    }
+}
+
+#[test]
 fn flux_avec_script_rhai_invalide_refuse() {
     let srv = Server::start("rhai");
     let admin = srv.login(ADMIN);
@@ -117,9 +143,9 @@ fn import_sans_simulation_ecarte_les_drivers_simules() {
     let admin = srv.login(ADMIN);
 
     let sim_tag = json!({
-        "id": "OPC_DEMO.Temp",
+        "id": "SIM_DEMO.Temp",
         "label": "Température",
-        "module_source": "OPC_DEMO",
+        "module_source": "SIM_DEMO",
         "protocol_address": "ns=2;s=Temp",
         "data_type": "Float",
         "unit": null,
@@ -134,10 +160,10 @@ fn import_sans_simulation_ecarte_les_drivers_simules() {
         "exported_at": "2026-10-17T00:00:00Z",
         "version": "1.1.0",
         "drivers": [{
-            "id": "OPC_DEMO",
-            "name": "OPC-UA de démonstration",
-            "protocol": "OpcUa",
-            "endpoint": "opc.tcp://127.0.0.1:4840",
+            "id": "SIM_DEMO",
+            "name": "Simulateur de démonstration",
+            "protocol": "Simulator",
+            "endpoint": "local",
             "enabled": true,
             "tags": [sim_tag.clone()]
         }],
@@ -159,7 +185,7 @@ fn import_sans_simulation_ecarte_les_drivers_simules() {
             .as_array()
             .expect("liste des drivers")
             .iter()
-            .any(|d| d["id"] == "OPC_DEMO"),
+            .any(|d| d["id"] == "SIM_DEMO"),
         "driver simulé enregistré sans simulation"
     );
     let tags = srv.call("GET", "/api/tags", Some(&admin), None).json();
@@ -168,7 +194,7 @@ fn import_sans_simulation_ecarte_les_drivers_simules() {
             .as_array()
             .expect("liste des tags")
             .iter()
-            .any(|t| t["id"] == "OPC_DEMO.Temp"),
+            .any(|t| t["id"] == "SIM_DEMO.Temp"),
         "variable d'un driver simulé enregistrée sans simulation"
     );
 }

@@ -188,8 +188,8 @@ pub struct SafetyConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SimulationConfig {
-    /// Active l'automate Modbus embarqué, le simulateur GTB et les drivers de protocoles simulés
-    /// (OPC-UA, BACnet/IP, S7). Désactivé par défaut pour une installation.
+    /// Active l'automate Modbus embarqué, le simulateur GTB et les données de démonstration.
+    /// Désactivé par défaut pour une installation.
     pub enabled: bool,
     /// Port de l'automate Modbus TCP embarqué (écoute sur 127.0.0.1 uniquement).
     pub modbus_slave_port: u16,

@@ -11,7 +11,7 @@ Ce guide s'adresse à la personne chargée d'installer et d'exploiter le moteur.
 | Réseau, port, emplacements, journalisation, rétention, sessions, mode sûr, simulation | Fichier `apex-scada.toml`, via l'**utilitaire desktop** ou la CLI | Au **redémarrage** du moteur |
 | Démarrage automatique du service | Utilitaire (onglet « État du moteur ») ou gestionnaire de services | Immédiate |
 | Comptes, mots de passe, rôles | IHM web (Administrateur) | Immédiate |
-| Mise en sommeil des alarmes (activation, durée maximale) | IHM web, onglet « Historian & Système » | Immédiate |
+| Mise en sommeil des alarmes (activation, durée maximale) | IHM web, onglet « Système » | Immédiate |
 | Drivers, variables, synoptiques, flux, plannings | IHM web | Immédiate |
 
 Le fichier de configuration a **un seul rédacteur à la fois**. Le moteur le lit sans jamais le réécrire. L'utilitaire et la CLI l'écrivent sous verrou, en écriture atomique (fichier temporaire, puis renommage), après une sauvegarde horodatée.
@@ -38,7 +38,7 @@ Emplacement : `C:\ProgramData\Apex Supervision\config\apex-scada.toml` sous Wind
 | `logging.file_enabled` | `true` | — | Fichiers quotidiens `apex-scada.AAAA-MM-JJ.log`, en plus de la sortie standard. |
 | `logging.retention_files` | `14` | 1 à 365 | Nombre de fichiers journaliers conservés. |
 | `safety.safe_mode` | `false` | — | **Mode sûr** : aucune commande vers les équipements réels (voir §5). |
-| `simulation.enabled` | `false` (installation), `true` (portable) | — | Automate Modbus embarqué, simulateur GTB et protocoles simulés (voir §6). |
+| `simulation.enabled` | `false` (installation), `true` (portable) | — | Automate Modbus embarqué, simulateur GTB et données de démonstration (voir §6). |
 | `simulation.modbus_slave_port` | `5502` | ≠ port web | Port de l'automate embarqué, en écoute sur `127.0.0.1` uniquement. |
 
 Le fichier ne contient **aucun secret**. Les comptes sont en base, avec des mots de passe hachés en Argon2id, et le jeton de contrôle local est régénéré à chaque démarrage.
@@ -102,36 +102,135 @@ Sous Windows, le code de sortie du service est visible dans `apex-scada service 
 ## 5. Mode sûr (mise en service)
 
 Avec `safety.safe_mode = true`, **aucune commande n'est envoyée aux équipements réels** :
-- les écritures depuis l'IHM sont refusées, avec un message explicite ;
+- les écritures depuis l'IHM sont refusées, avec un message explicite (HTTP 403) ;
 - le planificateur et les sorties des flux logiques sont bloqués ;
 - l'acquisition, les alarmes et l'historique fonctionnent normalement.
 
+Le mode sûr bloque toute écriture vers l'ensemble des **cinq protocoles industriels réels** (Modbus TCP, MQTT, Siemens S7, OPC-UA et BACnet/IP). Seul le simulateur GTB (driver simulé) reste pilotable.
+
 L'IHM signale l'effet du mode sûr : un planning actif dont la variable cible appartient à un équipement réel est affiché **SUSPENDU (mode sûr)** en orange, et un flux dont une sortie vise un équipement réel est marqué 🟠 suspendu, avec la liste des sorties bloquées.
 
-Les drivers simulés restent pilotables. Utilisez ce mode pour vérifier une installation, une configuration de drivers ou une mise à jour sans risque physique, puis désactivez-le et redémarrez le moteur.
+Utilisez ce mode pour vérifier une installation, une configuration de drivers ou une mise à jour sans risque physique, puis désactivez-le et redémarrez le moteur.
 
 Sans mode sûr, le planificateur et les flux **écrivent sur les équipements dès le démarrage du moteur**. Tenez-en compte avant tout redémarrage en exploitation.
 
 ---
 
-## 6. Simulation et protocoles simulés
+## 6. Simulation et protocoles
 
-`simulation.enabled = true` active :
+Apex Supervision intègre cinq protocoles industriels réels dialoguant avec de vrais équipements matériels ou logiciels, ainsi qu'un environnement de simulation pour les tests et la formation.
+
+### Règles communes aux protocoles réels
+
+- **Détection des coupures et reconnexion** : si un équipement ne répond plus, la liaison passe à l'état déconnecté, la qualité de ses variables est dégradée en `BadDisconnect` et le moteur tente automatiquement la reconnexion à chaque cycle.
+- **Isolation des erreurs d'adressage** : une adresse invalide ou refusée par l'équipement ne dégrade que sa variable propre ; la liaison du driver et les autres variables restent actives.
+- **Contrôle avant émission** : toute consigne hors de la plage admissible de son type (dépassement de capacité, type incompatible) est rejetée immédiatement (HTTP 400) avant tout envoi sur le réseau.
+- **Mode sûr** : bloque toute écriture vers ces cinq protocoles.
+
+---
+
+### 6.1 Modbus TCP
+
+Communication maître Modbus TCP standard, avec lecture optimisée par blocs de registres contigus.
+
+- **Endpoint** : `IP:port` (port par défaut : 502, ex. `192.168.1.10:502` ou `192.168.1.10`).
+- **Adresses supportées** :
+  - Bobines (Coils) : `COIL:n` (inscriptibles).
+  - Entrées discrètes : `DI:n` (lecture seule).
+  - Registres d'entrée : `IR:n` ou `IR:n:FLOAT32` (lecture seule).
+  - Registres de maintien : `HR:n` ou `HR:n:INT16`, `HR:n:UINT16`, `HR:n:INT32`, `HR:n:FLOAT32`, `HR:n:FLOAT32_SWAP` (inscriptibles).
+- **Fonctionnement et limites** :
+  - Délai maximal de réponse de 3 secondes par requête.
+  - Liaison déclarée établie dès la première réponse reçue.
+  - Pas d'auto-découverte.
+
+---
+
+### 6.2 MQTT
+
+Souscription et publication MQTT pour les équipements IoT et les passerelles de télémétrie.
+
+- **Endpoint** : `mqtt://hôte:port` (port par défaut : 1883, ex. `mqtt://192.168.1.50:1883`).
+- **Adresses (sujets)** :
+  - Sujet complet : `sujet` (ex. `atelier/temperature`).
+  - Clé JSON : `sujet#clé` (ex. `telemetrie/groupe1#puissance`).
+  - En lecture, les jokers `+` (un niveau) et `#` (multi-niveaux) sont supportés.
+- **Fonctionnement et limites** :
+  - Publications de consigne émises avec une qualité de service QoS 1.
+  - Identifiant client MQTT de la forme `apex-scada-<id>`.
+  - Pas encore d'authentification (utilisateur/mot de passe) ni de TLS.
+  - Pas d'auto-découverte.
+
+---
+
+### 6.3 Siemens S7 (S7-300, S7-400, S7-1200, S7-1500)
+
+Communication native ISO-on-TCP avec les automates programmables Siemens.
+
+- **Endpoint** : `IP[:port][?rack=R&slot=S]` (port 102 par défaut, rack 0, slot 1 pour S7-1200/1500 ; pour S7-300, spécifier `slot=2`, ex. `192.168.1.20:102?rack=0&slot=2`).
+- **Adresses supportées** :
+  - Blocs de données (DB) : `DB10.DBD0:REAL`, `DB10.DBX4.0`, `DB10.DBW2:INT`.
+  - Mémentos : `MW10`, `MD20`, `M0.1`.
+  - Entrées physiques : `I0.0` ou notation Siemens `E0.0`, `IW64` (lecture seule).
+  - Sorties physiques : `Q0.0` ou notation Siemens `A0.0` (inscriptibles).
+  - Types de données : `BOOL`, `BYTE`, `INT`, `WORD`, `DINT`, `DWORD`, `REAL`.
+- **Fonctionnement et limites** :
+  - S7-1200/1500 : autoriser l'accès PUT/GET dans les propriétés de la CPU sous TIA Portal, et configurer les blocs de données (DB) en accès standard (non optimisé).
+  - Les entrées physiques ne sont pas inscriptibles.
+  - Pas d'auto-découverte.
+
+---
+
+### 6.4 OPC-UA
+
+Client OPC-UA binaire pour serveurs d'automatismes et passerelles SCADA.
+
+- **Endpoint** : `opc.tcp://hôte:4840[/chemin]` (ex. `opc.tcp://192.168.1.30:4840`).
+- **Adresses (NodeId)** :
+  - Identifiant chaîne : `ns=2;s=Nom`.
+  - Identifiant numérique : `ns=3;i=1002`.
+- **Fonctionnement et limites** :
+  - Connexion sans chiffrement et session anonyme uniquement pour l'instant.
+  - L'écriture d'une consigne est automatiquement convertie dans le type du nœud (appris lors de la lecture).
+  - Certificats de la bibliothèque rangés dans `<données>/opcua-pki`.
+  - Pas d'auto-découverte.
+
+---
+
+### 6.5 BACnet/IP
+
+Protocole normalisé pour la gestion technique du bâtiment (GTB).
+
+- **Endpoint** : `IP[:port]` (port standard UDP : 47808, ex. `192.168.1.40:47808` ou `192.168.1.40`).
+- **Adresses supportées** :
+  - Format : `BACNET:type:instance[:propriété][:priorité]` (ex. `BACNET:AV:201` ou `BACNET:AV:201:Present_Value:8`).
+  - Types d'objets : `AI`, `AO`, `AV`, `BI`, `BO`, `BV`, `MSI`, `MSO`, `MSV`.
+  - Propriété par défaut : `Present_Value`.
+  - Priorité d'écriture configurable de 1 à 16 (8 par défaut).
+- **Auto-Découverte réelle** :
+  - BACnet/IP bénéficie d'une **auto-découverte réelle** : le moteur interroge l'automate BACnet pour dresser la liste des objets présents, leurs noms et leurs unités, et en permettre l'ajout direct.
+- **Fonctionnement et limites** :
+  - Équipement joint directement par son IP (pas de routage MS/TP).
+  - Les entrées physiques (`AI`, `BI`, `MSI`) sont non inscriptibles.
+
+---
+
+### 6.6 Simulation GTB et automate embarqué
+
+Le réglage `simulation.enabled = true` active l'environnement de simulation :
 - un automate Modbus TCP embarqué (groupe froid), sur `127.0.0.1:<modbus_slave_port>` ;
-- le simulateur physique GTB (CTA, chaufferie, TGBT) ;
-- les données de démonstration, au **premier** démarrage sur une base vide.
+- le simulateur physique GTB (`Simulator` : CTA, chaufferie, TGBT) ;
+- les données de démonstration et les trois comptes d'usine (`admin`, `superviseur`, `visu`), au **premier** démarrage sur une base vide. Quand la simulation est désactivée (production), seul le compte `admin` est créé.
 
-Les drivers **OPC-UA, BACnet/IP et Siemens S7 sont simulés** à ce stade : ils produisent des valeurs fictives. Ils ne sont **pas** opérationnels sur de vrais équipements. Seuls **Modbus TCP** et **MQTT** communiquent réellement.
+Le seul driver de démonstration restant est le **simulateur GTB** (`Simulator`, `ProtocolType::is_simulated()`). Quand la simulation est désactivée, seul le simulateur GTB est refusé à l'ajout et au démarrage (erreur HTTP 400). À l'import d'un projet, il est écarté avec ses variables (`ignored_drivers`, `ignored_tags`). Un simulateur déjà enregistré reste modifiable mais ne démarre pas.
 
-Quand la simulation est désactivée, les drivers simulés (OPC-UA, BACnet/IP, S7, simulateur GTB) sont refusés à l'ajout et au démarrage (erreur 400). À l'import d'un projet, ils sont écartés avec leurs variables, et la réponse de `POST /api/system/import` les liste dans `ignored_drivers` et `ignored_tags`. Un driver simulé déjà enregistré reste modifiable. Il ne démarre simplement pas.
-
-L'**Auto-Découverte** n'existe que pour les protocoles simulés OPC-UA, BACnet/IP et S7, et seulement avec la simulation active. Modbus TCP, MQTT et le simulateur GTB n'ont pas de catalogue à parcourir : `POST /api/drivers/:id/browse` répond 400 et le bouton est masqué.
+Les cinq protocoles industriels réels (Modbus TCP, MQTT, Siemens S7, OPC-UA, BACnet/IP) fonctionnent de manière indépendante et restent disponibles que la simulation soit activée ou non.
 
 ---
 
 ## 6 bis. Drivers et automatismes : règles de contrôle
 
-- **Commandes depuis les synoptiques** : elles se font en deux temps. Un clic sur une commande (marche/arrêt, ouverture, curseur, consigne) la **sélectionne** : l'équipement s'encadre en orange et un bandeau indique la variable et la valeur, avec « Exécuter » et « Annuler ». Rien n'est envoyé tant que l'opérateur ne clique pas sur « Exécuter », dans les 10 secondes. Passé ce délai, sur « Annuler », sur Échap ou en changeant de synoptique ou d'onglet, la sélection est abandonnée. Un bouton impulsionnel s'arme au premier appui, puis envoie une seule impulsion (1 puis 0) tant qu'il est maintenu. L'écriture directe depuis l'écran Drivers & Tags et les boutons « Forcer » du planning restent immédiats.
+- **Commandes depuis les synoptiques** : elles se font en deux temps. Un clic sur une commande (marche/arrêt, ouverture, curseur, consigne) la **sélectionne** : l'équipement s'encadre en orange et un bandeau indique la variable et la valeur, avec « Exécuter » et « Annuler ». Rien n'est envoyé tant que l'opérateur ne clique pas sur « Exécuter », dans les 10 secondes. Passé ce délai, sur « Annuler », sur Échap ou en changeant de synoptique ou d'onglet, la sélection est abandonnée. Un bouton impulsionnel s'arme au premier appui, puis envoie une seule impulsion (1 puis 0) tant qu'il est maintenu. L'écriture directe depuis l'écran Équipements et les boutons « Forcer » du planning restent immédiats.
 - **Profil Visualisation** : il consulte la liste et le journal des alarmes et peut **acquitter une alarme à la fois**, après une fenêtre de confirmation. L'acquittement est tracé à son nom. L'acquittement global, la mise en sommeil et l'effacement des alarmes résolues restent réservés aux profils Superviseur et Administrateur. Il lit aussi les derniers points d'historique des variables affichées par une courbe de tendance, pour la pré-remplir.
 - **Courbes de tendance** : au chargement de la page, elles sont pré-remplies avec les 55 derniers points de l'historique. Une variable non historisée démarre vide, avec la mention « non historisée ».
 
@@ -148,7 +247,8 @@ L'**Auto-Découverte** n'existe que pour les protocoles simulés OPC-UA, BACnet/
 
 ## 7. Sécurité
 
-- Changez les mots de passe des comptes d'usine (`admin`, `superviseur`, `visu`) dès la première connexion. Le moteur le rappelle dans ses journaux tant que ce n'est pas fait.
+- **Comptes au premier démarrage** : en production (simulation désactivée), seul le compte administrateur `admin` est créé avec son mot de passe initial `admin123` ; les comptes `superviseur` et `visu` ne sont pas créés. En démonstration (simulation active), les trois comptes d'usine (`admin`, `superviseur`, `visu`) sont initialisés. Une base déjà initialisée n'est jamais modifiée au redémarrage.
+- **Obligation de changer le mot de passe administrateur** : changez impérativement le mot de passe d'`admin` dès la première connexion (et ceux des autres comptes d'usine s'ils ont été créés). Le moteur émet un avertissement de sécurité dans ses journaux à chaque démarrage tant qu'un mot de passe d'usine reste en place.
 - **Connexion** : après 5 tentatives sans succès, l'identifiant est verrouillé 60 secondes, y compris face à des tentatives simultanées. Un identifiant inconnu est traité comme un mot de passe faux, avec le même message et le même temps de réponse. Le moteur fait au plus 4 vérifications de mot de passe à la fois. Une requête qui attend plus de 5 secondes une place reçoit 503 (« serveur occupé ») : la tentative n'est pas comptée. Le changement de son propre mot de passe est soumis au même verrouillage, avec un compteur distinct.
 - **Sessions conservées** : les sessions ouvertes survivent à un redémarrage du moteur, y compris après un arrêt brutal. Elles expirent après `security.session_ttl_hours` heures d'inactivité. La base (table `user_sessions`) ne contient que l'empreinte SHA-256 de chaque jeton, jamais le jeton lui-même : une copie de la base ne permet pas de reprendre une session. Déconnexions et fermetures de sessions sont écrites en base avant la réponse, et les dates d'activité au plus une minute après.
 - **Sessions** : changer le rôle d'un compte, le désactiver ou lui donner un nouveau mot de passe depuis l'écran Utilisateurs ferme toutes ses sessions ouvertes. Un administrateur qui change son propre mot de passe garde la session d'où il agit. Une connexion en cours pendant la modification ne peut ni restaurer l'ancien mot de passe ni conserver une session.
@@ -170,7 +270,7 @@ L'**Auto-Découverte** n'existe que pour les protocoles simulés OPC-UA, BACnet/
 | Quoi | Comment |
 |---|---|
 | Configuration (`apex-scada.toml`) | Automatique à chaque modification (20 versions dans `…/config/backups/`). Restauration depuis l'onglet « Sauvegardes ». |
-| Projet (drivers, variables, synoptiques, flux, plannings) | IHM web, onglet « Historian & Système » : export et import JSON (fichier `apex_supervision_projet_<date>.json`, 64 Mo au plus à l'import). |
+| Projet (drivers, variables, synoptiques, flux, plannings) | IHM web, onglet « Système » : export et import JSON (fichier `apex_supervision_projet_<date>.json`, 64 Mo au plus à l'import). |
 | Base complète (historique, comptes, audit) | Moteur arrêté : copie du fichier `apex-scada.db`, ainsi que des fichiers `-wal` et `-shm` s'ils existent (après un arrêt propre, le journal est reporté dans `apex-scada.db`, qui se suffit alors à lui-même). |
 
 ---

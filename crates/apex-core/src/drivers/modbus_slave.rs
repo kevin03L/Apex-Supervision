@@ -101,8 +101,8 @@ pub async fn spawn_embedded_modbus_plc(port: u16) {
 
             let comp_on = mem.coils[0];
             let pump_on = mem.coils[1];
-            let setpoint = read_f32_be(&mem.holding_registers, 2).clamp(4.0, 15.0);
-            let curr_temp = read_f32_be(&mem.holding_registers, 0);
+            let setpoint = finite_or(read_f32_be(&mem.holding_registers, 2), 7.0).clamp(4.0, 15.0);
+            let curr_temp = finite_or(read_f32_be(&mem.holding_registers, 0), 16.5);
 
             let target_temp = if comp_on && pump_on {
                 setpoint + (step.sin() * 0.25)
@@ -316,6 +316,14 @@ fn process_pdu(mem: &mut PlcMemory, fc: u8, pdu: &[u8]) -> Vec<u8> {
     }
 }
 
+fn finite_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        fallback
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +389,14 @@ mod tests {
         bad16.push(3);
         bad16.extend_from_slice(&[0, 0, 0]);
         assert_eq!(process_pdu(&mut mem, 0x10, &bad16), vec![0x90, 0x03]);
+    }
+
+    #[test]
+    fn vague2_simulation_recupere_non_finis() {
+        for v in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(finite_or(v, 7.0), 7.0);
+            assert_eq!(finite_or(v, 16.5), 16.5);
+        }
+        assert_eq!(finite_or(9.0, 7.0), 9.0);
     }
 }

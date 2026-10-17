@@ -32,6 +32,9 @@
 #ifndef OutputDir
   #define OutputDir SourceDir + "\dist"
 #endif
+#ifndef SignedUninstallerDir
+  #define SignedUninstallerDir OutputDir
+#endif
 
 #define AppName "Apex Supervision"
 #define ServiceName "ApexSupervision"
@@ -64,6 +67,7 @@ OutputBaseFilename=apex-supervision-{#AppVersion}-windows-x64-setup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+LicenseFile={#SourceDir}\LICENSE
 ; Icône du produit (packaging\icons\generer-icones.ps1) ; les raccourcis et l'entrée
 ; « Applications installées » reprennent celle embarquée dans les exécutables.
 SetupIconFile={#SourceDir}\packaging\icons\apex-supervision.ico
@@ -72,11 +76,18 @@ UninstallDisplayName={#AppName}
 CloseApplications=yes
 RestartApplications=no
 SetupLogging=yes
-; Signature Authenticode (prévue avant la bêta) : déclarer l'outil « signtool » dans ISCC
-; (/Ssigntool="signtool.exe sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /a $f")
-; puis décommenter :
-; SignTool=signtool
-; SignedUninstaller=yes
+; Signature Authenticode (Smart App Control, Windows 11) :
+; outil « apexsign » passé sur la ligne de commande ISCC via /Sapexsign=...
+#ifdef Signer
+SignTool=apexsign
+SignedUninstaller=yes
+SignedUninstallerDir={#SignedUninstallerDir}
+#else
+#ifdef SignedUninstaller
+SignedUninstaller=yes
+SignedUninstallerDir={#SignedUninstallerDir}
+#endif
+#endif
 
 [Languages]
 Name: "fr"; MessagesFile: "compiler:Languages\French.isl"
@@ -88,6 +99,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "{#BinDir}\{#EngineExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BinDir}\{#AdminExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\static\*"; DestDir: "{app}\web"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\bibliotheque_exemple_iso10628.json"; DestDir: "{app}\exemples"; Flags: ignoreversion
 Source: "{#SourceDir}\docs\INSTALLATION.md"; DestDir: "{app}\docs"; Flags: ignoreversion
@@ -107,17 +119,6 @@ Type: filesandordirs; Name: "{app}\exemples"
 Type: filesandordirs; Name: "{app}\docs"
 
 [Run]
-; Première installation : service (et répertoires de %ProgramData% avec leurs permissions)
-Filename: "{app}\{#EngineExe}"; Parameters: "service install"; StatusMsg: "Installation du service Windows..."; Flags: runhidden waituntilterminated; Check: not ServiceExists
-; Toute installation ou mise à jour : propriétaire et permissions de %ProgramData%\Apex Supervision
-; réappliqués (héritage coupé, écriture réservée aux administrateurs et au service)
-Filename: "{app}\{#EngineExe}"; Parameters: "service permissions"; StatusMsg: "Application des permissions..."; Flags: runhidden waituntilterminated
-; Mise à jour : configuration réécrite au format courant (valeurs conservées, sauvegarde préalable)
-Filename: "{app}\{#EngineExe}"; Parameters: "config migrate --config ""{#ConfigFile}"""; StatusMsg: "Mise à jour de la configuration..."; Flags: runhidden waituntilterminated; Check: ConfigExists
-; Mise à jour : le service est redémarré s'il fonctionnait avant
-Filename: "{app}\{#EngineExe}"; Parameters: "service start"; StatusMsg: "Redémarrage du service..."; Flags: runhidden waituntilterminated; Check: ServiceWasRunning
-; Réinstallation après une désinstallation qui a conservé la configuration : service démarré
-Filename: "{app}\{#EngineExe}"; Parameters: "service start"; StatusMsg: "Démarrage du service..."; Flags: runhidden waituntilterminated; Check: (not ServiceExisted) and ConfigExists
 ; Première installation : assistant de configuration (droits administrateur conservés pour
 ; écrire la configuration et régler le service)
 Filename: "{app}\{#AdminExe}"; Parameters: "--wizard"; Description: "Lancer l'assistant de configuration"; Flags: postinstall nowait skipifsilent runascurrentuser; Check: not ConfigExists
@@ -153,10 +154,30 @@ begin
   Result := ServiceExistedBefore;
 end;
 
+procedure RunRequired(AppExe, Args: String);
+var Code: Integer;
+begin
+  if not Exec(AppExe, Args, '', SW_HIDE, ewWaitUntilTerminated, Code) then
+    RaiseException('Impossible de lancer : ' + Args);
+  Log(Format('%s : code %d', [Args, Code]));
+  if Code <> 0 then
+    RaiseException('Échec de ' + Args + ' (code ' + IntToStr(Code) + ')');
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
+var AppExe: String;
 begin
   if CurStep = ssPostInstall then
+  begin
+    AppExe := ExpandConstant('{app}\{#EngineExe}');
+    RunRequired(AppExe, 'service install');
+    RunRequired(AppExe, 'service permissions');
+    if ConfigExists then
+      RunRequired(AppExe, ExpandConstant('config migrate --config "{#ConfigFile}"'));
+    if ServiceWasRunning or ((not ServiceExisted) and ConfigExists) then
+      RunRequired(AppExe, 'service start');
     InstallDone := True;
+  end;
 end;
 
 { Mise à jour annulée ou en échec après l'arrêt du service : la supervision est relancée
@@ -173,7 +194,9 @@ begin
 end;
 
 { Mise à jour : le service est arrêté proprement avant le remplacement des binaires.
-  « net stop » attend la fin de l'arrêt et renvoie 0 seulement si le service tournait. }
+  « net stop » attend la fin de l'arrêt et renvoie 0 seulement si le service tournait.
+  Les éventuelles instances de l'utilitaire desktop sont également fermées pour que son
+  exécutable puisse être remplacé sans blocage ni annulation silencieuse. }
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Code: Integer;
@@ -189,6 +212,27 @@ begin
       WasRunning := (Code = 0);
     Log(Format('net stop : code %d', [Code]));
   end;
+
+  { tasklist | find renvoie 0 seulement si l'utilitaire est en cours d'exécution. }
+  if not Exec(ExpandConstant('{cmd}'),
+              '/C tasklist /NH /FI "IMAGENAME eq {#AdminExe}" | find /I "{#AdminExe}"',
+              '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
+    Exit;
+
+  if not WizardSilent then
+  begin
+    if MsgBox('L''utilitaire d''administration ({#AdminExe}) doit être fermé pour continuer la mise à jour.' + #13#10#13#10 +
+              'Cliquez sur OK pour le fermer automatiquement, ou sur Annuler pour interrompre l''installation.',
+              mbConfirmation, MB_OKCANCEL or MB_DEFBUTTON1) <> IDOK then
+    begin
+      Result := 'Installation annulée par l''utilisateur : {#AdminExe} est resté ouvert.';
+      Exit;
+    end;
+  end;
+
+  Log('Fermeture des instances de {#AdminExe}');
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM {#AdminExe} /F', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  Log(Format('taskkill /IM {#AdminExe} /F : code %d', [Code]));
 end;
 
 { Désinstallation : les données ne sont supprimées que sur demande explicite (jamais en

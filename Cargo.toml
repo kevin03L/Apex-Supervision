@@ -18,6 +18,7 @@ rust-version = "1.89"
 authors = ["kevin03L"]
 repository = "https://github.com/kevin03L/Apex-Supervision"
 publish = false
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 apex-config = { path = "crates/apex-config" }

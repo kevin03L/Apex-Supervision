@@ -99,7 +99,15 @@ fn parse(raw: &str, path: &Path) -> Result<(AppConfig, Option<u32>), ConfigError
         path: path.to_path_buf(),
         message: e.message().to_string(),
     })?;
-    let (value, migrated_from) = crate::migrate::migrate(value)?;
+    let (value, migrated_from) = crate::migrate::migrate(value).map_err(|e| match e {
+        ConfigError::Schema { path: p, message } if p.as_os_str().is_empty() => {
+            ConfigError::Schema {
+                path: path.to_path_buf(),
+                message,
+            }
+        }
+        other => other,
+    })?;
     let config: AppConfig = value
         .try_into()
         .map_err(|e: toml::de::Error| ConfigError::Schema {
@@ -465,7 +473,7 @@ safe_mode = {safe_mode}
 
 [simulation]
 # Automate Modbus embarqué, simulateur GTB et données de démonstration.
-# Les drivers OPC-UA, BACnet/IP et Siemens S7 sont SIMULÉS : ils ne fonctionnent qu'avec la simulation active.
+# Seul le simulateur GTB est réservé à la simulation active.
 enabled = {sim_enabled}
 # Port de l'automate Modbus TCP embarqué (écoute sur 127.0.0.1 uniquement).
 modbus_slave_port = {sim_port}

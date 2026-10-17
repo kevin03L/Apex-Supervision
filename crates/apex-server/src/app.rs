@@ -12,7 +12,7 @@
 //! L'arrêt (API, Ctrl+C, SIGTERM, gestionnaire de services Windows) suit le même chemin :
 //! arrêt des drivers, vidage du dernier lot d'historique, suppression du jeton, libération du verrou.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use apex_config::{has_errors, store, AppConfig, Layout, LayoutKind, Severity};
 use apex_core::{
@@ -255,7 +255,7 @@ pub async fn run(
     // 6. Moteur
     if cfg.simulation.enabled {
         spawn_embedded_modbus_plc(cfg.simulation.modbus_slave_port).await;
-        warn!("SIMULATION active : automate Modbus embarqué, simulateur GTB et protocoles simulés disponibles");
+        warn!("SIMULATION active : automate Modbus embarqué, simulateur GTB et données de démonstration disponibles");
     }
     if cfg.safety.safe_mode {
         warn!("MODE SÛR actif : aucune commande ne sera envoyée aux équipements réels");
@@ -267,6 +267,7 @@ pub async fn run(
         safe_mode: cfg.safety.safe_mode,
         simulation_enabled: cfg.simulation.enabled,
         modbus_slave_port: cfg.simulation.modbus_slave_port,
+        data_dir: Some(eff.layout.data_dir.clone()),
     };
     // Le pool est partagé avec le moteur ; cette copie sert à le fermer à l'arrêt propre.
     let core = ScadaCore::new(Some(pool.clone()), &options);
@@ -341,6 +342,8 @@ pub async fn run(
     // sans quoi l'arrêt propre attendrait indéfiniment la fermeture des connexions.
     on_ready();
     let shutdown = Arc::clone(&core.shutdown_notify);
+    let core_shutdown = Arc::clone(&core);
+    let instance_name = cfg.instance.name.clone();
     let served = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -348,8 +351,26 @@ pub async fn run(
     .with_graceful_shutdown(async move {
         tokio::select! {
             _ = shutdown.notified() => info!("Arrêt demandé depuis l'IHM ou l'API"),
-            _ = wait_os_signal() => info!("Signal d'arrêt du système reçu"),
-            _ = stop.wait_for(|s| *s) => info!("Arrêt demandé par le gestionnaire de services"),
+            _ = wait_os_signal() => {
+                info!("Signal d'arrêt du système reçu");
+                core_shutdown.record_audit(
+                    "Système",
+                    "SERVEUR",
+                    "SHUTDOWN",
+                    &instance_name,
+                    "Signal d'arrêt du système reçu (SIGINT / SIGTERM)",
+                );
+            }
+            _ = stop.wait_for(|s| *s) => {
+                info!("Arrêt demandé par le gestionnaire de services");
+                core_shutdown.record_audit(
+                    "Système",
+                    "SERVEUR",
+                    "SHUTDOWN",
+                    &instance_name,
+                    "Arrêt demandé par le gestionnaire de services",
+                );
+            }
         }
         shutdown.notify_waiters();
         info!("Arrêt propre en cours : fermeture du serveur web...");
@@ -359,10 +380,10 @@ pub async fn run(
     // Arrêt propre
     core.shutdown();
     let _ = std::fs::remove_file(&token_file);
-    // Laisse aux écrivains (historique, alarmes, audit) le temps de vider leurs files
-    tokio::time::sleep(Duration::from_millis(1200)).await;
     // Dates d'activité des sessions à jour, pour leur reprise au prochain démarrage
     core.persist_sessions().await;
+    // Ferme formellement les canaux des écrivains SQLite et attend la fin de leur vidage (S-37)
+    core.drain_sqlite_writers().await;
     close_database(&pool).await;
     info!("{} arrêté proprement.", apex_config::version::PRODUCT_NAME);
 
@@ -438,12 +459,55 @@ fn write_control_token(path: &std::path::Path, token: &str) -> std::io::Result<(
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, token)?;
     #[cfg(unix)]
     {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        // S-22: Création atomique sans fenêtre TOCTOU avec mode 0o640
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o640)
+            .open(path)?;
         use std::os::unix::fs::PermissionsExt;
-        // Lecture : propriétaire (service) et groupe apex-scada (administrateurs du poste)
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o640))?;
+        file.write_all(token.as_bytes())?;
+    }
+
+    #[cfg(windows)]
+    {
+        // Recréer un fichier vide retire les ACL explicites d'un ancien jeton.
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        // S-22: Sous Windows (mode manuel/portable), restreindre les ACL à SYSTEM, Administrateurs et compte courant
+        let path_str = path.display().to_string();
+        let username = std::env::var("USERNAME").unwrap_or_default();
+        let mut grant_args = vec![
+            path_str,
+            "/inheritance:r".to_string(),
+            "/grant:r".to_string(),
+            "*S-1-5-18:(F)".to_string(),     // NT AUTHORITY\SYSTEM
+            "*S-1-5-32-544:(F)".to_string(), // Builtin\Administrators
+        ];
+        if !username.is_empty() {
+            grant_args.push(format!("{}:(F)", username));
+        }
+        let result = std::process::Command::new("icacls")
+            .args(&grant_args)
+            .output()?;
+        if !result.status.success() {
+            return Err(std::io::Error::other(
+                "Restriction des permissions du jeton impossible",
+            ));
+        }
+        use std::io::Write;
+        file.write_all(token.as_bytes())?;
     }
     Ok(())
 }
@@ -509,5 +573,41 @@ mod tests {
         let system = Layout::system();
         let command = legacy_command(&found, &system);
         assert!(!command.contains("--config"), "{command}");
+    }
+
+    #[test]
+    fn test_s22_write_control_token() {
+        let temp_dir = std::env::temp_dir().join(format!("apex-s22-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let token_path = temp_dir.join("control.token");
+        let token_value = "secret-token-test-1234567890";
+        write_control_token(&token_path, token_value).expect("écriture du jeton");
+        let read = std::fs::read_to_string(&token_path).expect("lecture du jeton");
+        assert_eq!(read, token_value);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&token_path).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+        #[cfg(windows)]
+        {
+            let result = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", "$allowed = @('S-1-5-18', 'S-1-5-32-544', [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value); $acl = Get-Acl -LiteralPath $env:APEX_TOKEN_TEST_PATH; if (!$acl.AreAccessRulesProtected) { exit 1 }; foreach ($ace in $acl.Access) { if ($ace.IsInherited -or $allowed -notcontains $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value) { exit 2 } }; exit 0"])
+                .env("APEX_TOKEN_TEST_PATH", &token_path)
+                // Lancé depuis PowerShell 7 (CI), Windows PowerShell 5.1 hériterait de son
+                // PSModulePath et ne pourrait plus charger Get-Acl.
+                .env_remove("PSModulePath")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "ACL du jeton trop larges : {:?}",
+                result
+            );
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

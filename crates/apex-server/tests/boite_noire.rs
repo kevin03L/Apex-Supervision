@@ -4,7 +4,7 @@
 //!
 //! Aucun test ne touche à une base existante ni n'envoie de commande à un équipement : le seul
 //! « automate » joint est l'automate Modbus embarqué de la simulation, sur la boucle locale,
-//! et le mode sûr refuse toute consigne vers les drivers non simulés.
+//! et le mode sûr refuse toute consigne vers les drivers réels (les cinq protocoles industriels).
 
 mod common;
 
@@ -95,7 +95,10 @@ fn health_est_public_et_detaille_en_boucle_locale() {
         let r = srv.call("GET", path, None, None);
         assert_eq!(r.status, 200, "{path}");
         assert_eq!(r.header("cache-control"), Some("no-cache"), "{path}");
-        assert!(r.header("content-security-policy").is_some(), "{path}");
+        let csp = r.header("content-security-policy").unwrap();
+        assert!(csp.contains("connect-src 'self'"), "{path}");
+        assert!(!csp.contains("ws:"), "{path}");
+        assert!(!csp.contains("wss:"), "{path}");
     }
 
     // Une route inconnue de l'API ne doit pas passer pour un succès
@@ -447,6 +450,36 @@ fn les_sessions_survivent_au_redemarrage_mais_pas_aux_revocations() {
         "session d'un compte désactivé reprise au redémarrage"
     );
 
+    // Tentative de connexion sur le compte désactivé : refus 403 et journalisation dans audit_logs (S-37)
+    let login_refused = srv.call(
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(&json!({
+            "username": VISU.0,
+            "password": VISU.1
+        })),
+    );
+    assert_eq!(login_refused.status, 403, "{}", login_refused.text());
+    let mut audit_items = serde_json::Value::Null;
+    for _ in 0..20 {
+        let audit_resp = srv.call("GET", "/api/audit?limit=20", Some(&admin), None);
+        assert_eq!(audit_resp.status, 200, "{}", audit_resp.text());
+        audit_items = audit_resp.json();
+        if audit_items.as_array().unwrap().iter().any(|e| {
+            e["category"] == "AUTH" && e["action"] == "LOGIN_REFUSED" && e["actor"] == "visu"
+        }) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        audit_items.as_array().unwrap().iter().any(|e| {
+            e["category"] == "AUTH" && e["action"] == "LOGIN_REFUSED" && e["actor"] == "visu"
+        }),
+        "refus sur compte désactivé non consigné dans audit_logs : {audit_items}"
+    );
+
     // Le jeton n'est jamais écrit en clair dans la base
     fn db_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -698,6 +731,9 @@ fn code_3_configuration_invalide() {
         ),
         // Format plus récent que le moteur
         ("version", "config_version = 99\n".to_string()),
+        // Numéro de version invalide (S-35)
+        ("version-negative", "config_version = -1\n".to_string()),
+        ("version-nulle", "config_version = 0\n".to_string()),
     ];
     for (name, content) in cases {
         let dir = TempDir::new(&format!("code3-{name}"));
@@ -918,4 +954,42 @@ fn arret_propre_par_jeton_de_controle_local() {
         .find(|e| e["action"] == "SHUTDOWN")
         .unwrap_or_else(|| panic!("arrêt absent du journal d'audit : {audit}"));
     assert_eq!(shutdown["actor"], "Utilitaire local", "{shutdown}");
+}
+
+#[test]
+fn initialisation_comptes_usine_selon_mode_simulation() {
+    // Démarrage sans simulation (mode production) : seul le compte admin est initialisé
+    let mut settings_prod = Settings::new();
+    settings_prod.simulation = false;
+    let srv_prod = Server::start_with("comptes_prod", settings_prod);
+
+    // Connexion admin réussie
+    let r_admin = srv_prod.call(
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(&json!({"username": "admin", "password": "admin123"})),
+    );
+    assert_eq!(r_admin.status, 200, "admin doit pouvoir se connecter");
+
+    // Connexion visu refusée (compte non créé)
+    let r_visu = srv_prod.call(
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(&json!({"username": "visu", "password": "visu123"})),
+    );
+    assert_eq!(r_visu.status, 401, "visu ne doit pas exister en production");
+
+    // Connexion superviseur refusée (compte non créé)
+    let r_sup = srv_prod.call(
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(&json!({"username": "superviseur", "password": "super123"})),
+    );
+    assert_eq!(
+        r_sup.status, 401,
+        "superviseur ne doit pas exister en production"
+    );
 }

@@ -8,6 +8,7 @@ rust-version = "1.95"
 authors.workspace = true
 repository.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "apex-scada-admin"

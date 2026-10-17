@@ -209,7 +209,7 @@ pub fn run(layout: &Layout, service: Option<&ServiceInfo>) -> Vec<Check> {
             out.push(check(
                 Level::Info,
                 "Simulation",
-                "Active : automate embarqué, simulateur GTB et protocoles simulés (OPC-UA, BACnet, S7).",
+                "Active : automate embarqué, simulateur GTB et données de démonstration.",
             ));
         }
     }

@@ -95,12 +95,14 @@ pub struct EngineOptions {
     pub instance_name: String,
     pub session_ttl_hours: u64,
     pub history_retention_days: u32,
-    /// Mode sûr : aucune commande n'est envoyée aux équipements réels (Modbus TCP, MQTT).
+    /// Mode sûr : aucune commande n'est envoyée aux équipements réels (les cinq protocoles industriels).
     pub safe_mode: bool,
-    /// Simulation : simulateur GTB, protocoles simulés (OPC-UA, BACnet/IP, S7), données de démo.
+    /// Simulation : simulateur GTB, automate Modbus embarqué, données de démo.
     pub simulation_enabled: bool,
     /// Port de l'automate Modbus embarqué (affiché dans l'état système).
     pub modbus_slave_port: u16,
+    /// Répertoire des données (None dans les tests : répertoire temporaire du système).
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for EngineOptions {
@@ -112,12 +114,15 @@ impl Default for EngineOptions {
             safe_mode: false,
             simulation_enabled: true,
             modbus_slave_port: 5502,
+            data_dir: None,
         }
     }
 }
 
 pub struct ScadaCore {
     pub started_at: DateTime<Utc>,
+    /// Répertoire des données de l'instance (certificats des clients OPC-UA, par exemple).
+    pub data_dir: Option<std::path::PathBuf>,
     pub modbus_slave_port: u16,
     pub instance_name: String,
     pub safe_mode: bool,
@@ -160,15 +165,34 @@ pub struct ScadaCore {
     driver_tx: broadcast::Sender<Vec<DriverConfig>>,
     flow_trace_tx: broadcast::Sender<FlowExecutionTrace>,
     ingest_tx: mpsc::Sender<TagState>,
-    history_tx: mpsc::Sender<TagState>,
+    ingestion_stop: Notify,
+    ingestion_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    journal_handles: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    active_pulses: DashMap<String, ()>,
+    history_tx: std::sync::Mutex<Option<mpsc::Sender<TagState>>>,
     /// Écrivain unique de l'état des alarmes (ordre des écritures garanti).
-    alarm_persist_tx: mpsc::UnboundedSender<AlarmPersistOp>,
+    alarm_persist_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<AlarmPersistOp>>>,
+    /// Écrivain unique du journal d'audit (ordre chronologique et vidage garanti à l'arrêt).
+    audit_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<AuditEntry>>>,
+    sqlite_writer_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Réglages système (mise en sommeil des alarmes...).
     settings: std::sync::RwLock<SystemSettings>,
     settings_tx: broadcast::Sender<SystemSettings>,
+    session_revoke_tx: broadcast::Sender<String>,
+    snapshot_notify_tx: broadcast::Sender<()>,
     pub shutdown_notify: Arc<Notify>,
     pub restart_requested: AtomicBool,
     db_pool: Option<SqlitePool>,
+}
+
+#[derive(Debug)]
+struct AuditEntry {
+    timestamp: String,
+    actor: String,
+    category: String,
+    action: String,
+    target: String,
+    details: String,
 }
 
 impl ScadaCore {
@@ -180,11 +204,15 @@ impl ScadaCore {
         let (ingest_tx, ingest_rx) = mpsc::channel::<TagState>(4096);
         let (history_tx, history_rx) = mpsc::channel::<TagState>(HISTORY_QUEUE_CAPACITY);
         let (alarm_persist_tx, alarm_persist_rx) = mpsc::unbounded_channel::<AlarmPersistOp>();
+        let (audit_tx, audit_rx) = mpsc::unbounded_channel::<AuditEntry>();
         let (settings_tx, _) = broadcast::channel::<SystemSettings>(16);
+        let (session_revoke_tx, _) = broadcast::channel::<String>(256);
+        let (snapshot_notify_tx, _) = broadcast::channel::<()>(64);
 
         let core = Arc::new(Self {
             started_at: Utc::now(),
             modbus_slave_port: config.modbus_slave_port,
+            data_dir: config.data_dir.clone(),
             instance_name: config.instance_name.clone(),
             safe_mode: config.safe_mode,
             simulation_enabled: config.simulation_enabled,
@@ -218,10 +246,18 @@ impl ScadaCore {
             driver_tx,
             flow_trace_tx,
             ingest_tx,
-            history_tx,
-            alarm_persist_tx,
+            ingestion_stop: Notify::new(),
+            ingestion_handle: tokio::sync::Mutex::new(None),
+            journal_handles: std::sync::Mutex::new(Vec::new()),
+            active_pulses: DashMap::new(),
+            history_tx: std::sync::Mutex::new(Some(history_tx)),
+            alarm_persist_tx: std::sync::Mutex::new(Some(alarm_persist_tx)),
+            audit_tx: std::sync::Mutex::new(Some(audit_tx)),
+            sqlite_writer_handles: tokio::sync::Mutex::new(Vec::new()),
             settings: std::sync::RwLock::new(SystemSettings::default()),
             settings_tx,
+            session_revoke_tx,
+            snapshot_notify_tx,
             shutdown_notify: Arc::new(Notify::new()),
             restart_requested: AtomicBool::new(false),
             db_pool,
@@ -231,13 +267,27 @@ impl ScadaCore {
         // Hachage factice des connexions sur identifiant inconnu (coût constant dès la première)
         security::prepare_dummy_password_hash();
 
-        Self::spawn_ingestion_worker(Arc::clone(&core), ingest_rx);
-        Self::spawn_history_writer(Arc::clone(&core), history_rx);
+        *core
+            .ingestion_handle
+            .try_lock()
+            .expect("initialisation ingestion") =
+            Some(Self::spawn_ingestion_worker(Arc::clone(&core), ingest_rx));
+        let mut handles = Vec::new();
+        if let Some(h) = Self::spawn_history_writer(Arc::clone(&core), history_rx) {
+            handles.push(h);
+        }
+        if let Some(h) = Self::spawn_alarm_persist_writer(Arc::clone(&core), alarm_persist_rx) {
+            handles.push(h);
+        }
+        if let Some(h) = Self::spawn_audit_writer(Arc::clone(&core), audit_rx) {
+            handles.push(h);
+        }
+        *core.sqlite_writer_handles.try_lock().expect("init lock") = handles;
+
         Self::spawn_history_retention_worker(Arc::clone(&core));
         Self::spawn_session_cleanup_worker(Arc::clone(&core));
         Self::spawn_driver_stats_broadcaster(Arc::clone(&core));
         Self::spawn_shelve_expiry_worker(Arc::clone(&core));
-        Self::spawn_alarm_persist_writer(Arc::clone(&core), alarm_persist_rx);
 
         core
     }
@@ -360,6 +410,16 @@ impl ScadaCore {
         self.ensure_protocol_available(&config.protocol)?;
         for tag in &config.tags {
             security::validate_id("tag", &tag.id)?;
+            if !tag.scale_factor.is_finite()
+                || tag.scale_factor.abs() < 1e-9
+                || !tag.scale_offset.is_finite()
+                || !tag.deadband.is_finite()
+                || tag.deadband < 0.0
+            {
+                return Err(ScadaError::BadRequest(
+                    "Le facteur d'échelle doit être un nombre non nul".to_string(),
+                ));
+            }
             validate_tag_for_protocol(&config.protocol, tag)?;
         }
         let driver_id = config.id.clone();
@@ -392,7 +452,7 @@ impl ScadaCore {
         start_result.map(|_| views)
     }
 
-    /// Refuse un protocole simulé (simulateur GTB, OPC-UA, BACnet/IP, S7) quand la simulation est
+    /// Refuse un protocole simulé (simulateur GTB) quand la simulation est
     /// désactivée : aucun chemin (ajout, import, démarrage) ne doit l'enregistrer ni le persister.
     fn ensure_protocol_available(&self, protocol: &ProtocolType) -> Result<(), ScadaError> {
         if protocol.is_simulated() && !self.simulation_enabled {
@@ -427,13 +487,7 @@ impl ScadaCore {
                 config.stats.running = true;
                 // Les drivers internes sont immédiatement « connectés » ; les drivers réseau
                 // le deviennent à leur première trame réussie (record_driver_poll).
-                config.stats.connected = matches!(
-                    config.protocol,
-                    crate::models::ProtocolType::Simulator
-                        | crate::models::ProtocolType::OpcUa
-                        | crate::models::ProtocolType::BacnetIp
-                        | crate::models::ProtocolType::SiemensS7
-                );
+                config.stats.connected = config.protocol.is_simulated();
                 config.stats.last_error = None;
                 config.stats.last_poll_at = Some(Utc::now());
                 Ok(())
@@ -686,27 +740,38 @@ impl ScadaCore {
         Ok(tag_ids.len())
     }
 
-    /// « Auto-Découverte » : déclare le catalogue de démonstration d'un driver simulé.
+    /// « Auto-Découverte » : interroge l'équipement pour proposer ses variables (BACnet/IP uniquement).
     ///
-    /// Réservée aux protocoles simulés (OPC-UA, BACnet/IP, S7) avec la simulation active.
-    /// Refusée pour un driver réel (Modbus TCP, MQTT) : aucune variable n'est inventée, en
-    /// particulier aucune consigne inscriptible à une adresse inconnue de l'équipement.
+    /// Refusée pour les protocoles sans auto-découverte (Modbus TCP, MQTT, Siemens S7, OPC-UA, simulateur GTB) :
+    /// aucune variable n'est inventée, en particulier aucune consigne inscriptible à une adresse inconnue de l'équipement.
     pub async fn discover_driver_tags(
         &self,
         actor: &str,
         driver_id: &str,
     ) -> Result<Vec<TagFullView>, ScadaError> {
-        let protocol = self
+        let config = self
             .drivers_config
             .get(driver_id)
-            .map(|d| d.protocol.clone())
+            .map(|d| d.clone())
             .ok_or_else(|| ScadaError::DriverNotFound(driver_id.to_string()))?;
-        self.ensure_protocol_available(&protocol)?;
-        let discovered = crate::drivers::discover_protocol_tags(driver_id, &protocol)
-            .map_err(ScadaError::BadRequest)?;
+        self.ensure_protocol_available(&config.protocol)?;
+        if let Some(why) = crate::drivers::discovery_refusal(&config.protocol) {
+            return Err(ScadaError::BadRequest(why));
+        }
+        let discovered = crate::drivers::discover_driver_tags(&config)
+            .await
+            .map_err(|e| {
+                ScadaError::DriverError(format!(
+                    "Auto-Découverte de '{}' impossible : {}",
+                    driver_id, e
+                ))
+            })?;
+        // Les variables déjà déclarées (libellé, alarmes, mise à l'échelle) ne sont pas écrasées
         let mut views = Vec::with_capacity(discovered.len());
         for tag in discovered {
-            views.push(self.upsert_tag(actor, tag).await?);
+            if !self.tags_registry.contains_key(&tag.id) {
+                views.push(self.upsert_tag(actor, tag).await?);
+            }
         }
         Ok(views)
     }
@@ -737,6 +802,43 @@ impl ScadaCore {
     pub fn shutdown(&self) {
         self.acquisition_paused.store(true, Ordering::SeqCst);
         self.stop_all_drivers();
+    }
+
+    /// Ferme formellement les canaux des écrivains SQLite (historique, alarmes, audit)
+    /// et attend la fin complète de l'écriture de leurs files en mémoire avant la fermeture du pool (S-37).
+    pub async fn drain_sqlite_writers(&self) {
+        self.ingestion_stop.notify_one();
+        if let Some(handle) = self.ingestion_handle.lock().await.take() {
+            if let Err(e) = handle.await {
+                warn!("Arrêt incomplet de l'ingestion : {}", e);
+            }
+        }
+        if let Ok(mut tx) = self.history_tx.lock() {
+            tx.take();
+        }
+        if let Ok(mut tx) = self.alarm_persist_tx.lock() {
+            tx.take();
+        }
+        if let Ok(mut tx) = self.audit_tx.lock() {
+            tx.take();
+        }
+
+        let mut handles = self.sqlite_writer_handles.lock().await;
+        for handle in handles.drain(..) {
+            if let Err(e) = handle.await {
+                warn!("Arrêt incomplet d'un écrivain SQLite : {}", e);
+            }
+        }
+        let journals = self
+            .journal_handles
+            .lock()
+            .map(|mut h| std::mem::take(&mut *h))
+            .unwrap_or_default();
+        for handle in journals {
+            if let Err(e) = handle.await {
+                warn!("Arrêt incomplet du journal d'alarmes : {}", e);
+            }
+        }
     }
 
     /// Met le moteur SCADA complet hors tension (arrêt de tous les drivers + pause acquisition) tout en gardant l'IHM disponible pour un rallumage à distance.
@@ -826,6 +928,7 @@ impl ScadaCore {
         }
         // La valeur n'a pas été appliquée : un flux qui la visait doit pouvoir la réécrire
         self.flow_runtime.forget_outputs_for_tag(tag_id);
+        self.forget_schedule_state_for_tag(tag_id);
         let _ = self.driver_tx.send(self.get_all_drivers());
         self.record_audit(
             driver_id,
@@ -851,12 +954,23 @@ impl ScadaCore {
         }
     }
 
+    /// Réinitialise l'état appliqué des règles de planning ciblant cette variable, afin
+    /// qu'elles réémettent immédiatement leur consigne après un refus ou une déconnexion.
+    pub fn forget_schedule_state_for_tag(&self, tag_id: &str) {
+        for mut rule in self.schedules.iter_mut() {
+            if rule.target_tag_id == tag_id {
+                rule.last_applied_state = None;
+            }
+        }
+    }
+
     /// Changement d'état de la liaison d'un driver : les commandes en file ou en cours ont pu
     /// être perdues (coupure, commandes obsolètes vidées à la reconnexion). Les flux qui
     /// écrivent sur ses variables oublient leur dernière sortie et la réécriront.
     fn forget_flow_outputs_for_driver(&self, driver_id: &str) {
         for tag in self.get_tags_for_driver(driver_id) {
             self.flow_runtime.forget_outputs_for_tag(&tag.id);
+            self.forget_schedule_state_for_tag(&tag.id);
         }
     }
 
@@ -905,6 +1019,13 @@ impl ScadaCore {
 
     pub fn register_tag(&self, tag: RegisteredTag, initial_value: Option<TagValue>) -> TagFullView {
         let tag_id = tag.id.clone();
+        let initial_value = initial_value.and_then(|v| v.coerce_to(tag.data_type).ok());
+        let quality =
+            if initial_value.is_some() && !self.drivers_config.contains_key(&tag.module_source) {
+                Quality::Good
+            } else {
+                Quality::Uncertain
+            };
         let default_val = initial_value.unwrap_or_else(|| match tag.data_type {
             crate::models::TagDataType::Bool => TagValue::Bool(false),
             crate::models::TagDataType::Float => TagValue::Float(0.0),
@@ -920,13 +1041,42 @@ impl ScadaCore {
             .or_insert_with(|| TagState {
                 tag_id,
                 value: default_val,
-                quality: Quality::Uncertain,
+                quality,
                 timestamp: Utc::now(),
             });
 
         TagFullView {
             metadata: tag,
             state: Some(state_entry.value().clone()),
+        }
+    }
+
+    /// Restaure uniquement les mémoires historisées ; un équipement attend toujours son driver.
+    async fn restore_internal_values(&self, pool: &SqlitePool) {
+        let tags: Vec<_> = self
+            .tags_registry
+            .iter()
+            .filter(|t| !self.drivers_config.contains_key(&t.module_source))
+            .map(|t| t.clone())
+            .collect();
+        for tag in tags {
+            let json: Option<String> = sqlx::query_scalar("SELECT value_json FROM tag_history WHERE tag_id = ? AND quality = 'Good' ORDER BY id DESC LIMIT 1")
+                .bind(&tag.id).fetch_optional(pool).await.unwrap_or(None);
+            if let Some(value) = json
+                .and_then(|s| serde_json::from_str::<TagValue>(&s).ok())
+                .and_then(|v| v.coerce_to(tag.data_type).ok())
+            {
+                self.tags_state.insert(
+                    tag.id.clone(),
+                    TagState {
+                        tag_id: tag.id.clone(),
+                        value: value.clone(),
+                        quality: Quality::Good,
+                        timestamp: Utc::now(),
+                    },
+                );
+                self.last_good_values.insert(tag.id, value);
+            }
         }
     }
 
@@ -941,7 +1091,12 @@ impl ScadaCore {
                 "Le driver (module source) du tag est requis".to_string(),
             ));
         }
-        if !tag.scale_factor.is_finite() || tag.scale_factor.abs() < 1e-9 {
+        if !tag.scale_factor.is_finite()
+            || tag.scale_factor.abs() < 1e-9
+            || !tag.scale_offset.is_finite()
+            || !tag.deadband.is_finite()
+            || tag.deadband < 0.0
+        {
             return Err(ScadaError::BadRequest(
                 "Le facteur d'échelle doit être un nombre non nul".to_string(),
             ));
@@ -1003,11 +1158,21 @@ impl ScadaCore {
             ),
         );
 
+        // S-31: Réévaluation ou clôture de l'alarme active lors du changement de seuils ou désactivation
+        if let Some(state) = self.tags_state.get(&tag.id).map(|s| s.clone()) {
+            if !tag.alarm_config.enabled {
+                self.apply_alarm_transition(&tag.id, &tag.id, &tag.label, None, None, state.value);
+            } else {
+                self.evaluate_alarm_for_tag(&tag, &state);
+            }
+        }
+
         Ok(view)
     }
 
     /// Retire un tag de toutes les structures temps réel (sans toucher à la base).
     fn forget_tag(&self, tag_id: &str) -> Option<RegisteredTag> {
+        self.flow_runtime.forget_outputs_for_tag(tag_id);
         let removed = self.tags_registry.remove(tag_id).map(|(_, t)| t);
         self.tags_state.remove(tag_id);
         self.last_good_values.remove(tag_id);
@@ -1062,17 +1227,33 @@ impl ScadaCore {
         if let Some(meta) = &tag_meta_opt {
             let has_scaling =
                 (meta.scale_factor - 1.0).abs() > 1e-9 || meta.scale_offset.abs() > 1e-9;
-            if from_device && has_scaling && meta.data_type == crate::models::TagDataType::Float {
-                if let (TagValue::Float(_) | TagValue::Int(_), Some(raw)) =
-                    (&incoming.value, incoming.value.as_f64())
-                {
-                    let scaled =
-                        ((raw * meta.scale_factor + meta.scale_offset) * 1000.0).round() / 1000.0;
-                    incoming.value = TagValue::Float(scaled);
+            if from_device && has_scaling {
+                if meta.data_type == crate::models::TagDataType::Float {
+                    if let (TagValue::Float(_) | TagValue::Int(_), Some(raw)) =
+                        (&incoming.value, incoming.value.as_f64())
+                    {
+                        let scaled = ((raw * meta.scale_factor + meta.scale_offset) * 1000.0)
+                            .round()
+                            / 1000.0;
+                        incoming.value = TagValue::Float(scaled);
+                    }
+                } else if meta.data_type == crate::models::TagDataType::Int {
+                    if let (TagValue::Float(_) | TagValue::Int(_), Some(raw)) =
+                        (&incoming.value, incoming.value.as_f64())
+                    {
+                        let scaled = (raw * meta.scale_factor + meta.scale_offset).round();
+                        match TagValue::Float(scaled).coerce_to(crate::models::TagDataType::Int) {
+                            Ok(value) => incoming.value = value,
+                            Err(_) => incoming.quality = Quality::BadDisconnect,
+                        }
+                    }
                 }
             }
         }
 
+        if matches!(&incoming.value, TagValue::Float(f) if !f.is_finite()) {
+            incoming.quality = Quality::BadDisconnect;
+        }
         // Perte de communication : on garde la dernière valeur connue (qualité Bad) au lieu de
         // la valeur de repli du driver (0, false...), comme un SCADA classique.
         if incoming.quality == Quality::BadDisconnect {
@@ -1115,7 +1296,13 @@ impl ScadaCore {
 
             if historize && self.db_pool.is_some() {
                 // File bornée et non bloquante : l'écrivain groupé gère la persistance.
-                if self.history_tx.try_send(incoming).is_err() {
+                let sent_ok = self
+                    .history_tx
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|tx| tx.try_send(incoming).is_ok()))
+                    .unwrap_or(false);
+                if !sent_ok {
                     self.history_dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -1174,6 +1361,16 @@ impl ScadaCore {
 
         match (reason, self.alarms.get_mut(alarm_id)) {
             (Some((msg, sev)), Some(mut existing)) => {
+                let previous_severity = existing.severity;
+                let current_severity = match existing.level {
+                    Some(AlarmLevel::High | AlarmLevel::Low) => self
+                        .tags_registry
+                        .get(source_id)
+                        .map(|t| t.alarm_config.severity)
+                        .unwrap_or(existing.severity),
+                    Some(AlarmLevel::HighHigh | AlarmLevel::LowLow) => AlarmSeverity::Critical,
+                    _ => existing.severity,
+                };
                 let was_active = matches!(
                     existing.state,
                     AlarmLifecycleState::ActiveUnack | AlarmLifecycleState::ActiveAck
@@ -1188,20 +1385,36 @@ impl ScadaCore {
                     existing.ack_comment = None;
                     changed = true;
                     journal_event = Some(("APPARITION", sev, msg.clone()));
-                } else if severity_rank(sev) > severity_rank(existing.severity) {
-                    // Aggravation (ex. H → HH) : l'alarme doit être réacquittée
+                } else if severity_rank(sev) > severity_rank(current_severity) {
+                    // Une aggravation réveille l'alarme et impose un nouvel acquittement.
+                    existing.shelved_until = None;
+                    existing.shelved_by = None;
                     existing.trigger_value = trigger_value;
                     existing.state = AlarmLifecycleState::ActiveUnack;
                     existing.acked_at = None;
                     existing.acked_by = None;
                     changed = true;
                     journal_event = Some(("AGGRAVATION", sev, msg.clone()));
+                } else if severity_rank(sev) < severity_rank(existing.severity) {
+                    // S-25: Désescalade (ex. HH → H) : journalisation explicite de la transition
+                    if existing.level != level {
+                        journal_event = Some(("DESESCALADE", sev, msg.clone()));
+                        changed = true;
+                    }
                 } else if existing.message != msg {
                     changed = true;
                 }
                 existing.message = msg;
                 existing.level = level;
-                existing.severity = sev;
+                // S-25: Conserver la gravité maximale atteinte tant que l'alarme n'est pas acquittée
+                if existing.state == AlarmLifecycleState::ActiveUnack {
+                    if severity_rank(sev) >= severity_rank(existing.severity) {
+                        existing.severity = sev;
+                    }
+                } else {
+                    existing.severity = sev;
+                }
+                changed |= previous_severity != existing.severity;
             }
             (Some((msg, sev)), None) => {
                 let instance = AlarmInstance {
@@ -1379,6 +1592,11 @@ impl ScadaCore {
                 .alarms
                 .get_mut(alarm_id)
                 .ok_or_else(|| ScadaError::AlarmNotFound(alarm_id.to_string()))?;
+            if alarm.state == AlarmLifecycleState::Normal {
+                return Err(ScadaError::BadRequest(
+                    "Une alarme normale ne peut pas être mise en sommeil".into(),
+                ));
+            }
             alarm.shelved_until = Some(until);
             alarm.shelved_by = Some(operator.to_string());
             alarm.clone()
@@ -1464,6 +1682,18 @@ impl ScadaCore {
 
     pub fn subscribe_settings(&self) -> broadcast::Receiver<SystemSettings> {
         self.settings_tx.subscribe()
+    }
+
+    pub fn subscribe_session_revocation(&self) -> broadcast::Receiver<String> {
+        self.session_revoke_tx.subscribe()
+    }
+
+    pub fn subscribe_snapshot_notify(&self) -> broadcast::Receiver<()> {
+        self.snapshot_notify_tx.subscribe()
+    }
+
+    pub fn notify_snapshot(&self) {
+        let _ = self.snapshot_notify_tx.send(());
     }
 
     /// Modifie les réglages système. Désactiver la mise en sommeil réveille immédiatement
@@ -1599,17 +1829,19 @@ impl ScadaCore {
             Some(a) => AlarmPersistOp::Upsert(Box::new(a.clone())),
             None => AlarmPersistOp::Delete(alarm_id.to_string()),
         };
-        let _ = self.alarm_persist_tx.send(op);
+        if let Ok(guard) = self.alarm_persist_tx.lock() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(op);
+            }
+        }
     }
 
     fn spawn_alarm_persist_writer(
         core: Arc<Self>,
         mut rx: mpsc::UnboundedReceiver<AlarmPersistOp>,
-    ) {
-        let Some(pool) = core.db_pool.clone() else {
-            return;
-        };
-        tokio::spawn(async move {
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let pool = core.db_pool.clone()?;
+        Some(tokio::spawn(async move {
             while let Some(op) = rx.recv().await {
                 match op {
                     AlarmPersistOp::Upsert(alarm) => match serde_json::to_string(&alarm) {
@@ -1636,7 +1868,7 @@ impl ScadaCore {
                     ),
                 }
             }
-        });
+        }))
     }
 
     pub fn acknowledge_all_alarms(&self, operator: &str) -> Vec<AlarmInstance> {
@@ -1725,7 +1957,7 @@ impl ScadaCore {
             let s = severity.to_string();
             let e = event_type.to_string();
             let m = message.to_string();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 log_db_error(
                     "journal d'alarmes",
                     sqlx::query(
@@ -1742,6 +1974,10 @@ impl ScadaCore {
                     .await,
                 );
             });
+            if let Ok(mut handles) = self.journal_handles.lock() {
+                handles.retain(|h| !h.is_finished());
+                handles.push(handle);
+            }
         }
     }
 
@@ -1791,6 +2027,71 @@ impl ScadaCore {
     ///   l'échelle) puis transmise au driver sans attente. La valeur affichée est mise à jour par la
     ///   relecture de l'équipement, jamais de façon « optimiste ». La commande est refusée si le driver
     ///   est arrêté, déconnecté ou saturé.
+    ///
+    /// Impulsion bornée par le serveur, indépendante de la connexion HTTP du poste.
+    pub async fn pulse_tag(self: &Arc<Self>, tag_id: &str) -> Result<TagState, ScadaError> {
+        if !self
+            .tags_registry
+            .get(tag_id)
+            .is_some_and(|t| t.data_type == crate::models::TagDataType::Bool)
+        {
+            return Err(ScadaError::BadRequest(
+                "Une impulsion exige une variable booléenne".into(),
+            ));
+        }
+        if self.active_pulses.insert(tag_id.into(), ()).is_some() {
+            return Err(ScadaError::BadRequest("Impulsion déjà en cours".into()));
+        }
+        let core = Arc::clone(self);
+        let id = tag_id.to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = core.write_tag(&id, TagValue::Bool(true)).await;
+            let started = result.is_ok();
+            let _ = tx.send(result);
+            if started {
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                let mut attempts: usize = 0;
+                loop {
+                    match core.write_tag(&id, TagValue::Bool(false)).await {
+                        Ok(_) => break,
+                        Err(e) => {
+                            warn!(
+                                "Remise à zéro de l'impulsion '{}' non confirmée : {}",
+                                id, e
+                            );
+                            core.record_audit(
+                                "Serveur",
+                                "CONSIGNE",
+                                "PULSE_RESET_FAILED",
+                                &id,
+                                &e.to_string(),
+                            );
+                            if matches!(
+                                e,
+                                ScadaError::TagNotFound(_) | ScadaError::TagNotWritable(_)
+                            ) {
+                                break;
+                            }
+                            attempts += 1;
+                            if attempts >= 10 {
+                                warn!(
+                                    "Abandon de la remise à zéro de l'impulsion '{}' après 10 tentatives",
+                                    id
+                                );
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            }
+            core.active_pulses.remove(&id);
+        });
+        rx.await
+            .map_err(|_| ScadaError::BadRequest("Impulsion interrompue".into()))?
+    }
+
     pub async fn write_tag(
         &self,
         tag_id: &str,
@@ -1849,6 +2150,10 @@ impl ScadaCore {
         // du registre (ou une adresse non écrivable) est refusée ici, avec une erreur renvoyée à
         // l'opérateur ou au flux, au lieu d'être saturée ou rejetée plus tard par le driver.
         let device_value = to_device_value(&tag_meta, &coerced_value);
+        if protocol == ProtocolType::Mqtt {
+            crate::drivers::check_mqtt_write(&tag_meta.protocol_address)
+                .map_err(ScadaError::BadRequest)?;
+        }
         if protocol == ProtocolType::ModbusTcp {
             crate::drivers::check_modbus_write(&tag_meta.protocol_address, &device_value).map_err(
                 |e| {
@@ -1858,6 +2163,39 @@ impl ScadaCore {
                     ))
                 },
             )?;
+        }
+
+        if protocol == ProtocolType::OpcUa {
+            crate::drivers::opc_ua::precheck_write(
+                &tag_meta.module_source,
+                &tag_meta.protocol_address,
+                &device_value,
+            )
+            .map_err(|e| {
+                ScadaError::BadRequest(format!(
+                    "Consigne refusée pour '{}' ({}) : {}",
+                    tag_meta.id, tag_meta.protocol_address, e
+                ))
+            })?;
+        }
+        if protocol == ProtocolType::SiemensS7 {
+            crate::drivers::s7::S7Address::parse(&tag_meta.protocol_address, tag_meta.data_type)
+                .and_then(|a| a.encode(&device_value))
+                .map_err(|e| {
+                    ScadaError::BadRequest(format!(
+                        "Consigne refusée pour '{}' ({}) : {}",
+                        tag_meta.id, tag_meta.protocol_address, e
+                    ))
+                })?;
+        }
+        if protocol == ProtocolType::BacnetIp {
+            crate::drivers::bacnet::check_bacnet_write(&tag_meta.protocol_address, &device_value)
+                .map_err(|e| {
+                ScadaError::BadRequest(format!(
+                    "Consigne refusée pour '{}' ({}) : {}",
+                    tag_meta.id, tag_meta.protocol_address, e
+                ))
+            })?;
         }
 
         if !running {
@@ -1964,7 +2302,10 @@ impl ScadaCore {
         rule.days.sort_unstable();
         rule.days.dedup();
         match self.tags_registry.get(&rule.target_tag_id) {
-            Some(t) if t.writable => {}
+            Some(t) if t.writable => {
+                rule.active_value = rule.active_value.coerce_to(t.data_type)?;
+                rule.inactive_value = rule.inactive_value.coerce_to(t.data_type)?;
+            }
             Some(_) => return Err(ScadaError::TagNotWritable(rule.target_tag_id.clone())),
             None => return Err(ScadaError::TagNotFound(rule.target_tag_id.clone())),
         }
@@ -2041,15 +2382,16 @@ impl ScadaCore {
                     } else {
                         rule.inactive_value.clone()
                     };
+                    // Réserver avant l'envoi : un refus immédiat du driver peut annuler cet état.
+                    if let Some(mut r) = core.schedules.get_mut(&rule.id) {
+                        r.last_applied_state = Some(is_in_window);
+                    }
                     match core
                         .write_tag(&rule.target_tag_id, target_val.clone())
                         .await
                     {
                         Ok(_) => {
                             failing.remove(&rule.id);
-                            if let Some(mut r_mut) = core.schedules.get_mut(&rule.id) {
-                                r_mut.last_applied_state = Some(is_in_window);
-                            }
                             core.record_audit(
                                 "Planificateur",
                                 "PLANNING",
@@ -2064,6 +2406,9 @@ impl ScadaCore {
                             );
                         }
                         Err(err) => {
+                            if let Some(mut r) = core.schedules.get_mut(&rule.id) {
+                                r.last_applied_state = None;
+                            }
                             if failing.insert(rule.id.clone()) {
                                 warn!(
                                     "Planning '{}' non appliqué sur '{}' : {} (nouvelle tentative toutes les 15 s)",
@@ -2444,31 +2789,48 @@ impl ScadaCore {
         target: &str,
         details: &str,
     ) {
-        if let Some(pool) = &self.db_pool {
-            let pool_c = pool.clone();
-            let a = actor.to_string();
-            let c = category.to_string();
-            let act = action.to_string();
-            let tgt = target.to_string();
-            let det = details.to_string();
-            tokio::spawn(async move {
+        if self.db_pool.is_none() {
+            return;
+        }
+        let entry = AuditEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: actor.to_string(),
+            category: category.to_string(),
+            action: action.to_string(),
+            target: target.to_string(),
+            details: details.to_string(),
+        };
+        if let Ok(guard) = self.audit_tx.lock() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(entry);
+            }
+        }
+    }
+
+    fn spawn_audit_writer(
+        core: Arc<Self>,
+        mut rx: mpsc::UnboundedReceiver<AuditEntry>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let pool = core.db_pool.clone()?;
+        Some(tokio::spawn(async move {
+            while let Some(e) = rx.recv().await {
                 log_db_error(
                     "journal d'audit",
                     sqlx::query(
                         "INSERT INTO audit_logs (timestamp, actor, category, action, target, details)
                          VALUES (?, ?, ?, ?, ?, ?)",
                     )
-                    .bind(Utc::now().to_rfc3339())
-                    .bind(a)
-                    .bind(c)
-                    .bind(act)
-                    .bind(tgt)
-                    .bind(det)
-                    .execute(&pool_c)
+                    .bind(&e.timestamp)
+                    .bind(&e.actor)
+                    .bind(&e.category)
+                    .bind(&e.action)
+                    .bind(&e.target)
+                    .bind(&e.details)
+                    .execute(&pool)
                     .await,
                 );
-            });
-        }
+            }
+        }))
     }
 
     pub async fn query_audit_logs(&self, limit: u32) -> Result<Vec<AuditLogEntry>, ScadaError> {
@@ -2512,10 +2874,12 @@ impl ScadaCore {
             dashboards: self.get_all_dashboards(),
             flows: self.get_all_flows(),
             schedules: self.get_all_schedules(),
+            symbols: self.get_all_symbols(),
+            settings: Some(self.get_settings()),
         }
     }
 
-    /// Restaure une archive projet complète (drivers, tags, synoptiques, flux, plannings)
+    /// Restaure une archive projet complète (drivers, tags, synoptiques, flux, plannings, symboles, réglages)
     /// et renvoie un rapport détaillé, erreurs comprises.
     pub async fn import_project_bundle(
         self: &Arc<Self>,
@@ -2524,7 +2888,8 @@ impl ScadaCore {
     ) -> Result<serde_json::Value, ScadaError> {
         let mut errors: Vec<String> = Vec::new();
         let mut counts = [0usize; 5];
-        // Drivers non importés (protocole simulé sans simulation, configuration invalide) :
+        let mut symbols_imported = 0usize;
+        // Drivers non importés (simulateur GTB sans simulation, configuration invalide) :
         // leurs variables sont écartées elles aussi.
         let mut ignored_drivers: std::collections::HashSet<String> = Default::default();
         let mut ignored_tags = 0usize;
@@ -2542,18 +2907,27 @@ impl ScadaCore {
                 ignored_drivers.insert(id);
                 continue;
             }
-            // Une variable invalide pour le protocole (ex. registre d'entrée Modbus déclaré
-            // inscriptible) est écartée seule, sans faire échouer l'import de tout le driver.
+            // S-23: Une variable avec identifiant invalide ou non supportée par le protocole
+            // est écartée seule, sans faire échouer l'import de tout le driver.
             let protocol = drv.protocol.clone();
-            drv.tags
-                .retain(|tag| match validate_tag_for_protocol(&protocol, tag) {
+            drv.tags.retain(|tag| {
+                if let Err(e) = security::validate_id("tag", &tag.id) {
+                    errors.push(format!(
+                        "Tag '{}' ignoré (identifiant invalide) : {}",
+                        tag.id, e
+                    ));
+                    ignored_tag_ids.insert(tag.id.clone());
+                    return false;
+                }
+                match validate_tag_for_protocol(&protocol, tag) {
                     Ok(()) => true,
                     Err(e) => {
                         errors.push(format!("Tag '{}' ignoré : {}", tag.id, e));
                         ignored_tag_ids.insert(tag.id.clone());
                         false
                     }
-                });
+                }
+            });
             match self.register_and_start_driver(actor, drv).await {
                 Ok(_) => counts[0] += 1,
                 // Un driver déclaré mais non démarrable (équipement absent) reste importé
@@ -2576,6 +2950,18 @@ impl ScadaCore {
             if ignored_tag_ids.contains(&tag.id) {
                 continue;
             }
+            // S-23: Si la variable référence un driver inexistant (ni interne ni connu)
+            if !tag.module_source.eq_ignore_ascii_case("internal")
+                && !tag.module_source.eq_ignore_ascii_case("interne")
+                && !self.drivers_config.contains_key(&tag.module_source)
+            {
+                errors.push(format!(
+                    "Tag '{}' ignoré : driver source '{}' introuvable",
+                    tag.id, tag.module_source
+                ));
+                ignored_tags += 1;
+                continue;
+            }
             let id = tag.id.clone();
             match self.upsert_tag(actor, tag).await {
                 Ok(_) => counts[1] += 1,
@@ -2584,7 +2970,7 @@ impl ScadaCore {
         }
         if ignored_tags > 0 {
             errors.push(format!(
-                "{} variable(s) rattachée(s) à un driver non importé, ignorée(s)",
+                "{} variable(s) rattachée(s) à un driver non importé ou manquant, ignorée(s)",
                 ignored_tags
             ));
         }
@@ -2609,14 +2995,32 @@ impl ScadaCore {
                 Err(e) => errors.push(format!("Planning '{}' : {}", id, e)),
             }
         }
+        // S-20: Restauration des symboles personnalisés et des paramètres système
+        for sym in bundle.symbols {
+            let id = sym.id.clone();
+            let mut imp = Vec::new();
+            let mut rej = Vec::new();
+            self.store_symbol(sym, &mut imp, &mut rej).await;
+            if !imp.is_empty() {
+                symbols_imported += 1;
+            }
+            for r in rej {
+                errors.push(format!("Symbole '{}' : {}", id, r));
+            }
+        }
+        if let Some(sett) = bundle.settings {
+            if let Err(e) = self.update_settings(actor, sett).await {
+                errors.push(format!("Réglages système : {}", e));
+            }
+        }
         self.record_audit(
             actor,
             "SYSTÈME",
             "IMPORT_PROJECT",
             "Backup JSON",
             &format!(
-                "Restauration : {} drivers, {} tags, {} synoptiques, {} flux, {} plannings, {} erreur(s)",
-                counts[0], counts[1], counts[2], counts[3], counts[4], errors.len()
+                "Restauration : {} drivers, {} tags, {} synoptiques, {} flux, {} plannings, {} symboles, {} erreur(s)",
+                counts[0], counts[1], counts[2], counts[3], counts[4], symbols_imported, errors.len()
             ),
         );
         Ok(serde_json::json!({
@@ -2626,6 +3030,7 @@ impl ScadaCore {
             "dashboards": counts[2],
             "flows": counts[3],
             "schedules": counts[4],
+            "symbols": symbols_imported,
             "ignored_drivers": ignored_drivers.len(),
             "ignored_tags": ignored_tags,
             "errors": errors,
@@ -2670,7 +3075,15 @@ impl ScadaCore {
                 .execute(&pool)
                 .await
                 .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
-            info!("Première initialisation : configuration de démonstration enregistrée en base");
+            if self.simulation_enabled {
+                info!(
+                    "Première initialisation : configuration de démonstration enregistrée en base"
+                );
+            } else {
+                info!(
+                    "Première initialisation : base de production créée (compte admin uniquement)"
+                );
+            }
         }
 
         // La base fait foi : la démonstration en mémoire est remplacée par le contenu persisté
@@ -2703,6 +3116,8 @@ impl ScadaCore {
                 Err(e) => warn!("Tag illisible ignoré : {}", e),
             }
         }
+
+        self.restore_internal_values(&pool).await;
 
         for js in load_json_column(&pool, "SELECT layout_json AS js FROM dashboards").await {
             match serde_json::from_str::<DashboardLayout>(&js) {
@@ -2851,7 +3266,8 @@ impl ScadaCore {
                 .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
         }
         // Données de démonstration (synoptiques, flux, plannings liés au simulateur) :
-        // uniquement si la simulation est active. Comptes et symboles sont toujours créés.
+        // uniquement si la simulation est active. Sans simulation (production), seul le compte
+        // administrateur d'usine est initialisé. Symboles toujours créés.
         let demo_dashboards = if self.simulation_enabled {
             self.get_all_dashboards()
         } else {
@@ -2994,9 +3410,11 @@ impl ScadaCore {
         // Écritures sérialisées, et toujours avec l'état courant du compte en mémoire : deux
         // modifications concurrentes ne peuvent pas laisser en base une copie périmée.
         let _guard = self.users_persist_lock.lock().await;
-        let current = self.users.get(&account.username).map(|u| u.clone());
-        let account = current.as_ref().unwrap_or(account);
-        match serde_json::to_string(account) {
+        let Some(account) = self.users.get(&account.username).map(|u| u.clone()) else {
+            // S-21: Le compte a été supprimé entre-temps ou n'existe plus en mémoire : on ne réinsère rien
+            return;
+        };
+        match serde_json::to_string(&account) {
             Ok(json) => log_db_error(
                 "persistance utilisateur",
                 sqlx::query(
@@ -3096,21 +3514,36 @@ impl ScadaCore {
     // TÂCHES DE FOND (INGESTION, HISTORIQUE, RÉTENTION, SESSIONS, TÉLÉMÉTRIE)
     // ========================================================================
 
-    fn spawn_ingestion_worker(core: Arc<Self>, mut ingest_rx: mpsc::Receiver<TagState>) {
+    fn spawn_ingestion_worker(
+        core: Arc<Self>,
+        mut ingest_rx: mpsc::Receiver<TagState>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            while let Some(state) = ingest_rx.recv().await {
-                core.process_incoming_state(state);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = core.ingestion_stop.notified() => {
+                        ingest_rx.close();
+                        while let Some(state) = ingest_rx.recv().await { core.process_incoming_state(state); }
+                        break;
+                    }
+                    state = ingest_rx.recv() => match state {
+                        Some(state) => { core.process_incoming_state(state); }
+                        None => break,
+                    }
+                }
             }
-        });
+        })
     }
 
     /// Écrivain unique de l'historique : regroupe les points (500 max ou 1 s) en une seule
     /// requête `INSERT` multi-lignes, au lieu d'une écriture disque par changement de valeur.
-    fn spawn_history_writer(core: Arc<Self>, mut rx: mpsc::Receiver<TagState>) {
-        let Some(pool) = core.db_pool.clone() else {
-            return;
-        };
-        tokio::spawn(async move {
+    fn spawn_history_writer(
+        core: Arc<Self>,
+        mut rx: mpsc::Receiver<TagState>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let pool = core.db_pool.clone()?;
+        Some(tokio::spawn(async move {
             let mut batch: Vec<TagState> = Vec::with_capacity(HISTORY_BATCH_MAX);
             loop {
                 let Some(first) = rx.recv().await else {
@@ -3127,7 +3560,7 @@ impl ScadaCore {
                 write_history_batch(&pool, &batch).await;
                 batch.clear();
             }
-        });
+        }))
     }
 
     /// Purge périodique (toutes les 6 h) des points d'historique plus anciens que la rétention.
@@ -3230,6 +3663,8 @@ impl ScadaCore {
             category: "CVC / Climatisation".to_string(),
             description: "Supervision complète de la CTA 01".to_string(),
             grid_size: 20,
+            canvas_width: None,
+            canvas_height: None,
             updated_at: Utc::now(),
             widgets: vec![
                 DashboardWidget {
@@ -3330,6 +3765,8 @@ impl ScadaCore {
             category: "Production Thermique".to_string(),
             description: "Supervision de la chaudière, des pompes P1/P2 et de l'automate Modbus TCP Groupe Froid".to_string(),
             grid_size: 20,
+            canvas_width: None,
+            canvas_height: None,
             updated_at: Utc::now(),
             widgets: vec![
                 DashboardWidget {
@@ -3419,6 +3856,8 @@ impl ScadaCore {
             category: "Énergie / TGBT".to_string(),
             description: "Mesure temps réel de la puissance active, de la tension triphasée et du facteur de puissance".to_string(),
             grid_size: 20,
+            canvas_width: None,
+            canvas_height: None,
             updated_at: Utc::now(),
             widgets: vec![
                 DashboardWidget {
@@ -3640,6 +4079,7 @@ impl ScadaCore {
             target_tag_id: "GTB.CTA01.Consigne_Temp".to_string(),
             start_time: "07:00".to_string(),
             end_time: "19:30".to_string(),
+            full_day: false,
             active_value: TagValue::Float(21.5),
             inactive_value: TagValue::Float(17.5),
             enabled: true,
@@ -3653,6 +4093,7 @@ impl ScadaCore {
             target_tag_id: "MODBUS.GF01.Consigne_Eau_Glacee".to_string(),
             start_time: "06:30".to_string(),
             end_time: "20:00".to_string(),
+            full_day: false,
             active_value: TagValue::Float(7.0),
             inactive_value: TagValue::Float(10.5),
             enabled: true,
@@ -3662,19 +4103,22 @@ impl ScadaCore {
         self.schedules.insert(sched_1.id.clone(), sched_1);
         self.schedules.insert(sched_2.id.clone(), sched_2);
 
-        // COMPTES UTILISATEURS PAR DÉFAUT (3 GROUPES : ADMIN, SUPERVISEUR, VISUALISATION)
-        let default_users = vec![
-            UserAccount {
-                username: "admin".to_string(),
-                display_name: "Administrateur Système SCADA".to_string(),
-                role: UserRole::Admin,
-                password_hash: "admin123".to_string(),
-                department: "Direction Technique / Automatisme".to_string(),
-                enabled: true,
-                created_at: Utc::now(),
-                last_login_at: Some(Utc::now()),
-            },
-            UserAccount {
+        // COMPTES UTILISATEURS PAR DÉFAUT
+        // En production (simulation désactivée), seul le compte administrateur est créé.
+        // En démonstration (simulation active), les trois profils d'usine sont initialisés.
+        let mut default_users = vec![UserAccount {
+            username: "admin".to_string(),
+            display_name: "Administrateur Système SCADA".to_string(),
+            role: UserRole::Admin,
+            password_hash: "admin123".to_string(),
+            department: "Direction Technique / Automatisme".to_string(),
+            enabled: true,
+            created_at: Utc::now(),
+            last_login_at: Some(Utc::now()),
+        }];
+
+        if self.simulation_enabled {
+            default_users.push(UserAccount {
                 username: "superviseur".to_string(),
                 display_name: "Ingénieur Superviseur GTB".to_string(),
                 role: UserRole::Supervisor,
@@ -3683,8 +4127,8 @@ impl ScadaCore {
                 enabled: true,
                 created_at: Utc::now(),
                 last_login_at: None,
-            },
-            UserAccount {
+            });
+            default_users.push(UserAccount {
                 username: "visu".to_string(),
                 display_name: "Poste Opérateur Visualisation".to_string(),
                 role: UserRole::Viewer,
@@ -3693,8 +4137,8 @@ impl ScadaCore {
                 enabled: true,
                 created_at: Utc::now(),
                 last_login_at: None,
-            },
-        ];
+            });
+        }
 
         // Les mots de passe d'usine sont hachés (Argon2id) lors du chargement initial
         // (voir `migrate_legacy_passwords`) : ils ne sont jamais conservés en clair.
@@ -3719,11 +4163,25 @@ impl ScadaCore {
     /// ni la réponse ni son temps ne permettent d'énumérer les comptes. Au-delà de 5 tentatives
     /// sans succès, l'identifiant est verrouillé 60 secondes, y compris face à des requêtes
     /// concurrentes (réservation atomique de la tentative avant la vérification).
-    pub async fn login(&self, req: LoginRequest) -> Result<LoginResponse, ScadaError> {
+    pub async fn login(
+        &self,
+        req: LoginRequest,
+        client_ip: Option<&str>,
+    ) -> Result<LoginResponse, ScadaError> {
+        if req.password.len() > 256 {
+            return Err(ScadaError::BadRequest(
+                "Mot de passe trop long (256 octets maximum)".to_string(),
+            ));
+        }
+
         let key = req.username.trim().to_lowercase();
+        security::validate_id("utilisateur", &key)?;
+
+        let ip_key = client_ip.unwrap_or("direct");
+        let lock_key = format!("{}:{}", ip_key, key);
         let now = Utc::now();
 
-        self.reserve_login_attempt(&key, now)?;
+        self.reserve_login_attempt(&lock_key, now)?;
 
         let account = self.users.get(&key).map(|u| u.clone());
         let stored_hash = account.as_ref().map(|u| u.password_hash.clone());
@@ -3734,7 +4192,7 @@ impl ScadaCore {
             Ok(ok) => ok,
             Err(busy) => {
                 // Aucune vérification faite : la tentative réservée est rendue
-                self.release_login_attempt(&key);
+                self.release_login_attempt(&lock_key);
                 return Err(busy);
             }
         };
@@ -3754,6 +4212,13 @@ impl ScadaCore {
         };
 
         if !account.enabled {
+            self.record_audit(
+                &key,
+                "AUTH",
+                "LOGIN_REFUSED",
+                &key,
+                "Connexion refusée : compte désactivé",
+            );
             return Err(ScadaError::Forbidden(
                 "Ce compte utilisateur est désactivé par l'administrateur".to_string(),
             ));
@@ -3777,6 +4242,14 @@ impl ScadaCore {
                 ));
             }
             if !current.enabled {
+                drop(current);
+                self.record_audit(
+                    &key,
+                    "AUTH",
+                    "LOGIN_REFUSED",
+                    &key,
+                    "Connexion refusée : compte désactivé",
+                );
                 return Err(ScadaError::Forbidden(
                     "Ce compte utilisateur est désactivé par l'administrateur".to_string(),
                 ));
@@ -3792,7 +4265,7 @@ impl ScadaCore {
             );
             current.clone()
         };
-        self.login_failures.remove(&key);
+        self.login_failures.remove(&lock_key);
         self.persist_user(&account).await;
         self.persist_sessions().await;
 
@@ -3880,9 +4353,10 @@ impl ScadaCore {
     }
 
     pub async fn logout(&self, token: &str) {
-        let clean = token.strip_prefix("Bearer ").unwrap_or(token).trim();
+        let clean = security::bearer_token(token);
         if let Some((_, session)) = self.sessions.remove(&security::session_key(clean)) {
             self.persist_sessions().await;
+            let _ = self.session_revoke_tx.send(session.username.clone());
             self.record_audit(
                 &session.username,
                 "AUTH",
@@ -3901,7 +4375,7 @@ impl ScadaCore {
     /// jamais de session utilisateur : voir [`Self::is_local_control_token`].
     pub fn resolve_user(&self, token: Option<&str>) -> Option<UserAccount> {
         let raw = token?;
-        let clean = raw.strip_prefix("Bearer ").unwrap_or(raw).trim();
+        let clean = security::bearer_token(raw);
         if clean.is_empty() {
             return None;
         }
@@ -3927,6 +4401,29 @@ impl ScadaCore {
             .filter(|u| u.enabled)
     }
 
+    /// Vérifie passivement la validité d'une session (présente, non expirée, compte activé).
+    /// Ne modifie ni `last_seen` ni `sessions_dirty` (utilisé par le tick de surveillance WebSocket).
+    pub fn is_session_valid(&self, token: Option<&str>) -> bool {
+        let Some(raw) = token else { return false };
+        let clean = security::bearer_token(raw);
+        if clean.is_empty() {
+            return false;
+        }
+        let ttl = chrono::Duration::hours(self.session_ttl_hours as i64);
+        let now = Utc::now();
+        let key = security::session_key(clean);
+        let Some(session) = self.sessions.get(&key) else {
+            return false;
+        };
+        if now - session.last_seen >= ttl {
+            return false;
+        }
+        self.users
+            .get(&session.username)
+            .map(|u| u.enabled)
+            .unwrap_or(false)
+    }
+
     /// Indique si `token` est le jeton de contrôle local (comparaison à temps constant).
     ///
     /// Ce jeton ne sert qu'à l'arrêt propre par l'utilitaire desktop : le serveur web ne
@@ -3934,7 +4431,7 @@ impl ScadaCore {
     /// de routes, sous l'acteur [`Self::local_utility_account`].
     pub fn is_local_control_token(&self, token: Option<&str>) -> bool {
         token
-            .map(|raw| raw.strip_prefix("Bearer ").unwrap_or(raw).trim())
+            .map(security::bearer_token)
             .is_some_and(|t| !t.is_empty() && constant_time_eq(t, &self.local_control_token))
     }
 
@@ -3998,11 +4495,11 @@ impl ScadaCore {
     /// son propre compte : il n'est pas déconnecté par sa propre action). La fermeture est
     /// écrite en base avant de rendre la main : elle survit à un redémarrage.
     async fn revoke_user_sessions_except(&self, username: &str, keep: Option<&str>) {
-        let keep =
-            keep.map(|t| security::session_key(t.strip_prefix("Bearer ").unwrap_or(t).trim()));
+        let keep = keep.map(|t| security::session_key(security::bearer_token(t)));
         self.sessions
             .retain(|key, s| s.username != username || keep.as_deref() == Some(key.as_str()));
         self.persist_sessions().await;
+        let _ = self.session_revoke_tx.send(username.to_string());
     }
 
     fn active_admin_count_excluding(&self, username: &str) -> usize {
@@ -4129,6 +4626,9 @@ impl ScadaCore {
                 "Vous ne pouvez pas supprimer votre propre compte".to_string(),
             ));
         }
+
+        let _guard = self.users_persist_lock.lock().await;
+
         self.users.remove(&uname).ok_or_else(|| {
             ScadaError::BadRequest(format!("Utilisateur '{}' introuvable", uname))
         })?;
@@ -4725,13 +5225,17 @@ pub(crate) fn log_db_error<T>(context: &str, res: Result<T, sqlx::Error>) {
 /// Convertit une valeur d'ingénierie en valeur brute équipement (inverse de la mise à l'échelle).
 fn to_device_value(meta: &RegisteredTag, value: &TagValue) -> TagValue {
     let has_scaling = (meta.scale_factor - 1.0).abs() > 1e-9 || meta.scale_offset.abs() > 1e-9;
-    if has_scaling
-        && meta.data_type == crate::models::TagDataType::Float
-        && meta.scale_factor.abs() > 1e-9
-    {
-        if let Some(f) = value.as_f64() {
-            let raw = (f - meta.scale_offset) / meta.scale_factor;
-            return TagValue::Float((raw * 1_000_000.0).round() / 1_000_000.0);
+    if has_scaling && meta.scale_factor.abs() > 1e-9 {
+        if meta.data_type == crate::models::TagDataType::Float {
+            if let Some(f) = value.as_f64() {
+                let raw = (f - meta.scale_offset) / meta.scale_factor;
+                return TagValue::Float((raw * 1_000_000.0).round() / 1_000_000.0);
+            }
+        } else if meta.data_type == crate::models::TagDataType::Int {
+            if let Some(f) = value.as_f64() {
+                let raw = ((f - meta.scale_offset) / meta.scale_factor).round() as i64;
+                return TagValue::Int(raw);
+            }
         }
     }
     value.clone()
@@ -4939,6 +5443,17 @@ async fn write_history_batch(pool: &SqlitePool, batch: &[TagState]) {
 /// Valide les identifiants d'un synoptique et assainit les SVG embarqués dans ses widgets.
 fn sanitize_dashboard(layout: &mut DashboardLayout) -> Result<(), ScadaError> {
     security::validate_id("synoptique", &layout.id)?;
+    if layout
+        .canvas_width
+        .is_some_and(|w| !(320..=7680).contains(&w))
+        || layout
+            .canvas_height
+            .is_some_and(|h| !(240..=4320).contains(&h))
+    {
+        return Err(ScadaError::BadRequest(
+            "Taille d'écran du synoptique invalide (320 × 240 à 7680 × 4320 px)".to_string(),
+        ));
+    }
     for w in layout.widgets.iter_mut() {
         security::validate_id("widget", &w.id)?;
         if w.bound_tag_id
@@ -4970,6 +5485,15 @@ fn sanitize_dashboard(layout: &mut DashboardLayout) -> Result<(), ScadaError> {
 
 /// Contrôle de l'endpoint d'un driver, à l'ajout, à l'import et à la modification.
 fn validate_driver_endpoint(protocol: &ProtocolType, endpoint: &str) -> Result<(), ScadaError> {
+    if *protocol == ProtocolType::SiemensS7 {
+        crate::drivers::s7::S7Endpoint::parse(endpoint).map_err(ScadaError::BadRequest)?;
+    }
+    if *protocol == ProtocolType::OpcUa {
+        crate::drivers::opc_ua::validate_endpoint(endpoint).map_err(ScadaError::BadRequest)?;
+    }
+    if *protocol == ProtocolType::BacnetIp {
+        crate::drivers::bacnet::parse_endpoint(endpoint).map_err(ScadaError::BadRequest)?;
+    }
     if *protocol == ProtocolType::ModbusTcp
         && endpoint.trim().parse::<std::net::SocketAddr>().is_err()
     {
@@ -4989,6 +5513,18 @@ fn validate_tag_for_protocol(
     match protocol {
         ProtocolType::ModbusTcp => {
             crate::drivers::validate_modbus_tag(tag).map_err(ScadaError::BadRequest)
+        }
+        ProtocolType::SiemensS7 => {
+            crate::drivers::s7::validate_s7_tag(tag).map_err(ScadaError::BadRequest)
+        }
+        ProtocolType::OpcUa => {
+            crate::drivers::opc_ua::validate_opcua_tag(tag).map_err(ScadaError::BadRequest)
+        }
+        ProtocolType::Mqtt if tag.writable => {
+            crate::drivers::check_mqtt_write(&tag.protocol_address).map_err(ScadaError::BadRequest)
+        }
+        ProtocolType::BacnetIp => {
+            crate::drivers::bacnet::validate_bacnet_tag(tag).map_err(ScadaError::BadRequest)
         }
         _ => Ok(()),
     }
@@ -5025,6 +5561,19 @@ fn validate_flow(flow: &FlowGraph) -> Result<(), ScadaError> {
         if !node_ids.insert(n.id.as_str()) {
             return Err(ScadaError::BadRequest(format!("Nœud '{}' dupliqué", n.id)));
         }
+        if let FlowNodeKind::PidController {
+            kp,
+            ki,
+            kd,
+            min_out,
+            max_out,
+            ..
+        } = &n.kind
+        {
+            if ![kp, ki, kd, min_out, max_out].iter().all(|v| v.is_finite()) || min_out > max_out {
+                return Err(ScadaError::BadRequest("Paramètres PID invalides".into()));
+            }
+        }
         if let FlowNodeKind::RhaiScript { script } = &n.kind {
             crate::flow_engine::check_rhai_script(script).map_err(|e| {
                 ScadaError::BadRequest(format!(
@@ -5049,9 +5598,13 @@ fn validate_flow(flow: &FlowGraph) -> Result<(), ScadaError> {
 }
 
 #[cfg(test)]
+#[path = "../../apex-server/src/db.rs"]
+mod vague2_db;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::TagDataType;
+    use crate::models::{all_week_days, TagDataType};
 
     fn tag(scale: f64, offset: f64) -> RegisteredTag {
         RegisteredTag {
@@ -5099,6 +5652,8 @@ mod tests {
             category: "c".into(),
             description: "d".into(),
             grid_size: 20,
+            canvas_width: None,
+            canvas_height: None,
             widgets: vec![DashboardWidget {
                 id: "w-1".into(),
                 x: 0.0,
@@ -5183,7 +5738,10 @@ mod tests {
         let attempts: Vec<_> = (0..20)
             .map(|_| {
                 let core = Arc::clone(&core);
-                tokio::spawn(async move { core.login(login_req("visu", "mauvais")).await })
+                tokio::spawn(async move {
+                    core.login(login_req("visu", "mauvais"), Some("192.168.1.50"))
+                        .await
+                })
             })
             .collect();
         let (mut unauthorized, mut locked) = (0, 0);
@@ -5199,7 +5757,8 @@ mod tests {
         assert_eq!(locked, 20 - LOGIN_MAX_FAILURES as usize);
         // Le bon mot de passe est lui aussi refusé pendant le verrouillage
         assert!(matches!(
-            core.login(login_req("visu", "visu123")).await,
+            core.login(login_req("visu", "visu123"), Some("192.168.1.50"))
+                .await,
             Err(ScadaError::Forbidden(_))
         ));
         // Tous les jetons du plafond Argon2 ont été rendus
@@ -5215,11 +5774,15 @@ mod tests {
         for _ in 0..2 {
             for _ in 0..(LOGIN_MAX_FAILURES - 1) {
                 assert!(matches!(
-                    core.login(login_req("visu", "mauvais")).await,
+                    core.login(login_req("visu", "mauvais"), Some("192.168.1.51"))
+                        .await,
                     Err(ScadaError::Unauthorized(_))
                 ));
             }
-            assert!(core.login(login_req("VISU ", "visu123")).await.is_ok());
+            assert!(core
+                .login(login_req("VISU ", "visu123"), Some("192.168.1.51"))
+                .await
+                .is_ok());
         }
     }
 
@@ -5230,11 +5793,13 @@ mod tests {
         let (mut known, mut unknown) = (Duration::MAX, Duration::MAX);
         for i in 0..4 {
             let t = std::time::Instant::now();
-            let _ = core.login(login_req("superviseur", "faux")).await;
+            let _ = core.login(login_req("superviseur", "faux"), None).await;
             known = known.min(t.elapsed());
             // Un identifiant différent à chaque fois : le verrouillage n'intervient pas
             let t = std::time::Instant::now();
-            let r = core.login(login_req(&format!("inconnu{i}"), "faux")).await;
+            let r = core
+                .login(login_req(&format!("inconnu{i}"), "faux"), None)
+                .await;
             unknown = unknown.min(t.elapsed());
             assert!(matches!(r, Err(ScadaError::Unauthorized(_))));
         }
@@ -5264,10 +5829,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_account_login_rejected_and_drained() {
+        let pool = vague2_db::open(None).await.unwrap();
+        let core = ScadaCore::new(Some(pool.clone()), &engine_options(false));
+        let mut user = factory_admin_account();
+        user.username = "visu_disabled".into();
+        user.password_hash = security::hash_password("visu123").unwrap();
+        core.users.insert(user.username.clone(), user);
+        if let Some(mut user) = core.users.get_mut("visu_disabled") {
+            user.enabled = false;
+        }
+        let res = core
+            .login(login_req("visu_disabled", "visu123"), None)
+            .await;
+        assert!(matches!(res, Err(ScadaError::Forbidden(_))));
+        assert_eq!(res.unwrap_err().http_status(), 403);
+        core.shutdown();
+        core.drain_sqlite_writers().await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(count > 0, "Le refus de connexion doit être persisté");
+        pool.close().await;
+    }
+
+    #[tokio::test]
     async fn password_reset_by_admin_revokes_sessions() {
         let core = core_with_user("visu", "visu123");
         let session = core
-            .login(login_req("visu", "visu123"))
+            .login(login_req("visu", "visu123"), None)
             .await
             .unwrap()
             .token;
@@ -5288,12 +5879,12 @@ mod tests {
         assert!(core.resolve_user(Some(&session)).is_none());
         // Sur son propre compte, l'administrateur garde la session d'où il agit
         let own = core
-            .login(login_req("visu", "Nouveau-2026"))
+            .login(login_req("visu", "Nouveau-2026"), None)
             .await
             .unwrap()
             .token;
         let other = core
-            .login(login_req("visu", "Nouveau-2026"))
+            .login(login_req("visu", "Nouveau-2026"), None)
             .await
             .unwrap()
             .token;
@@ -5315,7 +5906,8 @@ mod tests {
                     tokio::spawn(async move {
                         let mut tokens = Vec::new();
                         for _ in 0..3 {
-                            if let Ok(r) = core.login(login_req("victime", "ancien123")).await {
+                            if let Ok(r) = core.login(login_req("victime", "ancien123"), None).await
+                            {
                                 tokens.push(r.token);
                             }
                         }
@@ -5351,6 +5943,44 @@ mod tests {
                 "sessions de l'ancien mot de passe encore valides"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn login_security_ip_lockout_and_input_validation() {
+        let core = core_with_user("secu", "motdepasse123");
+
+        // 1. Identifiant syntaxiquement invalide rejeté sans vérification de mot de passe
+        let res = core
+            .login(login_req("bad user!", "motdepasse123"), Some("10.0.0.1"))
+            .await;
+        assert!(matches!(res, Err(ScadaError::BadRequest(_))));
+
+        // 2. Mot de passe trop long (> 256 octets) rejeté pour prévenir le déni de service Argon2
+        let long_password = "a".repeat(257);
+        let res = core
+            .login(login_req("secu", &long_password), Some("10.0.0.1"))
+            .await;
+        assert!(matches!(res, Err(ScadaError::BadRequest(_))));
+
+        // 3. Verrouillage compartimenté par IP : un attaquant sur IP 10.0.0.1 ne bloque pas 10.0.0.2
+        for _ in 0..LOGIN_MAX_FAILURES {
+            let res = core
+                .login(login_req("secu", "mauvais"), Some("10.0.0.1"))
+                .await;
+            assert!(matches!(res, Err(ScadaError::Unauthorized(_))));
+        }
+
+        // L'IP 10.0.0.1 est maintenant verrouillée
+        let res = core
+            .login(login_req("secu", "motdepasse123"), Some("10.0.0.1"))
+            .await;
+        assert!(matches!(res, Err(ScadaError::Forbidden(_))));
+
+        // L'IP 10.0.0.2 peut se connecter avec succès sur le même compte
+        let res = core
+            .login(login_req("secu", "motdepasse123"), Some("10.0.0.2"))
+            .await;
+        assert!(res.is_ok());
     }
 
     #[test]
@@ -5592,17 +6222,17 @@ mod tests {
     async fn simulated_drivers_are_never_registered_without_simulation() {
         let core = ScadaCore::new(None, &engine_options(false));
         let sim = driver(
-            "OPC_DEMO",
-            ProtocolType::OpcUa,
-            vec![driver_tag("OPC_DEMO.T1", "OPC_DEMO", "ns=2;s=T1", false)],
+            "SIM_DEMO",
+            ProtocolType::Simulator,
+            vec![driver_tag("SIM_DEMO.T1", "SIM_DEMO", "SIM:T1", false)],
         );
         let err = core
             .register_and_start_driver("test", sim.clone())
             .await
             .unwrap_err();
         assert_eq!(err.http_status(), 400);
-        assert!(!core.drivers_config.contains_key("OPC_DEMO"));
-        assert!(!core.tags_registry.contains_key("OPC_DEMO.T1"));
+        assert!(!core.drivers_config.contains_key("SIM_DEMO"));
+        assert!(!core.tags_registry.contains_key("SIM_DEMO.T1"));
 
         // Import : le driver simulé et ses variables sont écartés, avec un rapport explicite
         let mb = driver(
@@ -5615,12 +6245,14 @@ mod tests {
             version: APP_VERSION.to_string(),
             drivers: vec![sim.clone(), mb],
             tags: vec![
-                driver_tag("OPC_DEMO.T1", "OPC_DEMO", "ns=2;s=T1", false),
+                driver_tag("SIM_DEMO.T1", "SIM_DEMO", "SIM:T1", false),
                 driver_tag("MB_01.T1", "MB_01", "HR:0:FLOAT32", false),
             ],
             dashboards: vec![],
             flows: vec![],
             schedules: vec![],
+            symbols: vec![],
+            settings: None,
         };
         let report = core.import_project_bundle("test", bundle).await.unwrap();
         assert_eq!(report["drivers"], 1);
@@ -5629,19 +6261,19 @@ mod tests {
         assert!(report["errors"][0]
             .as_str()
             .unwrap()
-            .contains("Driver 'OPC_DEMO' ignoré"));
-        assert!(!core.drivers_config.contains_key("OPC_DEMO"));
-        assert!(!core.tags_registry.contains_key("OPC_DEMO.T1"));
+            .contains("Driver 'SIM_DEMO' ignoré"));
+        assert!(!core.drivers_config.contains_key("SIM_DEMO"));
+        assert!(!core.tags_registry.contains_key("SIM_DEMO.T1"));
         assert!(core.tags_registry.contains_key("MB_01.T1"));
 
         // Driver simulé hérité de la base : le démarrage est refusé et l'état voulu reste « arrêté »
-        core.drivers_config.insert("OPC_DEMO".to_string(), sim);
+        core.drivers_config.insert("SIM_DEMO".to_string(), sim);
         let err = core
-            .start_or_restart_driver("test", "OPC_DEMO")
+            .start_or_restart_driver("test", "SIM_DEMO")
             .await
             .unwrap_err();
         assert_eq!(err.http_status(), 400);
-        assert!(!core.drivers_config.get("OPC_DEMO").unwrap().enabled);
+        assert!(!core.drivers_config.get("SIM_DEMO").unwrap().enabled);
     }
 
     #[tokio::test]
@@ -5666,34 +6298,28 @@ mod tests {
         core.register_and_start_driver("test", driver("MQ_01", ProtocolType::Mqtt, vec![]))
             .await
             .unwrap();
-        for id in ["MB_01", "MQ_01"] {
+        core.register_and_start_driver("test", driver("S7_01", ProtocolType::SiemensS7, vec![]))
+            .await
+            .unwrap();
+        core.register_and_start_driver("test", driver("UA_01", ProtocolType::OpcUa, vec![]))
+            .await
+            .unwrap_err(); // endpoint de test invalide pour OPC-UA : refusé à l'enregistrement
+        for id in ["MB_01", "MQ_01", "S7_01"] {
             let err = core.discover_driver_tags("test", id).await.unwrap_err();
             assert_eq!(err.http_status(), 400);
             assert!(core.get_tags_for_driver(id).is_empty(), "{}", id);
         }
-        core.register_and_start_driver("test", driver("S7_01", ProtocolType::SiemensS7, vec![]))
+
+        // BACnet : l'équipement est réellement interrogé ; injoignable, aucune variable inventée
+        core.register_and_start_driver("test", driver("BAC_01", ProtocolType::BacnetIp, vec![]))
             .await
             .unwrap();
-        assert!(!core
-            .discover_driver_tags("test", "S7_01")
+        let err = core
+            .discover_driver_tags("test", "BAC_01")
             .await
-            .unwrap()
-            .is_empty());
-
-        // Simulation désactivée : découverte refusée même pour un protocole simulé
-        let prod = ScadaCore::new(None, &engine_options(false));
-        prod.drivers_config.insert(
-            "S7_01".to_string(),
-            driver("S7_01", ProtocolType::SiemensS7, vec![]),
-        );
-        assert_eq!(
-            prod.discover_driver_tags("test", "S7_01")
-                .await
-                .unwrap_err()
-                .http_status(),
-            400
-        );
-        assert!(prod.get_tags_for_driver("S7_01").is_empty());
+            .unwrap_err();
+        assert_ne!(err.http_status(), 400, "{err}");
+        assert!(core.get_tags_for_driver("BAC_01").is_empty());
     }
 
     #[tokio::test]
@@ -5742,6 +6368,80 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ScadaError::DriverError(_)), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn bacnet_writes_are_checked_before_sending() {
+        let core = ScadaCore::new(None, &engine_options(true));
+        let mut av_tag = driver_tag("BAC_01.AV", "BAC_01", "BACNET:AV:1:Present_Value", true);
+        av_tag.data_type = TagDataType::Float;
+        core.register_and_start_driver(
+            "test",
+            driver("BAC_01", ProtocolType::BacnetIp, vec![av_tag]),
+        )
+        .await
+        .unwrap();
+
+        // Valeur non numérique sur un REAL : refusée 400 immédiatement
+        let err = core
+            .write_tag("BAC_01.AV", TagValue::Text("invalide".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.http_status(), 400);
+
+        // Valeur valide : passe le pré-contrôle synchrone (puis refusée car driver arrêté)
+        let err = core
+            .write_tag("BAC_01.AV", TagValue::Float(21.5))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ScadaError::DriverError(_)), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn schedule_last_applied_state_is_reset_on_driver_rejection_and_disconnect() {
+        let core = ScadaCore::new(None, &engine_options(true));
+        let tag = driver_tag("MB.SP", "MB_DRV", "HR:10:FLOAT32", true);
+        core.register_and_start_driver(
+            "test",
+            driver("MB_DRV", ProtocolType::ModbusTcp, vec![tag]),
+        )
+        .await
+        .unwrap();
+
+        let rule = ScheduleRule {
+            id: "sched_1".into(),
+            name: "Confort".into(),
+            target_tag_id: "MB.SP".into(),
+            start_time: "07:00".into(),
+            end_time: "19:00".into(),
+            full_day: false,
+            active_value: TagValue::Float(21.0),
+            inactive_value: TagValue::Float(18.0),
+            enabled: true,
+            days: vec![1, 2, 3, 4, 5, 6, 7],
+            last_applied_state: Some(true),
+        };
+        core.schedules.insert(rule.id.clone(), rule);
+
+        // 1. Refus d'écriture sur le tag : last_applied_state doit repasser à None
+        core.record_driver_write_rejected("MB_DRV", "MB.SP", "exception Modbus");
+        assert_eq!(
+            core.schedules.get("sched_1").unwrap().last_applied_state,
+            None
+        );
+
+        // Réarmons à Some(true)
+        core.schedules
+            .get_mut("sched_1")
+            .unwrap()
+            .last_applied_state = Some(true);
+
+        // 2. Déconnexion / coupure de liaison sur le driver : last_applied_state repasse à None
+        core.forget_flow_outputs_for_driver("MB_DRV");
+        assert_eq!(
+            core.schedules.get("sched_1").unwrap().last_applied_state,
+            None
+        );
     }
 
     #[tokio::test]
@@ -5797,4 +6497,258 @@ mod tests {
             assert!(validate_flow(&f).is_ok(), "{}", f.id);
         }
     }
+
+    #[tokio::test]
+    async fn test_s19_int_scaling_in_ingest_and_device_value() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        let mut tag = driver_tag("INT_SCALE_TAG", "internal", "mem", true);
+        tag.data_type = crate::models::TagDataType::Int;
+        tag.scale_factor = 10.0;
+        tag.scale_offset = 5.0;
+        core.register_tag(tag.clone(), None);
+
+        // Ingestion depuis driver : raw = 2 -> (2 * 10 + 5) = 25
+        let incoming = TagState {
+            tag_id: "INT_SCALE_TAG".into(),
+            value: TagValue::Int(2),
+            quality: Quality::Good,
+            timestamp: Utc::now(),
+        };
+        core.ingest_state(incoming, true);
+        assert_eq!(
+            core.tags_state
+                .get("INT_SCALE_TAG")
+                .map(|s| s.value.clone())
+                .unwrap(),
+            TagValue::Int(25)
+        );
+
+        // Conversion inverse vers l'équipement : val = 25 -> ((25 - 5) / 10) = 2
+        let to_dev = to_device_value(&tag, &TagValue::Int(25));
+        assert_eq!(to_dev, TagValue::Int(2));
+    }
+
+    #[tokio::test]
+    async fn test_s20_bundle_symbols_and_settings_export_import() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        let sym = SymbolLibraryItem {
+            id: "custom_pump".into(),
+            name: "Pompe sur mesure".into(),
+            category: "custom".into(),
+            standard: "custom".into(),
+            svg_content:
+                r#"<svg xmlns="http://www.w3.org/2000/svg"><circle cx="10" cy="10" r="5"/></svg>"#
+                    .into(),
+            default_width: 50.0,
+            default_height: 50.0,
+            animate_rotation: false,
+            colorize_on_state: true,
+            created_at: Utc::now(),
+        };
+        let mut imp = Vec::new();
+        let mut rej = Vec::new();
+        core.store_symbol(sym.clone(), &mut imp, &mut rej).await;
+        assert_eq!(imp.len(), 1);
+
+        let mut sett = core.get_settings();
+        sett.alarm_shelve_max_minutes = 120;
+        core.update_settings("admin", sett.clone()).await.unwrap();
+
+        // Export bundle
+        let bundle = core.export_project_bundle();
+        assert!(bundle.symbols.iter().any(|s| s.id == "custom_pump"));
+        assert_eq!(
+            bundle.settings.as_ref().map(|s| s.alarm_shelve_max_minutes),
+            Some(120)
+        );
+
+        // Import dans une autre instance
+        let core2 = ScadaCore::new(None, &engine_options(false));
+        let res = core2.import_project_bundle("admin", bundle).await.unwrap();
+        assert_eq!(res["symbols"], 5);
+        assert!(core2.symbols_library.contains_key("custom_pump"));
+        assert_eq!(core2.get_settings().alarm_shelve_max_minutes, 120);
+    }
+
+    #[tokio::test]
+    async fn test_s21_user_persistence_lock_and_deleted_user() {
+        exec_vague2_suppression_utilisateur_persistance_concurrente().await;
+    }
+
+    #[tokio::test]
+    async fn test_s23_import_tag_validation_and_orphan_rejection() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        let drv = driver(
+            "DRV_VALID",
+            ProtocolType::ModbusTcp,
+            vec![
+                driver_tag("DRV_VALID.T1", "DRV_VALID", "HR:0:FLOAT32", false),
+                driver_tag("DRV_VALID.INVALID ID!!", "DRV_VALID", "HR:1:FLOAT32", false),
+            ],
+        );
+        let bundle = ProjectBackupBundle {
+            exported_at: Utc::now(),
+            version: APP_VERSION.to_string(),
+            drivers: vec![drv],
+            tags: vec![
+                driver_tag("DRV_VALID.T1", "DRV_VALID", "HR:0:FLOAT32", false),
+                // Tag orphelin rattaché à un driver inexistant
+                driver_tag("ORPHAN_TAG", "NON_EXISTENT_DRV", "HR:0:FLOAT32", false),
+            ],
+            dashboards: vec![],
+            flows: vec![],
+            schedules: vec![],
+            symbols: vec![],
+            settings: None,
+        };
+        let rep = core.import_project_bundle("admin", bundle).await.unwrap();
+        assert_eq!(rep["drivers"], 1);
+        assert_eq!(rep["tags"], 1);
+        assert_eq!(rep["ignored_tags"], 1); // ORPHAN_TAG ignoré
+        assert!(core.tags_registry.contains_key("DRV_VALID.T1"));
+        assert!(!core.tags_registry.contains_key("DRV_VALID.INVALID ID!!"));
+        assert!(!core.tags_registry.contains_key("ORPHAN_TAG"));
+    }
+
+    #[tokio::test]
+    async fn test_s25_alarm_deescalation_preserves_unack_critical() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        let mut tag = driver_tag("ALARM_TAG", "internal", "mem", true);
+        tag.alarm_config.enabled = true;
+        tag.alarm_config.high = Some(50.0);
+        tag.alarm_config.high_high = Some(80.0);
+        core.register_tag(tag.clone(), None);
+
+        // 1. Passage en HighHigh (Critical, ActiveUnack)
+        let s1 = TagState {
+            tag_id: "ALARM_TAG".into(),
+            value: TagValue::Float(85.0),
+            quality: Quality::Good,
+            timestamp: Utc::now(),
+        };
+        core.evaluate_alarm_for_tag(&tag, &s1);
+        let al = core.alarms.get("ALARM_TAG").unwrap().clone();
+        assert_eq!(al.severity, AlarmSeverity::Critical);
+        assert_eq!(al.state, AlarmLifecycleState::ActiveUnack);
+
+        // 2. Désescalade vers High (Warning) avant acquittement
+        let s2 = TagState {
+            tag_id: "ALARM_TAG".into(),
+            value: TagValue::Float(60.0),
+            quality: Quality::Good,
+            timestamp: Utc::now(),
+        };
+        core.evaluate_alarm_for_tag(&tag, &s2);
+        let al2 = core.alarms.get("ALARM_TAG").unwrap().clone();
+        // Doit conserver la sévérité Critical non acquittée
+        assert_eq!(al2.severity, AlarmSeverity::Critical);
+        assert_eq!(al2.level, Some(AlarmLevel::High));
+    }
+
+    #[tokio::test]
+    async fn test_s31_scale_factor_validation_and_alarm_reeval_on_upsert() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        let mut drv = driver(
+            "MB_SCALE_TEST",
+            ProtocolType::ModbusTcp,
+            vec![driver_tag(
+                "MB_SCALE_TEST.T1",
+                "MB_SCALE_TEST",
+                "HR:0:FLOAT32",
+                false,
+            )],
+        );
+        drv.tags[0].scale_factor = 0.0;
+        let err = core
+            .register_and_start_driver("admin", drv)
+            .await
+            .unwrap_err();
+        assert_eq!(err.http_status(), 400);
+
+        // Réévaluation d'alarme sur upsert_tag
+        let mut tag = driver_tag("UP_ALARM_TAG", "internal", "mem", true);
+        tag.alarm_config.enabled = true;
+        tag.alarm_config.high = Some(50.0);
+        core.register_tag(tag.clone(), None);
+        core.tags_state.insert(
+            "UP_ALARM_TAG".into(),
+            TagState {
+                tag_id: "UP_ALARM_TAG".into(),
+                value: TagValue::Float(60.0),
+                quality: Quality::Good,
+                timestamp: Utc::now(),
+            },
+        );
+        let s = core.tags_state.get("UP_ALARM_TAG").unwrap().clone();
+        core.evaluate_alarm_for_tag(&tag, &s);
+        assert!(core.alarms.contains_key("UP_ALARM_TAG"));
+
+        // Désactivation de l'alarme lors d'un upsert_tag -> l'alarme active doit être clôturée
+        tag.alarm_config.enabled = false;
+        core.upsert_tag("admin", tag).await.unwrap();
+        let al = core.alarms.get("UP_ALARM_TAG").unwrap().clone();
+        assert_eq!(al.state, AlarmLifecycleState::ClearedUnack);
+    }
+
+    #[tokio::test]
+    async fn forget_tag_clears_flow_runtime_outputs() {
+        let core = ScadaCore::new(None, &engine_options(true));
+        core.register_tag(tag(1.0, 0.0), None);
+        core.flow_runtime.last_outputs.insert(
+            "flow_node_1".to_string(),
+            ("T".to_string(), TagValue::Float(42.0)),
+        );
+        assert_eq!(core.flow_runtime.last_outputs.len(), 1);
+        core.delete_tag("admin", "T").await.unwrap();
+        assert!(
+            core.flow_runtime.last_outputs.is_empty(),
+            "last_outputs non vidé à la suppression du tag"
+        );
+    }
+
+    #[tokio::test]
+    async fn demarrage_sans_simulation_ne_cree_que_admin() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        assert!(
+            core.users.contains_key("admin"),
+            "Le compte admin doit exister"
+        );
+        assert!(
+            !core.users.contains_key("superviseur"),
+            "Le compte superviseur ne doit pas exister en production"
+        );
+        assert!(
+            !core.users.contains_key("visu"),
+            "Le compte visu ne doit pas exister en production"
+        );
+        assert_eq!(
+            core.users.len(),
+            1,
+            "Seul le compte admin doit être créé sans simulation"
+        );
+    }
+
+    #[tokio::test]
+    async fn demarrage_avec_simulation_cree_les_trois_comptes() {
+        let core = ScadaCore::new(None, &engine_options(true));
+        assert!(
+            core.users.contains_key("admin"),
+            "Le compte admin doit exister"
+        );
+        assert!(
+            core.users.contains_key("superviseur"),
+            "Le compte superviseur doit exister en simulation"
+        );
+        assert!(
+            core.users.contains_key("visu"),
+            "Le compte visu doit exister en simulation"
+        );
+        assert_eq!(
+            core.users.len(),
+            3,
+            "Les trois comptes doivent être créés avec simulation"
+        );
+    }
+    include!("core_vague2_tests.rs");
+    include!("core_vague3_tests.rs");
 }

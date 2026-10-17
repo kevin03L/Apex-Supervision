@@ -20,3 +20,8 @@
 
 # Jeton de contrôle local des versions 1.x
 .scada_local_token
+
+# Certificats et métadonnées locales de signature de code
+*.pfx
+*.p12
+signature-metadata*.json
