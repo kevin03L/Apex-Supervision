@@ -22,8 +22,9 @@ UTILISATION :
   apex-scada migrate-legacy --from <dossier|fichier.db> [--config <fichier>] [--force]
         Copie la base d'une version antérieure (rust_scada_flow.db). La source n'est jamais modifiée.
 
-  apex-scada service install|uninstall|start|stop|restart|status|enable|disable  (Windows, administrateur)
-        Gère le service Windows « Apex Supervision ». Sous Linux : systemctl … apex-scada.
+  apex-scada service install|uninstall|start|stop|restart|status|enable|disable|permissions
+        Gère le service Windows « Apex Supervision » (administrateur) ; « permissions » réapplique
+        les droits des dossiers. Sous Linux : systemctl … apex-scada.
 
   apex-scada version      Affiche la version.
   apex-scada help         Affiche cette aide.

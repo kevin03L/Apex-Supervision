@@ -236,7 +236,10 @@ impl Wizard {
                 });
                 ui.end_row();
                 ui.label("Fichier de configuration :");
-                ui.monospace(layout.config_file.display().to_string());
+                form::wrapped(
+                    ui,
+                    RichText::new(layout.config_file.display().to_string()).monospace(),
+                );
                 ui.end_row();
             });
         ui.add_space(12.0);
@@ -412,10 +415,10 @@ impl Wizard {
             .spacing([16.0, 6.0])
             .show(ui, |ui| {
                 ui.label("Données (base, historique) :");
-                ui.monospace(data.display().to_string());
+                form::wrapped(ui, RichText::new(data.display().to_string()).monospace());
                 ui.end_row();
                 ui.label("Journaux :");
-                ui.monospace(logs.display().to_string());
+                form::wrapped(ui, RichText::new(logs.display().to_string()).monospace());
                 ui.end_row();
             });
         form::hint(

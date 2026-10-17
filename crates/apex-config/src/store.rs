@@ -104,9 +104,87 @@ fn parse(raw: &str, path: &Path) -> Result<(AppConfig, Option<u32>), ConfigError
         .try_into()
         .map_err(|e: toml::de::Error| ConfigError::Schema {
             path: path.to_path_buf(),
-            message: e.message().to_string(),
+            message: describe_schema_error(raw, e.message()),
         })?;
     Ok((config, migrated_from))
+}
+
+/// Message de schéma lisible : traduction des messages courants de serde et, quand c'est
+/// possible, numéro de la ligne concernée (l'erreur levée après migration ne la donne pas).
+fn describe_schema_error(raw: &str, message: &str) -> String {
+    // Texte entre accents graves : `x`
+    fn quoted(s: &str) -> Vec<&str> {
+        s.split('`').skip(1).step_by(2).collect()
+    }
+    // Première ligne « clé = … » (ou contenant le motif) hors commentaire
+    fn line_of(raw: &str, pred: impl Fn(&str) -> bool) -> Option<usize> {
+        raw.lines()
+            .position(|l| {
+                let l = l.trim_start();
+                !l.starts_with('#') && pred(l)
+            })
+            .map(|i| i + 1)
+    }
+    let at = |line: Option<usize>| line.map(|n| format!(" (ligne {n})")).unwrap_or_default();
+
+    if let Some(rest) = message.strip_prefix("unknown field ") {
+        let names = quoted(rest);
+        if let Some((field, expected)) = names.split_first() {
+            let line = line_of(raw, |l| {
+                l.split('=').next().is_some_and(|k| k.trim() == *field)
+            });
+            return format!(
+                "paramètre inconnu « {field} »{} — paramètres possibles dans cette section : {}",
+                at(line),
+                expected.join(", ")
+            );
+        }
+    }
+    if let Some(rest) = message.strip_prefix("missing field ") {
+        if let Some(field) = quoted(rest).first() {
+            return format!("paramètre obligatoire « {field} » manquant");
+        }
+    }
+    if let Some(rest) = message.strip_prefix("invalid value: ") {
+        // « integer `99999`, expected u16 »
+        let value = quoted(rest).first().copied().unwrap_or("");
+        let expected = rest.rsplit("expected ").next().unwrap_or("");
+        let line = line_of(raw, |l| {
+            l.split_once('=').is_some_and(|(_, v)| v.trim() == value)
+        });
+        return format!(
+            "valeur {value} invalide{} : {} attendu",
+            at(line),
+            expected_fr(expected)
+        );
+    }
+    if let Some(rest) = message.strip_prefix("invalid type: ") {
+        // « string "abc", expected u16 »
+        let (found, expected) = rest.split_once(", expected ").unwrap_or((rest, ""));
+        return format!(
+            "type invalide : {} ({} attendu)",
+            found
+                .replace("string", "texte")
+                .replace("integer", "nombre entier")
+                .replace("boolean", "booléen")
+                .replace("floating point", "nombre décimal"),
+            expected_fr(expected)
+        );
+    }
+    message.to_string()
+}
+
+/// Types attendus de serde, en clair.
+fn expected_fr(expected: &str) -> String {
+    match expected.trim() {
+        "u8" => "un entier de 0 à 255".into(),
+        "u16" => "un entier de 0 à 65535".into(),
+        "u32" | "u64" | "usize" => "un entier positif".into(),
+        "i32" | "i64" => "un entier".into(),
+        "a boolean" | "bool" => "true ou false".into(),
+        "a string" => "un texte entre guillemets".into(),
+        other => other.into(),
+    }
 }
 
 /// Rapport d'écriture.
@@ -417,6 +495,28 @@ modbus_slave_port = {sim_port}
 mod tests {
     use super::*;
     use crate::model::Severity;
+
+    #[test]
+    fn schema_errors_are_explained_in_french_with_their_line() {
+        let raw = "config_version = 1\n[server]\nport = 99999\n[simulation]\ninconnu = 1\n";
+        let msg = |m: &str| describe_schema_error(raw, m);
+        assert_eq!(
+            msg("invalid value: integer `99999`, expected u16"),
+            "valeur 99999 invalide (ligne 3) : un entier de 0 à 65535 attendu"
+        );
+        let unknown = msg("unknown field `inconnu`, expected `enabled` or `modbus_slave_port`");
+        assert!(
+            unknown.starts_with("paramètre inconnu « inconnu » (ligne 5)"),
+            "{unknown}"
+        );
+        assert!(unknown.contains("enabled, modbus_slave_port"), "{unknown}");
+        assert_eq!(
+            msg("invalid type: string \"abc\", expected u16"),
+            "type invalide : texte \"abc\" (un entier de 0 à 65535 attendu)"
+        );
+        // Message inconnu : repris tel quel
+        assert_eq!(msg("autre chose"), "autre chose");
+    }
 
     fn temp_layout(name: &str) -> Layout {
         let base = std::env::temp_dir().join(format!("apex-store-{}-{}", name, std::process::id()));

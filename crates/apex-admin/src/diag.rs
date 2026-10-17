@@ -264,13 +264,19 @@ pub fn run(layout: &Layout, service: Option<&ServiceInfo>) -> Vec<Check> {
         )),
     }
     if let Some(legacy) = find_legacy_db(&layout) {
+        // En mode portable, --config désigne l'instance : sans lui, la commande viserait
+        // l'installation système.
+        let mut command = format!("apex-scada migrate-legacy --from \"{}\"", legacy.display());
+        if layout.kind == LayoutKind::Portable {
+            command.push_str(&format!(" --config \"{}\"", layout.config_file.display()));
+        }
         out.push(check(
             Level::Info,
             "Ancienne version",
             format!(
-                "Base d'une version antérieure trouvée (« {} »). Pour reprendre ses données, moteur arrêté : apex-scada migrate-legacy --from \"{}\"",
+                "Base d'une version antérieure trouvée (« {} »). Pour reprendre ses données, moteur arrêté : {}                  (ajoutez --force si une base existe déjà : elle sera sauvegardée puis remplacée).",
                 legacy.display(),
-                legacy.display()
+                command
             ),
         ));
     }

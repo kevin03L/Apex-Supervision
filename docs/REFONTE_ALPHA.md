@@ -308,10 +308,10 @@ La version est définie **une seule fois** (`[workspace.package] version`) et pr
 
 | Vérification | Résultat |
 |---|---|
-| `cargo test --workspace` (Windows, windows-gnu) | ✅ 142 tests réussis après les audits de contrôle (§12.5) : apex-core 66, apex-server 13 unitaires + 19 d'intégration, apex-admin 17, apex-config 23, apex-build 4 |
+| `cargo test --workspace` (Windows, windows-gnu) | ✅ 144 tests réussis après les audits (§12.5) et la campagne de tests fonctionnels (§12.6) : apex-core 67, apex-server 13 unitaires + 19 d'intégration, apex-admin 17, apex-config 24, apex-build 4 |
 | `cargo clippy --workspace --all-targets -- -D warnings` (Windows) | ✅ aucun avertissement |
 | `clippy -D warnings` de `apex-admin` et `apex-config` pour `x86_64-unknown-linux-gnu` | ✅ compilation croisée sans avertissement |
-| Compilation Linux complète, sous Docker (`ubuntu:22.04`, glibc 2.35, Rust 1.99.1, paquets de `LINUX_GUI_DEPS`) : `cargo build --release --locked -p apex-server -p apex-admin`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo fmt --all --check` | ✅ exécutée : aucune erreur, aucun avertissement, **142 tests réussis** (relancé après les corrections des audits). Le code `cfg(unix)` / `cfg(not(windows))` n'a demandé aucune correction. Le symbole le plus récent requis est `GLIBC_2.35` : il faut glibc 2.35 ou plus récente. |
+| Compilation Linux complète, sous Docker (`ubuntu:22.04`, glibc 2.35, Rust 1.99.1, paquets de `LINUX_GUI_DEPS`) : `cargo build --release --locked -p apex-server -p apex-admin`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo fmt --all --check` | ✅ exécutée : aucune erreur, aucun avertissement, **144 tests réussis** (relancé après les audits et les tests fonctionnels). Le code `cfg(unix)` / `cfg(not(windows))` n'a demandé aucune correction. Le symbole le plus récent requis est `GLIBC_2.35` : il faut glibc 2.35 ou plus récente. |
 | `cargo fmt --check` | ✅ appliqué à tout le workspace (commit dédié) |
 | Moteur en mode portable (Windows) : démarrage, `/api/health`, 2ᵉ instance (code 4, PID affiché), port occupé (code 5), configuration invalide (code 3), arrêt propre par jeton, `config migrate` v0 → v1, `migrate-legacy` sur une copie de la base 1.x (source inchangée, empreinte SHA-256 identique) | ✅ exécuté |
 | Utilitaire desktop piloté par UI Automation : assistant complet, enregistrement, démarrage du moteur, tableau de bord, configuration, diagnostics, arrêt avec confirmation, erreur de port | ✅ exécuté |
@@ -406,3 +406,64 @@ Deux audits indépendants ont relu tout le code de la refonte. Chaque anomalie a
 - Un symbole SVG peut encore modifier l'apparence d'autres éléments de la page par des animations sur `display` ou `fill`, sans exécuter de script.
 - MQTT : l'identifiant client devient `apex-scada-<id>` (au lieu de `rust-scada-flow-<id>`). Adaptez les ACL du broker si elles en dépendent.
 - Les écritures Modbus réelles (INT32, exception) ne sont couvertes que par des tests unitaires : le mode sûr bloque les consignes dans les tests d'intégration.
+
+### 12.6 Vérification de fonctionnement, tests fonctionnels et UI/UX
+
+Campagne menée sur une instance portable dans un dossier temporaire : binaire release, ports 38700 et 38701, simulation et mode sûr actifs. Aucune base d'exploitation n'a été touchée et aucune commande n'a été envoyée à un équipement réel.
+
+**Fonctionnement (ligne de commande et cycle de vie).**
+- Vérifiés :
+  - `version`, `help` ;
+  - `config init` (refus sans `--force`, sauvegarde avec), `config check`, `config show`, `config migrate` (v0 → v1, sauvegarde) ;
+  - démarrage, puis codes de sortie 3 (port invalide, clé inconnue), 4 (deuxième instance, avec son PID), 5 (port occupé) et 6 (base inaccessible) ;
+  - arrêt propre par jeton local (code 0, jeton et PID retirés, base autonome), veille, redémarrage à chaud.
+- Corrigés :
+  - `config check` répondait « valide » (code 0) sur un poste non installé, alors que le démarrage y est refusé : il renvoie maintenant le code 3 ;
+  - les erreurs de configuration étaient en anglais, sans ligne : elles sont traduites, avec la ligne fautive ;
+  - l'aide ne citait pas `service permissions` ;
+  - le fichier `apex-scada.pid` restait après un arrêt propre.
+
+**Test fonctionnel de l'API.** Script de 90 vérifications, rejoué jusqu'à 90/90 :
+- comptes, rôles, sessions, mot de passe, protection du dernier administrateur ;
+- consignes : type, lecture seule, mode sûr ;
+- alarmes : apparition, escalade HH, acquittement, mise en sommeil, bande morte, retour à la normale, journal ;
+- drivers : ajout, Auto-Découverte, modification, arrêt, démarrage, suppression ;
+- flux et scripts Rhai, synoptiques et assainissement SVG, symboles, plannings ;
+- historique et export CSV, export et réimport du projet, audit, pause, réglages, WebSocket.
+
+Corrigés :
+- un driver Modbus TCP était **accepté avec un endpoint invalide** à l'ajout et à l'import (seule la modification le contrôlait) ;
+- `updated_at` était exigé à l'enregistrement d'un synoptique alors que le serveur le fixe lui-même.
+
+**IHM web (navigateur, 1366 px, tablette, mobile).** Tous les onglets ont été parcourus avec les comptes administrateur et Visualisation. Corrigés :
+- **mise à jour** : les fichiers de l'IHM étaient servis sans `Cache-Control`. Après une mise à jour, le navigateur pouvait garder un ancien CSS avec un nouveau JS. Ils sont désormais revalidés à chaque chargement (`no-cache`) ;
+- **formulaires** : ceux des drivers, des variables, des plannings, des comptes et des symboles étaient pré-remplis avec de vraies valeurs d'exemple. Un clic créait par exemple un driver vers 127.0.0.1:5502. Ce sont maintenant des textes indicatifs ;
+- **mise en page** : la colonne Bibliothèque/Inspecteur recouvrait les tableaux (actions du planning). Elle n'est plus affichée que sur les synoptiques et les flux, et les tableaux défilent dans leur carte ;
+- **historique** : la courbe était tracée par indice, sans axes. Elle a maintenant une échelle de temps réelle, un tracé en escalier, une grille et des valeurs. La colonne « Horodatage UTC » affichait l'heure locale ;
+- **petits écrans** : l'en-tête débordait (« STUDIO » tronqué en 1366 px, chevauchements en mobile). Les onglets défilent désormais. Sous 900 px, l'en-tête passe à la ligne, les panneaux latéraux sont masqués et le synoptique est mis à l'échelle de l'écran ;
+- **mode RUN** : il affichait encore les commandes d'édition du synoptique ;
+- **accessibilité** :
+  - contrastes inférieurs à 4,5:1 (gris `#64748b`, bouton principal) ;
+  - pas de repère de focus au clavier ;
+  - 5 champs sans étiquette ;
+  - texte impossible à sélectionner pour le copier ;
+  - message de connexion refusée à triple préfixe, peu visible ;
+- **retours d'action** : notification brève à l'exécution d'un flux et à l'acquittement, et commentaire d'acquittement vidé après usage.
+
+**Utilitaire desktop (UI Automation).** Parcourus :
+- état du moteur, configuration (modification, avis de redémarrage, sauvegarde) ;
+- redémarrage avec confirmation, journaux, diagnostics ;
+- sauvegardes (comparaison, restauration), assistant en 5 étapes.
+
+Corrigés :
+- avec « Suivre », les journaux s'ouvraient au début du fichier et non sur les dernières lignes ;
+- les chemins longs et les bandeaux de l'assistant sortaient de la fenêtre ;
+- en mode portable, le diagnostic « Ancienne version » conseillait une commande sans `--config`.
+
+**Recommandations non appliquées** (choix de conception à arbitrer) :
+- **commandes directes sans confirmation** dans les synoptiques : un clic sur un moteur ou un curseur envoie la consigne immédiatement. Une confirmation en deux temps (sélection puis exécution), usuelle en supervision, est à décider ;
+- **profil Visualisation** : il n'a pas accès à la liste des alarmes, seulement au bandeau ;
+- **tendance temps réel** : elle repart vide après un rechargement de la page (aucun historique préchargé) ;
+- **planning visant un driver réel** : il est affiché « ACTIF » alors que le mode sûr l'empêche de s'appliquer ;
+- **sessions** : elles sont en mémoire, donc un redémarrage du moteur déconnecte tous les utilisateurs ;
+- **erreurs** : l'IHM les signale encore par des fenêtres `alert()` natives.

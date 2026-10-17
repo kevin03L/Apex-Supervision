@@ -52,8 +52,8 @@ cargo test --workspace
 | Crate | Tests | Couverture principale |
 |---|---|---|
 | `apex-build` | 4 | Version de fichier Windows dérivée de la version du paquet |
-| `apex-config` | 23 | Valeurs par défaut sûres, validation par champ, migrations (v0 → v1, format trop récent), écriture atomique, sauvegarde et restauration, conflit, verrou, erreurs lisibles, chemins système et portables |
-| `apex-core` | 66 | Moteur : alarmes et escalade, bande morte, mise en sommeil, historique, sécurité (assainissement SVG, verrouillage et courses de connexion, sessions), drivers Modbus (encodage, plages), flux, compatibilité des données |
+| `apex-config` | 24 | Valeurs par défaut sûres, validation par champ, migrations (v0 → v1, format trop récent), écriture atomique, sauvegarde et restauration, conflit, verrou, erreurs lisibles, chemins système et portables |
+| `apex-core` | 67 | Moteur : alarmes et escalade, bande morte, mise en sommeil, historique, sécurité (assainissement SVG, verrouillage et courses de connexion, sessions), drivers Modbus (encodage, plages), flux, compatibilité des données |
 | `apex-server` | 13 + 19 | Unitaires : ligne de commande, instance unique, reprise 1.x. Intégration : `boite_noire.rs` (12), `drivers_automatismes.rs` (4), `exploitation.rs` (3), tableau ci-dessous |
 | `apex-admin` | 17 | Client HTTP (réponses simples et découpées, serveur injoignable), journaux, diagnostics, formulaires, verrou d'instance, libellés |
 

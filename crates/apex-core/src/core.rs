@@ -348,6 +348,7 @@ impl ScadaCore {
         mut config: DriverConfig,
     ) -> Result<Vec<TagFullView>, ScadaError> {
         security::validate_id("driver", &config.id)?;
+        validate_driver_endpoint(&config.protocol, &config.endpoint)?;
         // Simulation désactivée : un driver simulé n'est ni enregistré ni persisté
         self.ensure_protocol_available(&config.protocol)?;
         for tag in &config.tags {
@@ -587,14 +588,7 @@ impl ScadaCore {
             .map(|e| e.trim().to_string())
             .filter(|e| !e.is_empty())
         {
-            if cfg.protocol == crate::models::ProtocolType::ModbusTcp
-                && ep.parse::<std::net::SocketAddr>().is_err()
-            {
-                return Err(ScadaError::BadRequest(format!(
-                    "Endpoint Modbus TCP invalide '{}' (attendu IP:port, ex. 192.168.1.10:502)",
-                    ep
-                )));
-            }
+            validate_driver_endpoint(&cfg.protocol, &ep)?;
             if ep != cfg.endpoint {
                 changes.push(format!("endpoint {} → {}", cfg.endpoint, ep));
                 cfg.endpoint = ep;
@@ -4796,6 +4790,19 @@ fn sanitize_dashboard(layout: &mut DashboardLayout) -> Result<(), ScadaError> {
     Ok(())
 }
 
+/// Contrôle de l'endpoint d'un driver, à l'ajout, à l'import et à la modification.
+fn validate_driver_endpoint(protocol: &ProtocolType, endpoint: &str) -> Result<(), ScadaError> {
+    if *protocol == ProtocolType::ModbusTcp
+        && endpoint.trim().parse::<std::net::SocketAddr>().is_err()
+    {
+        return Err(ScadaError::BadRequest(format!(
+            "Endpoint Modbus TCP invalide '{}' (attendu IP:port, ex. 192.168.1.10:502)",
+            endpoint
+        )));
+    }
+    Ok(())
+}
+
 /// Contrôle propre au protocole du driver d'une variable (adresse écrivable pour Modbus TCP).
 fn validate_tag_for_protocol(
     protocol: &ProtocolType,
@@ -5457,6 +5464,19 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.http_status(), 400);
         assert!(!core.drivers_config.get("OPC_DEMO").unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn modbus_driver_with_invalid_endpoint_is_refused() {
+        let core = ScadaCore::new(None, &engine_options(true));
+        let mut bad = driver("MB_KO", ProtocolType::ModbusTcp, vec![]);
+        bad.endpoint = "pas-une-adresse".into();
+        let err = core
+            .register_and_start_driver("test", bad)
+            .await
+            .unwrap_err();
+        assert_eq!(err.http_status(), 400);
+        assert!(!core.drivers_config.contains_key("MB_KO"));
     }
 
     #[tokio::test]

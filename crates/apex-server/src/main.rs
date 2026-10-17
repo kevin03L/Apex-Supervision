@@ -136,6 +136,19 @@ fn config_check(config: Option<&Path>) -> i32 {
     for o in &eff.env_overrides {
         println!("Surcharge d'environnement : {o}");
     }
+    // Même règle que le démarrage : sans installation ni --config, le moteur refuserait de
+    // démarrer ; « Configuration valide » serait trompeur.
+    if !eff.installed() {
+        eprintln!(
+            "Logiciel non installé : « {} » n'existe pas. Installez Apex Supervision, ou désignez une instance portable avec --config <fichier>.",
+            eff.layout
+                .config_file
+                .parent()
+                .map(|d| d.display().to_string())
+                .unwrap_or_default()
+        );
+        return exit::CONFIG;
+    }
     let mut issues = eff.config.validate();
     // Disponibilité du port (sauf s'il est tenu par une instance Apex déjà en marche)
     if let Ok(ip) = eff.config.server.bind.trim().parse::<std::net::IpAddr>() {

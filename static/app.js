@@ -267,6 +267,23 @@ function payloadTooLargeMessage(maxBytes, actualBytes) {
 }
 
 /** Lit le message d'erreur JSON d'une réponse API. */
+/** Notification brève et non bloquante (succès d'une action sans effet visible immédiat). */
+function notify(message, kind = 'ok') {
+  let box = document.getElementById('toastBox');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'toastBox';
+    box.setAttribute('role', 'status');
+    box.setAttribute('aria-live', 'polite');
+    document.body.appendChild(box);
+  }
+  const t = document.createElement('div');
+  t.className = 'toast toast-' + kind;
+  t.textContent = message;
+  box.appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
+
 async function apiError(res, maxBytes) {
   if (res.status === 413) return payloadTooLargeMessage(maxBytes);
   try {
@@ -684,6 +701,24 @@ function renderTagTree() {
   container.appendChild(frag);
 }
 
+/**
+ * Petits écrans (moins de 900 px) : le synoptique, dessiné en coordonnées absolues, est réduit
+ * pour tenir dans la largeur disponible. Les grands écrans gardent l'échelle 1 (édition).
+ */
+function fitSynopticToScreen() {
+  const surface = document.getElementById('synopticSurface');
+  const dash = getActiveDashboard();
+  if (!surface) return;
+  if (window.innerWidth >= 900 || !dash || !dash.widgets.length) {
+    surface.style.zoom = '';
+    return;
+  }
+  const contentWidth = Math.max(...dash.widgets.map(w => w.x + w.width)) + 20;
+  const available = (surface.parentElement && surface.parentElement.clientWidth) || window.innerWidth;
+  surface.style.zoom = String(Math.min(1, available / contentWidth));
+}
+window.addEventListener('resize', fitSynopticToScreen);
+
 function buildTagItemHtml(tag) {
   const qual = tag.state ? tag.state.quality : 'Uncertain';
   return `
@@ -743,7 +778,7 @@ function inspectTagDirect(tagId) {
           <button class="btn btn-primary" onclick="sendWriteTag(${jsArg(tag.id)}, parseInputForTag(${jsArg(tag.data_type)}, document.getElementById('directWriteVal').value))">Envoyer</button>
         </div>
       </div>
-    ` : `<p style="color:#64748b;font-size:11px;">${tag.writable ? 'Envoi de consignes non autorisé pour votre profil.' : 'Variable en lecture seule (Capteur / Mesure).'}</p>`}
+    ` : `<p style="color:#8b9bb4;font-size:11px;">${tag.writable ? 'Envoi de consignes non autorisé pour votre profil.' : 'Variable en lecture seule (Capteur / Mesure).'}</p>`}
   `;
 }
 
@@ -860,6 +895,7 @@ function renderDashboard() {
   }
   container.innerHTML = '';
   container.appendChild(frag);
+  fitSynopticToScreen();
 }
 
 function buildWidgetCard(w) {
@@ -910,7 +946,7 @@ function buildWidgetCard(w) {
   header.className = 'widget-header';
   header.innerHTML = `
     <span>${esc(w.title)}</span>
-    <span style="font-size:10px;color:#64748b;">${esc(w.widget_type)}</span>
+    <span style="font-size:10px;color:#8b9bb4;">${esc(w.widget_type)}</span>
   `;
   header.onmousedown = (e) => startWidgetDrag(e, w, card);
 
@@ -1006,7 +1042,7 @@ function buildWidgetBodyHtml(w) {
         <line x1="85" y1="12" x2="85" y2="54" stroke="#38bdf8" stroke-width="4" transform="rotate(${angle} 85 33)"/>
       </svg>
       <div style="font-weight:800;color:#38bdf8;font-size:14px;">Ouverture : ${pct.toFixed(0)} %</div>
-      <input type="range" min="0" max="100" value="${pct}" onchange="sendWriteTag(${jsArg(w.bound_tag_id)}, parseFloat(this.value))" />
+      <input type="range" min="0" max="100" value="${pct}" aria-label="${esc(w.title || w.bound_tag_id || 'Commande')}" onchange="sendWriteTag(${jsArg(w.bound_tag_id)}, parseFloat(this.value))" />
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
   }
@@ -1059,7 +1095,7 @@ function buildWidgetBodyHtml(w) {
         <rect x="44" y="3" width="32" height="10" rx="3" fill="#f59e0b"/>
       </svg>
       <div style="font-weight:800;font-size:15px;color:#38bdf8;">${pct.toFixed(1)} %</div>
-      <input type="range" min="0" max="100" value="${pct}" onchange="sendWriteTag(${jsArg(w.bound_tag_id)}, parseFloat(this.value))" />
+      <input type="range" min="0" max="100" value="${pct}" aria-label="${esc(w.title || w.bound_tag_id || 'Commande')}" onchange="sendWriteTag(${jsArg(w.bound_tag_id)}, parseFloat(this.value))" />
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
   }
@@ -1070,7 +1106,7 @@ function buildWidgetBodyHtml(w) {
       <div class="big-num" style="color:#38bdf8;">${numVal.toFixed(1)} ${unit}</div>
       <div class="setpoint-controls">
         <button class="btn" onclick="sendWriteTag(${jsArg(w.bound_tag_id)}, ${(numVal - step).toFixed(2)})">-${step}</button>
-        <input type="number" step="${step}" value="${numVal}" id="sp-in-${cssSafe(w.id)}" />
+        <input type="number" step="${step}" value="${numVal}" id="sp-in-${cssSafe(w.id)}" aria-label="Nouvelle consigne : ${esc(w.title || w.bound_tag_id || '')}" />
         <button class="btn" onclick="sendWriteTag(${jsArg(w.bound_tag_id)}, ${(numVal + step).toFixed(2)})">+${step}</button>
         <button class="btn btn-primary" onclick="sendWriteTag(${jsArg(w.bound_tag_id)}, parseFloat(document.getElementById(${jsArg('sp-in-' + cssSafe(w.id))}).value))">OK</button>
       </div>
@@ -1164,7 +1200,7 @@ function buildWidgetBodyHtml(w) {
 
   if (w.widget_type === 'Compressor') {
     const active = boolVal || numVal > 0.5;
-    const col = active ? '#10b981' : '#64748b';
+    const col = active ? '#10b981' : '#8b9bb4';
     return `
       <svg width="88" height="82" viewBox="0 0 100 94">
         <circle cx="50" cy="48" r="35" fill="#0b1120" stroke="${col}" stroke-width="3.5"/>
@@ -1262,7 +1298,7 @@ function buildWidgetBodyHtml(w) {
 
   if (w.widget_type === 'ElectricMotor') {
     const run = boolVal || numVal > 0;
-    const col = run ? '#10b981' : '#64748b';
+    const col = run ? '#10b981' : '#8b9bb4';
     return `
       <svg width="86" height="82" viewBox="0 0 100 94">
         <circle cx="50" cy="48" r="34" fill="#0b1120" stroke="${col}" stroke-width="3.5"/>
@@ -1656,6 +1692,7 @@ async function triggerCurrentFlowNow() {
   if (!flow) return;
   const res = await fetch(`/api/flows/${encodeURIComponent(flow.id)}/trigger`, { method: 'POST' });
   if (!res.ok) alert(await apiError(res));
+  else notify(`Flux « ${flow.name} » exécuté`);
 }
 
 async function promptNewFlow() {
@@ -2147,7 +2184,7 @@ function renderAlarmsTable() {
   const tbody = document.getElementById('alarmsTableBody');
   if (!tbody) return;
   if (state.alarms.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:#64748b;padding:20px;">Aucune alarme active. Cliquez sur "Tester" sur le pressostat filtre du synoptique pour déclencher une alarme ISA-18.2.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:#8b9bb4;padding:20px;">Aucune alarme active. Cliquez sur "Tester" sur le pressostat filtre du synoptique pour déclencher une alarme ISA-18.2.</td></tr>`;
     return;
   }
   const allowAck = state.currentUser && state.currentUser.permissions && state.currentUser.permissions.can_ack_alarms;
@@ -2201,6 +2238,12 @@ async function unshelveAlarm(alarmId) {
   if (!res.ok) alert(await apiError(res));
 }
 
+/** Vide le commentaire d'acquittement une fois utilisé. */
+function clearAckComment() {
+  const el = document.getElementById('ackComment');
+  if (el) el.value = '';
+}
+
 function ackComment() {
   const el = document.getElementById('ackComment');
   return el && el.value.trim() ? el.value.trim() : null;
@@ -2213,6 +2256,8 @@ async function ackSingleAlarm(alarmId) {
     body: JSON.stringify({ comment: ackComment() })
   });
   if (res.ok) {
+    clearAckComment();
+    notify('Alarme acquittée');
     state.alarms = await getJson('/api/alarms', state.alarms);
     renderAlarmBanner();
     renderAlarmsTable();
@@ -2229,6 +2274,8 @@ async function ackAllAlarms() {
     body: JSON.stringify({ comment: ackComment() })
   });
   if (res.ok) {
+    clearAckComment();
+    notify('Alarmes acquittées');
     state.alarms = await res.json();
     renderAlarmBanner();
     renderAlarmsTable();
@@ -2254,7 +2301,7 @@ async function loadAlarmJournal() {
   if (!tbody) return;
   const list = await getJson('/api/alarms/journal', []);
   if (!list.length) {
-    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#64748b;">Aucun événement archivé dans le journal SQLite.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#8b9bb4;">Aucun événement archivé dans le journal SQLite.</td></tr>';
     return;
   }
   tbody.innerHTML = list.map(e => `
@@ -2302,7 +2349,7 @@ function renderDriversCardsOnly() {
             ${SIMULATED_PROTOCOLS.includes(d.protocol)
               ? `<span class="badge-qual q-Uncertain" title="Aucune communication réelle : valeurs fictives (démonstration)">SIMULÉ</span>`
               : ''}
-            <span style="font-size:11px;color:#64748b;">${(d.tags || []).length} variable(s)</span>
+            <span style="font-size:11px;color:#8b9bb4;">${(d.tags || []).length} variable(s)</span>
           </div>
           <div style="font-size:11.5px;color:#94a3b8;margin-top:4px;">
             Protocole : <b>${esc(d.protocol)}</b> | Endpoint : <code>${esc(d.endpoint)}</code> | Slave : ${Number(d.unit_id)} |
@@ -2744,34 +2791,75 @@ async function loadHistorianData() {
     : '--';
 
   const chartBox = document.getElementById('historianChartBox');
-  const nums = data.points.map(p => typeof p.value === 'number' ? p.value : (p.value ? 1 : 0));
-  if (nums.length > 1) {
-    const min = Math.min(...nums) - 0.5;
-    const max = Math.max(...nums) + 0.5;
-    const w = 1150, h = 210;
-    const poly = nums.map((v, i) => {
-      const x = (i / (nums.length - 1)) * (w - 20) + 10;
-      const y = h - 15 - ((v - min) / ((max - min) || 1)) * (h - 30);
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    }).join(' ');
-    chartBox.innerHTML = `
-      <svg width="100%" height="${h}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
-        <polyline fill="none" stroke="#38bdf8" stroke-width="2.5" points="${poly}" />
-      </svg>
-    `;
-  } else {
-    chartBox.innerHTML = '<p style="color:#64748b;padding:20px;">Aucun échantillon sur cette période.</p>';
-  }
+  chartBox.innerHTML = historianChartSvg(data.points, unit, chartBox.clientWidth || 1150);
 
   const tbody = document.getElementById('historianTableBody');
   tbody.innerHTML = data.points.slice().reverse().slice(0, 40).map(p => `
     <tr>
       <td style="font-family:Consolas;">${esc(new Date(p.timestamp).toLocaleString('fr-FR'))}</td>
       <td style="font-family:Consolas;font-weight:700;">${esc(data.tag_id)}</td>
-      <td style="font-family:Consolas;color:var(--accent);font-weight:700;">${esc(JSON.stringify(p.value) + unit)}</td>
+      <td style="font-family:Consolas;color:var(--accent);font-weight:700;">${esc(formatHistoryValue(p.value) + unit)}</td>
       <td><span class="badge-qual q-${esc(p.quality)}">${esc(p.quality)}</span></td>
     </tr>
   `).join('');
+}
+
+/** Valeur d'historique lisible (nombre arrondi, booléen en clair, texte sans guillemets). */
+function formatHistoryValue(v) {
+  if (typeof v === 'number') return Number.isInteger(v) ? String(v) : v.toFixed(2);
+  if (typeof v === 'boolean') return v ? 'Vrai (1)' : 'Faux (0)';
+  return String(v);
+}
+
+/**
+ * Courbe d'historique en SVG : abscisse proportionnelle au temps, tracé en escalier (chaque
+ * valeur est tenue jusqu'au changement suivant), grille, valeurs en ordonnée et heures en
+ * abscisse.
+ */
+function historianChartSvg(points, unit, width) {
+  const pts = points
+    .map(p => ({ t: new Date(p.timestamp).getTime(), v: typeof p.value === 'number' ? p.value : (p.value ? 1 : 0) }))
+    .filter(p => Number.isFinite(p.t) && Number.isFinite(p.v))
+    .sort((a, b) => a.t - b.t);
+  if (pts.length < 2) {
+    return '<p style="color:#8b9bb4;padding:20px;">Pas assez d\'échantillons sur cette période pour tracer une courbe.</p>';
+  }
+  const w = Math.max(320, Math.round(width - 24)), h = 230;
+  const left = 64, right = 12, top = 12, bottom = 28;
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+  let vMin = Math.min(...pts.map(p => p.v)), vMax = Math.max(...pts.map(p => p.v));
+  if (vMax - vMin < 1e-9) { vMin -= 1; vMax += 1; }
+  const pad = (vMax - vMin) * 0.08;
+  vMin -= pad;
+  vMax += pad;
+  const x = t => left + ((t - t0) / ((t1 - t0) || 1)) * (w - left - right);
+  const y = v => top + (1 - (v - vMin) / (vMax - vMin)) * (h - top - bottom);
+  // Escalier : horizontal jusqu'à l'instant suivant, puis vertical
+  let d = `M ${x(pts[0].t).toFixed(1)} ${y(pts[0].v).toFixed(1)}`;
+  for (let i = 1; i < pts.length; i++) {
+    d += ` H ${x(pts[i].t).toFixed(1)} V ${y(pts[i].v).toFixed(1)}`;
+  }
+  const sameDay = new Date(t0).toDateString() === new Date(t1).toDateString();
+  const fmtT = t => new Date(t).toLocaleString('fr-FR', sameDay
+    ? { hour: '2-digit', minute: '2-digit', second: '2-digit' }
+    : { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+  const fmtV = v => (Math.abs(vMax - vMin) < 10 ? v.toFixed(2) : v.toFixed(1)) + unit;
+  let grid = '';
+  for (let k = 0; k <= 4; k++) {
+    const yy = y(vMin + (k / 4) * (vMax - vMin)).toFixed(1);
+    grid += `<line x1="${left}" x2="${w - right}" y1="${yy}" y2="${yy}" stroke="#1e293b" stroke-width="1"/>`
+      + `<text x="${left - 6}" y="${yy}" fill="#94a3b8" font-size="11" text-anchor="end" dominant-baseline="middle">${esc(fmtV(vMin + (k / 4) * (vMax - vMin)))}</text>`;
+  }
+  for (let k = 0; k <= 4; k++) {
+    const t = t0 + (k / 4) * (t1 - t0), xx = x(t).toFixed(1);
+    const anchor = k === 0 ? 'start' : (k === 4 ? 'end' : 'middle');
+    grid += `<line x1="${xx}" x2="${xx}" y1="${top}" y2="${h - bottom}" stroke="#111c2e" stroke-width="1"/>`
+      + `<text x="${xx}" y="${h - 8}" fill="#94a3b8" font-size="11" text-anchor="${anchor}">${esc(fmtT(t))}</text>`;
+  }
+  return `<svg width="100%" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="Courbe d'historique">
+      ${grid}
+      <path d="${d}" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linejoin="round"/>
+    </svg>`;
 }
 
 /** Télécharge un contenu via un lien temporaire (l'API exige l'en-tête d'authentification). */
@@ -2920,6 +3008,9 @@ function switchTab(tab, btn) {
   }
 
   state.activeTab = tab;
+  // La bibliothèque de symboles et l'inspecteur ne servent qu'aux synoptiques et aux flux :
+  // ailleurs, la colonne de droite est masquée pour laisser la place aux tableaux.
+  document.body.classList.toggle('studio-panel-off', tab !== 'synoptic' && tab !== 'flow');
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   if (btn) btn.classList.add('active');
 
@@ -3052,6 +3143,7 @@ function showLoginModal(message) {
   modal.classList.toggle('locked', !authenticated);
   document.getElementById('authModalClose').style.display = authenticated ? 'inline-block' : 'none';
   document.getElementById('accountSection').style.display = authenticated ? 'block' : 'none';
+  document.getElementById('authModalMsg').style.color = '';
   document.getElementById('authModalMsg').textContent = message
     || (authenticated ? 'Changez de compte ou gérez votre mot de passe.' : 'Identifiez-vous pour accéder à la supervision.');
   if (authenticated) {
@@ -3093,7 +3185,9 @@ async function submitManualLogin() {
     body: JSON.stringify({ username, password })
   });
   if (!res.ok) {
-    document.getElementById('authModalMsg').textContent = `Échec d'authentification : ${await apiError(res)}`;
+    const msgEl = document.getElementById('authModalMsg');
+    msgEl.style.color = '#f87171';
+    msgEl.textContent = `Connexion refusée : ${await apiError(res)}`;
     return;
   }
   const data = await res.json();

@@ -23,7 +23,17 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  user-select: none;
+}
+
+/* Les surfaces de dessin et les commandes ne sélectionnent pas de texte (glisser-déposer) ;
+   le reste (identifiants, valeurs, messages, journaux) reste sélectionnable pour être copié. */
+button, .tab-btn, .mode-btn, .canvas-surface, .tag-item, .lib-item, .widget-header { user-select: none; }
+
+/* Repère de focus visible pour la navigation au clavier */
+button:focus-visible, select:focus-visible, a:focus-visible, [tabindex]:focus-visible,
+input[type="checkbox"]:focus-visible, input[type="range"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* BARRE SUPÉRIEURE SCADA */
@@ -149,8 +159,8 @@ header {
 }
 
 .btn:hover { border-color: var(--accent); color: var(--accent); }
-.btn-primary { background: #0284c7; border-color: #38bdf8; color: #fff; }
-.btn-primary:hover { background: #0369a1; color: #fff; }
+.btn-primary { background: #0369a1; border-color: #38bdf8; color: #fff; }
+.btn-primary:hover { background: #075985; color: #fff; }
 .btn-danger { background: rgba(239,68,68,0.2); border-color: #ef4444; color: #fca5a5; }
 .btn-danger:hover { background: #dc2626; color: #fff; }
 
@@ -268,6 +278,8 @@ header {
 /* ZONE CENTRALE */
 .center-stage {
   flex: 1;
+  /* Sans min-width, un tableau large empêcherait la zone centrale de rétrécir */
+  min-width: 0;
   position: relative;
   overflow: auto;
   background-color: #080d18;
@@ -358,7 +370,7 @@ body.run-mode .resize-handle { display: none; }
 .widget-tag-sub {
   font-size: 10px;
   font-family: Consolas, monospace;
-  color: #64748b;
+  color: #8b9bb4;
   margin-top: 4px;
 }
 
@@ -409,6 +421,10 @@ body.run-mode .resize-handle { display: none; }
 }
 
 body.run-mode .right-panel { display: none; }
+/* Mode RUN (exploitation) : les commandes d'édition du synoptique sont masquées */
+body.run-mode #synopticStudioActions,
+body.run-mode #synopticSaveGroup { display: none !important; }
+body.studio-panel-off .right-panel { display: none; }
 
 .palette-grid {
   display: grid;
@@ -563,6 +579,8 @@ body.run-mode .right-panel { display: none; }
 }
 
 .card-box {
+  /* Un tableau plus large que la carte défile au lieu de déborder sous les panneaux */
+  overflow-x: auto;
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -653,4 +671,64 @@ body.viewer-only-mode .setpoint-controls { display: none !important; }
   background: #080f1e;
   border: 1px solid var(--border);
   border-radius: 6px;
+}
+
+/* Notifications brèves (succès d'une action) */
+#toastBox {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 9999;
+  pointer-events: none;
+}
+.toast {
+  background: #0f2a1f;
+  border: 1px solid var(--good);
+  color: #a7f3d0;
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+}
+.toast-error { background: #2a0f12; border-color: var(--bad); color: #fecaca; }
+
+/* ============================================================================
+   AFFICHAGE ADAPTATIF (écrans étroits, tablettes, téléphones d'astreinte)
+   ============================================================================ */
+
+/* Les onglets défilent plutôt que d'écraser les commandes de droite */
+.nav-tabs { min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.nav-tabs::-webkit-scrollbar { display: none; }
+.toolbar-right, .brand { flex-shrink: 0; }
+
+@media (max-width: 1500px) {
+  .tab-btn { padding: 6px 8px; font-size: 12px; }
+  .brand > span:not(.brand-badge) { display: none; }
+}
+
+@media (max-width: 900px) {
+  body { height: 100dvh; }
+  header {
+    height: auto;
+    flex-wrap: wrap;
+    padding: 6px 10px;
+    row-gap: 6px;
+  }
+  .nav-tabs { order: 3; width: 100%; }
+  .tab-btn { white-space: nowrap; }
+  .toolbar-right { flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+  .alarm-banner-bar {
+    height: auto;
+    min-height: 32px;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    padding: 4px 10px;
+  }
+  #sysInfoPill { display: none; }
+  /* Arborescence des variables et atelier : réservés aux grands écrans */
+  .left-panel, .right-panel { display: none; }
+  .page-container { padding: 10px; }
 }

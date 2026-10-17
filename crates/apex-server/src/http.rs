@@ -315,6 +315,11 @@ async fn security_headers_middleware(req: Request, next: Next) -> Response {
     if is_api {
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     } else {
+        // IHM : revalidation à chaque chargement (304 si inchangée). Sans cela, le navigateur
+        // garde par heuristique d'anciens fichiers après une mise à jour (JS neuf, CSS périmé).
+        if !h.contains_key(header::CACHE_CONTROL) {
+            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        }
         // Politique de sécurité du contenu : aucune ressource ni connexion vers un site tiers.
         // `unsafe-inline` reste nécessaire tant que l'IHM utilise des gestionnaires onclick en ligne.
         h.insert(

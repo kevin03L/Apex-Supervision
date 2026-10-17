@@ -14,6 +14,7 @@ use std::{
 #[derive(Debug)]
 pub struct InstanceLock {
     _file: File,
+    pid_path: std::path::PathBuf,
 }
 
 #[derive(Debug)]
@@ -59,7 +60,18 @@ impl InstanceLock {
         }
         // PID informatif (le verrou, lui, est porté par le système)
         let _ = std::fs::write(&pid_path, std::process::id().to_string());
-        Ok(Self { _file: file })
+        Ok(Self {
+            _file: file,
+            pid_path,
+        })
+    }
+}
+
+/// Arrêt propre : le fichier PID est retiré avec le verrou. Après un arrêt brutal il reste,
+/// sans effet : seul le verrou fait foi.
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.pid_path);
     }
 }
 
@@ -78,6 +90,10 @@ mod tests {
             other => panic!("refus attendu, obtenu {other:?}"),
         }
         drop(first);
+        assert!(
+            !path.with_extension("pid").exists(),
+            "PID retiré avec le verrou"
+        );
         assert!(
             InstanceLock::acquire(&path).is_ok(),
             "libéré à la fermeture"

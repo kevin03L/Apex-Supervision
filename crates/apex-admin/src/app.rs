@@ -175,6 +175,9 @@ struct LogsView {
     problems_only: bool,
     follow: bool,
     loaded_at: Option<Instant>,
+    /// Défilement vers la fin demandé (ouverture, nouveau contenu ou « Suivre » recoché) :
+    /// `stick_to_bottom` seul ne colle au bas que si la vue y était déjà.
+    scroll_to_end: bool,
 }
 
 #[derive(Default)]
@@ -714,6 +717,7 @@ impl AdminApp {
 
     fn reload_logs(&mut self) {
         self.logs.loaded_at = Some(Instant::now());
+        let previous_len = self.logs.content.len();
         match logs::list(&self.layout.log_dir) {
             Ok(files) => {
                 self.logs.error = None;
@@ -750,6 +754,9 @@ impl AdminApp {
             },
             None => String::new(),
         };
+        if self.logs.follow && self.logs.content.len() != previous_len {
+            self.logs.scroll_to_end = true;
+        }
     }
 
     fn refresh_backups(&mut self) {
@@ -1501,7 +1508,9 @@ impl AdminApp {
             {
                 reload = true;
             }
-            ui.checkbox(&mut self.logs.follow, "Suivre");
+            if ui.checkbox(&mut self.logs.follow, "Suivre").changed() && self.logs.follow {
+                self.logs.scroll_to_end = true;
+            }
             if ui.button("Copier").clicked() {
                 ui.ctx().copy_text(self.logs.content.clone());
             }
@@ -1518,6 +1527,7 @@ impl AdminApp {
             form::banner(ui, form::warn_color(ui), e);
         }
         ui.add_space(4.0);
+        let scroll_to_end = std::mem::take(&mut self.logs.scroll_to_end);
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .stick_to_bottom(self.logs.follow)
@@ -1529,6 +1539,10 @@ impl AdminApp {
                         .desired_width(f32::INFINITY)
                         .interactive(true),
                 );
+                // Défilement vers la dernière ligne, sur la taille réelle du contenu affiché
+                if scroll_to_end {
+                    ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                }
             });
     }
 
@@ -1708,7 +1722,7 @@ impl AdminApp {
             .striped(true)
             .show(ui, |ui| {
                 ui.label("Moteur");
-                ui.monospace(engine.display().to_string());
+                form::wrapped(ui, RichText::new(engine.display().to_string()).monospace());
                 ui.label(match &self.engine_version {
                     Some(Ok(v)) => v.clone(),
                     Some(Err(e)) => e.clone(),
@@ -1731,7 +1745,7 @@ impl AdminApp {
                 ];
                 for (label, path) in rows {
                     ui.label(label);
-                    ui.monospace(path.display().to_string());
+                    form::wrapped(ui, RichText::new(path.display().to_string()).monospace());
                     if ui.small_button("Ouvrir").clicked() {
                         open = Some(path);
                     }

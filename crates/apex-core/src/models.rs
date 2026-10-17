@@ -49,7 +49,7 @@ pub enum ScadaError {
     #[error("Requête invalide : {0}")]
     BadRequest(String),
 
-    #[error("Authentification requise ou identifiants invalides : {0}")]
+    #[error("{0}")]
     Unauthorized(String),
 
     #[error("Accès refusé (Privilèges insuffisants) : {0}")]
@@ -495,6 +495,8 @@ pub struct DashboardLayout {
     pub description: String,
     pub grid_size: u32,
     pub widgets: Vec<DashboardWidget>,
+    /// Fixée par le serveur à chaque enregistrement : facultative dans les requêtes.
+    #[serde(default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
 }
 

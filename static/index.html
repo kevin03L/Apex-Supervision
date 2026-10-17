@@ -24,7 +24,7 @@
         <h3 style="color:var(--accent);">🔐 Connexion Apex Supervision</h3>
         <button id="authModalClose" class="btn" onclick="closeAuthModal()">✕ Fermer</button>
       </div>
-      <p id="authModalMsg" style="font-size:12px;color:#94a3b8;margin-bottom:12px;">
+      <p id="authModalMsg" role="status" aria-live="polite" style="font-size:12px;color:#94a3b8;margin-bottom:12px;">
         Identifiez-vous pour accéder à la supervision.
       </p>
 
@@ -99,11 +99,11 @@
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;align-items:end;margin-bottom:10px;">
           <div class="form-group">
             <label>Nom du Symbole / Pack</label>
-            <input id="symImportName" value="Échangeur Spirale ISO" />
+            <input id="symImportName" placeholder="ex. Échangeur spirale ISO" />
           </div>
           <div class="form-group">
             <label>Catégorie</label>
-            <input id="symImportCat" value="ISO 10628 Externe" />
+            <input id="symImportCat" placeholder="ex. ISO 10628 externe" />
           </div>
           <div class="form-group">
             <label>Format</label>
@@ -240,7 +240,7 @@
         <span id="tagCountBadge">0</span>
       </div>
       <div class="search-box">
-        <input type="text" id="tagSearch" placeholder="Filtrer (CTA01, MODBUS, Pompe)..." oninput="renderTagTree()" />
+        <input type="text" id="tagSearch" aria-label="Filtrer les variables" placeholder="Filtrer (CTA01, MODBUS, Pompe)..." oninput="renderTagTree()" />
       </div>
       <div id="tagTree" class="tag-tree"></div>
     </aside>
@@ -255,7 +255,7 @@
         <div class="canvas-toolbar">
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
             <label style="font-size:12px;color:#94a3b8;font-weight:700;">Synoptique :</label>
-            <select id="dashboardSelect" class="scada-select" style="width:320px;" onchange="selectDashboard(this.value)"></select>
+            <select id="dashboardSelect" aria-label="Synoptique affiché" class="scada-select" style="width:320px;" onchange="selectDashboard(this.value)"></select>
             <span id="synopticStudioActions" style="display:flex;gap:6px;">
               <button class="btn" onclick="promptNewDashboard()">+ Nouvelle Vue</button>
               <button class="btn" onclick="duplicateSelectedWidget()">📋 Dupliquer Widget</button>
@@ -382,7 +382,7 @@
           <div style="display:grid;grid-template-columns:1.1fr 1fr 1.2fr 0.6fr 0.7fr auto;gap:8px;align-items:end;margin-bottom:14px;">
             <div class="form-group">
               <label>ID Équipement</label>
-              <input id="drvId" value="MODBUS_SOUS_STATION_02" oninput="refreshDriverFormMode()" />
+              <input id="drvId" placeholder="ex. MODBUS_SOUS_STATION_02" oninput="refreshDriverFormMode()" />
             </div>
             <div class="form-group">
               <label>Protocole Industriel</label>
@@ -398,8 +398,8 @@
               </select>
             </div>
             <div class="form-group">
-              <label>Endpoint Réseau (ex: 127.0.0.1:5502)</label>
-              <input id="drvEndpoint" value="127.0.0.1:5502" />
+              <label>Endpoint réseau</label>
+              <input id="drvEndpoint" placeholder="ex. 192.168.1.10:502" />
             </div>
             <div class="form-group">
               <label>Unit / Slave ID</label>
@@ -418,10 +418,10 @@
         <div class="card-box">
           <h3 style="margin-bottom:10px;color:var(--accent);">2. Éditeur CRUD de la Base de Données Temps Réel (Tag Database)</h3>
           <div style="display:grid;grid-template-columns:1.2fr 1.2fr 0.8fr 1fr 0.6fr 0.5fr 0.6fr 0.6fr 0.6fr 0.6fr 0.7fr auto;gap:6px;align-items:end;margin-bottom:14px;">
-            <div class="form-group"><label>Tag ID</label><input id="tagFormId" value="GTB.CTA02.Temp_Soufflage" /></div>
-            <div class="form-group"><label>Libellé</label><input id="tagFormLabel" value="Température Soufflage CTA 02" /></div>
-            <div class="form-group"><label>Driver</label><input id="tagFormSource" value="SIM_GTB_01" /></div>
-            <div class="form-group"><label>Adresse</label><input id="tagFormAddr" value="HR:0:FLOAT32" /></div>
+            <div class="form-group"><label>Tag ID</label><input id="tagFormId" placeholder="ex. GTB.CTA02.Temp_Soufflage" /></div>
+            <div class="form-group"><label>Libellé</label><input id="tagFormLabel" placeholder="ex. Température soufflage CTA 02" /></div>
+            <div class="form-group"><label>Driver</label><input id="tagFormSource" placeholder="ID du driver" /></div>
+            <div class="form-group"><label>Adresse</label><input id="tagFormAddr" placeholder="ex. HR:0:FLOAT32" /></div>
             <div class="form-group">
               <label>Type</label>
               <select id="tagFormType">
@@ -431,7 +431,7 @@
                 <option value="Text">Text</option>
               </select>
             </div>
-            <div class="form-group"><label>Unité</label><input id="tagFormUnit" value="°C" /></div>
+            <div class="form-group"><label>Unité</label><input id="tagFormUnit" placeholder="°C" /></div>
             <div class="form-group">
               <label>Accès</label>
               <select id="tagFormRw">
@@ -441,7 +441,7 @@
             </div>
             <div class="form-group"><label>Scale (×)</label><input type="number" step="0.1" id="tagFormScale" value="1.0" /></div>
             <div class="form-group"><label>Seuil Bas</label><input type="number" step="0.5" id="tagFormLow" placeholder="Opt." /></div>
-            <div class="form-group"><label>Seuil Haut</label><input type="number" step="0.5" id="tagFormHigh" value="28.0" /></div>
+            <div class="form-group"><label>Seuil Haut</label><input type="number" step="0.5" id="tagFormHigh" placeholder="Opt." /></div>
             <div class="form-group">
               <label title="Interdire la mise en sommeil des alarmes de sécurité (ISA-18.2)">Sommeil alarme</label>
               <select id="tagFormShelve">
@@ -478,7 +478,7 @@
         <div class="card-box">
           <h3 style="margin-bottom:10px;color:var(--accent);">Planificateur Horaire GTB — Modes Confort Jour / Réduit Nuit</h3>
           <div style="display:grid;grid-template-columns:1.5fr 1.3fr 0.7fr 0.7fr 0.7fr 0.7fr auto;gap:8px;align-items:end;margin-bottom:16px;">
-            <div class="form-group"><label>Nom du Programme</label><input id="schedName" value="Occupation Zone Bureaux" /></div>
+            <div class="form-group"><label>Nom du Programme</label><input id="schedName" placeholder="ex. Occupation zone bureaux" /></div>
             <div class="form-group"><label>Variable Cible (Writable)</label><select id="schedTagSelect" class="scada-select"></select></div>
             <div class="form-group"><label>Début Confort</label><input type="time" id="schedStart" value="07:00" /></div>
             <div class="form-group"><label>Fin Confort</label><input type="time" id="schedEnd" value="19:00" /></div>
@@ -489,7 +489,7 @@
           <div style="display:flex;align-items:center;gap:10px;margin:-6px 0 16px;flex-wrap:wrap;">
             <span style="font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;">Jours actifs :</span>
             <div id="schedDaysBox" style="display:flex;gap:6px;flex-wrap:wrap;"></div>
-            <span style="font-size:11px;color:#64748b;">Une plage qui passe minuit (ex. 22:00 → 06:00) est rattachée à son jour de début.</span>
+            <span style="font-size:11px;color:#8b9bb4;">Une plage qui passe minuit (ex. 22:00 → 06:00) est rattachée à son jour de début.</span>
           </div>
 
           <table class="scada-table">
@@ -561,7 +561,7 @@
               <input type="number" id="setShelveMax" min="1" max="480" class="scada-select" style="width:80px;" /> min
             </label>
             <button class="btn btn-primary" onclick="saveSystemSettings()">💾 Appliquer</button>
-            <span style="font-size:11px;color:#64748b;">Désactiver réveille immédiatement toutes les alarmes en sommeil.</span>
+            <span style="font-size:11px;color:#8b9bb4;">Désactiver réveille immédiatement toutes les alarmes en sommeil.</span>
           </div>
         </div>
 
@@ -589,7 +589,7 @@
             <label for="histTo">au</label>
             <input type="datetime-local" id="histTo" class="scada-select" style="width:200px;" onchange="loadHistorianData()" />
             <button class="btn" onclick="clearHistorianRange()">✕ Toute la période</button>
-            <span id="histRetentionInfo" style="margin-left:auto;color:#64748b;"></span>
+            <span id="histRetentionInfo" style="margin-left:auto;color:#8b9bb4;"></span>
           </div>
 
           <div class="kpi-grid">
@@ -603,7 +603,7 @@
 
           <table class="scada-table">
             <thead>
-              <tr><th>Horodatage UTC</th><th>Variable</th><th>Valeur</th><th>Qualité OPC</th></tr>
+              <tr><th>Horodatage (heure locale)</th><th>Variable</th><th>Valeur</th><th>Qualité OPC</th></tr>
             </thead>
             <tbody id="historianTableBody"></tbody>
           </table>
@@ -615,7 +615,7 @@
             <h3>3. Journal d'Audit & Traçabilité Opérateur (SQLite Audit Trail)</h3>
             <div style="display:flex;gap:8px;align-items:center;">
               <input id="auditFilter" class="scada-select" style="width:280px;" placeholder="Filtrer (acteur, action, cible...)" oninput="renderAuditTable()" />
-              <span id="auditCount" style="font-size:11px;color:#64748b;"></span>
+              <span id="auditCount" style="font-size:11px;color:#8b9bb4;"></span>
               <button class="btn" onclick="loadAuditLogs()">🔄 Actualiser Audit</button>
             </div>
           </div>
@@ -690,11 +690,11 @@
           <div style="display:grid;grid-template-columns:1fr 1.2fr 1fr 1.2fr 1fr 0.6fr auto;gap:8px;align-items:end;margin-bottom:16px;">
             <div class="form-group">
               <label>Identifiant (Login)</label>
-              <input id="usrFormLogin" value="operateur_nuit" />
+              <input id="usrFormLogin" placeholder="ex. operateur_nuit" />
             </div>
             <div class="form-group">
               <label>Nom Complet</label>
-              <input id="usrFormName" value="Opérateur Ronde Nuit" />
+              <input id="usrFormName" placeholder="ex. Opérateur ronde de nuit" />
             </div>
             <div class="form-group">
               <label>Groupe de Privilèges</label>
@@ -706,7 +706,7 @@
             </div>
             <div class="form-group">
               <label>Service / Département</label>
-              <input id="usrFormDept" value="Poste de Garde CVC" />
+              <input id="usrFormDept" placeholder="ex. Poste de garde CVC" />
             </div>
             <div class="form-group">
               <label>Mot de Passe</label>
@@ -806,7 +806,7 @@
 
       <div class="panel-header">Inspecteur & Télécommande</div>
       <div id="inspectorContent" class="inspector-form">
-        <p style="color:#64748b;">Sélectionnez un widget sur le synoptique, un nœud de flux ou une variable pour configurer ses paramètres.</p>
+        <p style="color:#8b9bb4;">Sélectionnez un widget sur le synoptique, un nœud de flux ou une variable pour configurer ses paramètres.</p>
       </div>
     </aside>
   </div>

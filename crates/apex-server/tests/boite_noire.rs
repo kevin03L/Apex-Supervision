@@ -89,6 +89,15 @@ fn health_est_public_et_detaille_en_boucle_locale() {
         );
     }
 
+    // IHM : revalidée à chaque chargement, pour ne jamais garder un ancien fichier après une
+    // mise à jour ; politique de sécurité du contenu présente
+    for path in ["/", "/app.js", "/styles.css"] {
+        let r = srv.call("GET", path, None, None);
+        assert_eq!(r.status, 200, "{path}");
+        assert_eq!(r.header("cache-control"), Some("no-cache"), "{path}");
+        assert!(r.header("content-security-policy").is_some(), "{path}");
+    }
+
     // Une route inconnue de l'API ne doit pas passer pour un succès
     let r = srv.call("GET", "/api/inexistant", None, None);
     assert_ne!(r.status, 200);
