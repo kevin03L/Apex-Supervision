@@ -630,6 +630,27 @@ pub struct ScheduleRule {
     pub last_applied_state: Option<bool>,
 }
 
+/// Planning tel que renvoyé à l'IHM : la règle, plus la raison pour laquelle elle ne
+/// s'applique pas en ce moment (mode sûr), calculée par le serveur.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleView {
+    #[serde(flatten)]
+    pub rule: ScheduleRule,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspended_reason: Option<String>,
+}
+
+/// Flux tel que renvoyé à l'IHM : le graphe, plus ses sorties bloquées par le mode sûr.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowView {
+    #[serde(flatten)]
+    pub flow: FlowGraph,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspended_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_outputs: Vec<String>,
+}
+
 pub fn all_week_days() -> Vec<u8> {
     vec![1, 2, 3, 4, 5, 6, 7]
 }
@@ -792,10 +813,10 @@ pub struct FlowExecutionTrace {
 pub enum WsServerMessage {
     InitialSnapshot {
         tags: Vec<TagFullView>,
-        flows: Vec<FlowGraph>,
+        flows: Vec<FlowView>,
         alarms: Vec<AlarmInstance>,
         drivers: Vec<DriverConfig>,
-        schedules: Vec<ScheduleRule>,
+        schedules: Vec<ScheduleView>,
         status: SystemStatus,
     },
     TagUpdate(TagState),
@@ -844,7 +865,9 @@ impl UserRole {
                 can_edit_studio: true,
                 can_manage_flows: true,
                 can_manage_drivers_tags: true,
+                can_view_alarms: true,
                 can_ack_alarms: true,
+                can_manage_alarms: true,
                 can_manage_schedules: true,
                 can_view_historian: true,
                 can_manage_system: true,
@@ -856,7 +879,9 @@ impl UserRole {
                 can_edit_studio: true,
                 can_manage_flows: true,
                 can_manage_drivers_tags: true,
+                can_view_alarms: true,
                 can_ack_alarms: true,
+                can_manage_alarms: true,
                 can_manage_schedules: true,
                 can_view_historian: true,
                 can_manage_system: false,
@@ -868,7 +893,10 @@ impl UserRole {
                 can_edit_studio: false,
                 can_manage_flows: false,
                 can_manage_drivers_tags: false,
-                can_ack_alarms: false,
+                can_view_alarms: true,
+                // Acquittement d'une alarme à la fois, confirmé dans l'IHM et tracé à son nom
+                can_ack_alarms: true,
+                can_manage_alarms: false,
                 can_manage_schedules: false,
                 can_view_historian: false,
                 can_manage_system: false,
@@ -885,7 +913,12 @@ pub struct UserPermissions {
     pub can_edit_studio: bool,
     pub can_manage_flows: bool,
     pub can_manage_drivers_tags: bool,
+    /// Consultation de la liste et du journal des alarmes.
+    pub can_view_alarms: bool,
+    /// Acquittement d'une alarme à la fois.
     pub can_ack_alarms: bool,
+    /// Acquittement global, mise en sommeil et purge des alarmes revenues à la normale.
+    pub can_manage_alarms: bool,
     pub can_manage_schedules: bool,
     pub can_view_historian: bool,
     pub can_manage_system: bool,

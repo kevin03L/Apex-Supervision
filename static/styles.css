@@ -695,6 +695,46 @@ body.viewer-only-mode .setpoint-controls { display: none !important; }
 }
 .toast-error { background: #2a0f12; border-color: var(--bad); color: #fecaca; }
 
+/* Commande sélectionnée dans un synoptique : équipement encadré, bandeau Exécuter / Annuler */
+.scada-widget.cmd-armed {
+  outline: 3px solid #f59e0b;
+  outline-offset: 2px;
+  box-shadow: 0 0 18px rgba(245, 158, 11, 0.55);
+}
+#commandBar {
+  position: fixed;
+  /* Centré sans translate : la largeur disponible reste celle de tout l'écran */
+  left: 16px;
+  right: 16px;
+  bottom: 18px;
+  margin: 0 auto;
+  width: fit-content;
+  z-index: 9000;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  max-width: calc(100vw - 32px);
+  padding: 10px 14px;
+  background: #1c1405;
+  border: 2px solid #f59e0b;
+  border-radius: 8px;
+  color: #fde68a;
+  font-size: 13px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.6);
+}
+#commandBar .cmd-value { color: #fbbf24; font-family: Consolas, monospace; }
+#commandBar .cmd-left { font-family: Consolas, monospace; color: #fbbf24; min-width: 3ch; }
+
+/* Fenêtre de confirmation de l'IHM */
+.confirm-box { width: 460px; max-width: 100%; border: 1px solid #f59e0b; }
+.confirm-box h3 { color: #fbbf24; margin-bottom: 10px; }
+.confirm-msg { font-size: 13px; color: #cbd5e1; margin-bottom: 16px; white-space: pre-line; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* Planning ou flux actif mais bloqué par le mode sûr */
+.badge-qual.q-Suspended { background: rgba(249, 115, 22, 0.2); color: #fb923c; border: 1px solid #f97316; white-space: nowrap; }
+
 /* ============================================================================
    AFFICHAGE ADAPTATIF (écrans étroits, tablettes, téléphones d'astreinte)
    ============================================================================ */

@@ -308,7 +308,7 @@ La version est définie **une seule fois** (`[workspace.package] version`) et pr
 
 | Vérification | Résultat |
 |---|---|
-| `cargo test --workspace` (Windows, windows-gnu) | ✅ 144 tests réussis après les audits (§12.5) et la campagne de tests fonctionnels (§12.6) : apex-core 67, apex-server 13 unitaires + 19 d'intégration, apex-admin 17, apex-config 24, apex-build 4 |
+| `cargo test --workspace` (Windows, windows-gnu) | ✅ 146 tests réussis après les audits (§12.5), la campagne de tests fonctionnels (§12.6) et les choix de conception (§12.7) : apex-core 67, apex-server 13 unitaires + 21 d'intégration, apex-admin 17, apex-config 24, apex-build 4 |
 | `cargo clippy --workspace --all-targets -- -D warnings` (Windows) | ✅ aucun avertissement |
 | `clippy -D warnings` de `apex-admin` et `apex-config` pour `x86_64-unknown-linux-gnu` | ✅ compilation croisée sans avertissement |
 | Compilation Linux complète, sous Docker (`ubuntu:22.04`, glibc 2.35, Rust 1.99.1, paquets de `LINUX_GUI_DEPS`) : `cargo build --release --locked -p apex-server -p apex-admin`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo fmt --all --check` | ✅ exécutée : aucune erreur, aucun avertissement, **144 tests réussis** (relancé après les audits et les tests fonctionnels). Le code `cfg(unix)` / `cfg(not(windows))` n'a demandé aucune correction. Le symbole le plus récent requis est `GLIBC_2.35` : il faut glibc 2.35 ou plus récente. |
@@ -460,10 +460,26 @@ Corrigés :
 - les chemins longs et les bandeaux de l'assistant sortaient de la fenêtre ;
 - en mode portable, le diagnostic « Ancienne version » conseillait une commande sans `--config`.
 
-**Recommandations non appliquées** (choix de conception à arbitrer) :
+**Recommandations non appliquées** à l'issue de la campagne (arbitrées ensuite, voir §12.7) :
 - **commandes directes sans confirmation** dans les synoptiques : un clic sur un moteur ou un curseur envoie la consigne immédiatement. Une confirmation en deux temps (sélection puis exécution), usuelle en supervision, est à décider ;
 - **profil Visualisation** : il n'a pas accès à la liste des alarmes, seulement au bandeau ;
 - **tendance temps réel** : elle repart vide après un rechargement de la page (aucun historique préchargé) ;
 - **planning visant un driver réel** : il est affiché « ACTIF » alors que le mode sûr l'empêche de s'appliquer ;
 - **sessions** : elles sont en mémoire, donc un redémarrage du moteur déconnecte tous les utilisateurs ;
 - **erreurs** : l'IHM les signale encore par des fenêtres `alert()` natives.
+
+### 12.7 Choix de conception arbitrés
+
+Cinq des six recommandations du §12.6 ont été tranchées et appliquées :
+
+| Sujet | Décision | Mise en œuvre |
+|---|---|---|
+| Commandes des synoptiques | **Sélection puis exécution** | Premier clic : équipement encadré, bandeau « Exécuter / Annuler », 10 s pour confirmer ; Échap, changement de vue ou expiration abandonnent sans rien envoyer. Bouton impulsionnel armé au premier appui, puis impulsion unique. |
+| Profil Visualisation et alarmes | **Consultation et acquittement unitaire confirmé** | Nouvelles permissions `can_view_alarms` et `can_manage_alarms` ; `can_ack_alarms` accordé au profil Visualisation. Acquittement global, mise en sommeil et purge réservés aux superviseurs. |
+| Tendance temps réel | **Pré-remplie depuis l'historique** | 55 derniers points chargés à l'ouverture de la page ; le profil Visualisation y a accès pour les seules variables d'une courbe de tendance. |
+| Planning et flux en mode sûr | **État réel affiché** | Le serveur calcule `suspended_reason` (plannings, flux) et `blocked_outputs` (flux), dans l'API et l'instantané WebSocket ; badge orange « SUSPENDU (mode sûr) ». |
+| Sessions | **Conservées en base** | Table `user_sessions` indexée par l'empreinte SHA-256 du jeton ; écriture à chaque ouverture, fermeture et révocation, dates d'activité chaque minute ; reprise au démarrage des seules sessions non expirées de comptes actifs. |
+
+Reste ouvert : les fenêtres `alert()` natives de l'IHM. La fenêtre de confirmation créée pour l'acquittement (`confirmDialog`) pourra servir à leur remplacement.
+
+Vérifications : 146 tests (deux nouveaux tests d'intégration et un test du mode sûr étendu), clippy sans avertissement, scénario fonctionnel 90/90, contrôle dans le navigateur (sélection, exécution, annulation, expiration, impulsion, acquittement par le profil Visualisation, session reprise après redémarrage, badge suspendu).

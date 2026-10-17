@@ -100,6 +100,14 @@ pub async fn open(path: Option<&Path>) -> Result<sqlx::SqlitePool, sqlx::Error> 
             user_json TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );",
+        // Sessions ouvertes, sous l'empreinte de leur jeton (voir `security::session_key`) :
+        // elles survivent à un redémarrage du moteur jusqu'à leur expiration par inactivité.
+        "CREATE TABLE IF NOT EXISTS user_sessions (
+            token_hash TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_seen TEXT NOT NULL
+        );",
         "CREATE TABLE IF NOT EXISTS alarms_state (
             id TEXT PRIMARY KEY,
             alarm_json TEXT NOT NULL,

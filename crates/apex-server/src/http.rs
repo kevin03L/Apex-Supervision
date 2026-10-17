@@ -420,7 +420,7 @@ async fn api_auth_logout(
     State(state): State<AppState>,
     Extension(token): Extension<AuthToken>,
 ) -> Json<serde_json::Value> {
-    state.core.logout(&token.0);
+    state.core.logout(&token.0).await;
     Json(serde_json::json!({ "logged_out": true }))
 }
 
@@ -856,9 +856,9 @@ async fn api_delete_dashboard(
 async fn api_get_flows(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
-) -> Result<Json<Vec<FlowGraph>>, ApiError> {
+) -> Result<Json<Vec<apex_core::models::FlowView>>, ApiError> {
     require_supervisor(&user)?;
-    Ok(Json(state.core.get_all_flows()))
+    Ok(Json(state.core.get_flow_views()))
 }
 
 async fn api_save_flow(
@@ -908,7 +908,9 @@ async fn api_get_alarm_journal(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<Vec<AlarmJournalEntry>>, ApiError> {
-    require_supervisor(&user)?;
+    if !user.0.role.permissions().can_view_alarms {
+        return Err(ScadaError::Forbidden("Consultation des alarmes non autorisée".into()).into());
+    }
     let list = state.core.query_alarm_journal(150).await?;
     Ok(Json(list))
 }
@@ -919,7 +921,12 @@ async fn api_ack_alarm(
     Extension(user): Extension<CurrentUser>,
     Json(req): Json<AckAlarmRequest>,
 ) -> Result<Json<AlarmInstance>, ApiError> {
-    require_supervisor(&user)?;
+    // Tous les profils peuvent acquitter une alarme à la fois (le profil Visualisation après
+    // confirmation dans l'IHM) ; l'acquittement global et la mise en sommeil restent réservés
+    // aux superviseurs.
+    if !user.0.role.permissions().can_ack_alarms {
+        return Err(ScadaError::Forbidden("Acquittement des alarmes non autorisé".into()).into());
+    }
     // L'opérateur tracé est toujours l'utilisateur authentifié (traçabilité ISA-18.2)
     let comment = req.comment.filter(|c| !c.trim().is_empty());
     let updated = state
@@ -971,9 +978,9 @@ async fn api_clear_normal_alarms(
 async fn api_get_schedules(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
-) -> Result<Json<Vec<ScheduleRule>>, ApiError> {
+) -> Result<Json<Vec<apex_core::models::ScheduleView>>, ApiError> {
     require_supervisor(&user)?;
-    Ok(Json(state.core.get_all_schedules()))
+    Ok(Json(state.core.get_schedule_views()))
 }
 
 async fn api_save_schedule(
@@ -1039,8 +1046,23 @@ async fn api_get_history(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<HistoryResponse>, ApiError> {
-    require_supervisor(&user)?;
     let (limit, from, to) = parse_history_params(&params, 200)?;
+    if is_viewer(&user) {
+        // Profil Visualisation : seulement les derniers points d'une variable affichée par une
+        // courbe de tendance d'un synoptique (pré-remplissage de la courbe au chargement).
+        if !state.core.tag_on_trend_widget(&tag_id) || from.is_some() || to.is_some() {
+            return Err(ScadaError::Forbidden(
+                "Historique réservé aux profils Superviseur et Administrateur".into(),
+            )
+            .into());
+        }
+        let res = state
+            .core
+            .query_tag_history(&tag_id, limit.min(200), None, None)
+            .await?;
+        return Ok(Json(res));
+    }
+    require_supervisor(&user)?;
     let res = state
         .core
         .query_tag_history(&tag_id, limit, from, to)
@@ -1126,7 +1148,7 @@ fn build_snapshot(state: &AppState, viewer: bool) -> WsServerMessage {
         flows: if viewer {
             vec![]
         } else {
-            state.core.get_all_flows()
+            state.core.get_flow_views()
         },
         alarms: state.core.get_all_alarms(),
         drivers: if viewer {
@@ -1137,7 +1159,7 @@ fn build_snapshot(state: &AppState, viewer: bool) -> WsServerMessage {
         schedules: if viewer {
             vec![]
         } else {
-            state.core.get_all_schedules()
+            state.core.get_schedule_views()
         },
         status: state.core.get_system_status(),
     }

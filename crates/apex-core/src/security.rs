@@ -108,6 +108,19 @@ pub fn generate_token() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// Clé d'une session : empreinte SHA-256 (hexadécimal) du jeton.
+///
+/// Les sessions sont indexées et conservées en base sous cette empreinte : une copie de la base
+/// ne permet pas de reprendre une session, et le jeton n'est jamais écrit sur disque. Un jeton
+/// de 256 bits aléatoires n'a pas besoin d'un hachage lent.
+pub fn session_key(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
 // ============================================================================
 // VALIDATION DES IDENTIFIANTS
 // ============================================================================

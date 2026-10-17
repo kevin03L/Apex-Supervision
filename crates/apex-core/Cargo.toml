@@ -33,4 +33,6 @@ rand = "0.8"
 # Sécurité : hachage des mots de passe (Argon2id) & assainissement des SVG importés
 # (analyse XML réelle puis reconstruction sur liste blanche)
 argon2 = "0.5"
+# Empreinte des jetons de session conservés en base (le jeton lui-même n'y est jamais écrit)
+sha2 = "0.10"
 quick-xml.workspace = true

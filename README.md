@@ -47,7 +47,7 @@ Au premier démarrage, trois comptes d'usine sont créés :
 |---|---|---|
 | `admin` | `admin123` | Administrateur : tous les droits, dont système et utilisateurs |
 | `superviseur` | `super123` | Superviseur : tout sauf système et utilisateurs |
-| `visu` | `visu123` | Visualisation : synoptiques en lecture seule |
+| `visu` | `visu123` | Visualisation : synoptiques en lecture seule, consultation des alarmes et acquittement unitaire confirmé |
 
 > ⚠️ **Changez ces mots de passe dès la première connexion.** Pour cela, cliquez sur le badge utilisateur en haut à droite, puis sur « Changer mon mot de passe ». Tant qu'un compte garde son mot de passe d'usine, le moteur l'indique dans ses journaux à chaque démarrage.
 

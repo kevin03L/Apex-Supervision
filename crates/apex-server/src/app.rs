@@ -361,6 +361,8 @@ pub async fn run(
     let _ = std::fs::remove_file(&token_file);
     // Laisse aux écrivains (historique, alarmes, audit) le temps de vider leurs files
     tokio::time::sleep(Duration::from_millis(1200)).await;
+    // Dates d'activité des sessions à jour, pour leur reprise au prochain démarrage
+    core.persist_sessions().await;
     close_database(&pool).await;
     info!("{} arrêté proprement.", apex_config::version::PRODUCT_NAME);
 

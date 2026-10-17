@@ -351,6 +351,130 @@ fn rbac_visualisation_refuse_les_actions_admin() {
     assert!(names.contains(&"visu"), "{names:?}");
 }
 
+#[test]
+fn visualisation_consulte_et_acquitte_une_alarme_mais_pas_plus() {
+    let srv = Server::start("rbac-alarmes");
+    let visu = srv.login(VISU);
+
+    assert_eq!(
+        srv.call("GET", "/api/alarms", Some(&visu), None).status,
+        200
+    );
+    let r = srv.call("GET", "/api/alarms/journal", Some(&visu), None);
+    assert_eq!(r.status, 200, "journal par visu : {}", r.text());
+    let me = srv.call("GET", "/api/auth/me", Some(&visu), None).json();
+    assert_eq!(me["permissions"]["can_view_alarms"], true, "{me}");
+    assert_eq!(me["permissions"]["can_ack_alarms"], true, "{me}");
+    assert_eq!(me["permissions"]["can_manage_alarms"], false, "{me}");
+
+    // Acquittement unitaire autorisé : une alarme inconnue donne 404, pas 403
+    let r = srv.call(
+        "POST",
+        "/api/alarms/inconnue/ack",
+        Some(&visu),
+        Some(&json!({ "comment": null })),
+    );
+    assert_eq!(r.status, 404, "acquittement par visu : {}", r.text());
+
+    // Actions de gestion réservées aux superviseurs
+    let r = srv.call("POST", "/api/alarms/ack-all", Some(&visu), Some(&json!({})));
+    assert_eq!(r.status, 403, "acquittement global par visu : {}", r.text());
+    let r = srv.call("POST", "/api/alarms/clear-normal", Some(&visu), None);
+    assert_eq!(r.status, 403, "purge par visu : {}", r.text());
+    let r = srv.call(
+        "POST",
+        "/api/alarms/inconnue/shelve",
+        Some(&visu),
+        Some(&json!({ "minutes": 10 })),
+    );
+    assert_eq!(r.status, 403, "mise en sommeil par visu : {}", r.text());
+
+    // Historique : refusé hors courbe de tendance d'un synoptique
+    let r = srv.call(
+        "GET",
+        &format!("/api/history/{SIMULATED_SETPOINT}"),
+        Some(&visu),
+        None,
+    );
+    assert_eq!(r.status, 403, "historique par visu : {}", r.text());
+}
+
+#[test]
+fn les_sessions_survivent_au_redemarrage_mais_pas_aux_revocations() {
+    let mut srv = Server::start("sessions-persistees");
+    let admin = srv.login(ADMIN);
+    let visu = srv.login(VISU);
+    let deconnecte = srv.login(VISU);
+    let r = srv.call("POST", "/api/auth/logout", Some(&deconnecte), None);
+    assert!(r.status < 300, "déconnexion : {}", r.text());
+
+    // Arrêt brutal (processus tué) : les sessions ont été écrites dès leur ouverture
+    srv.restart();
+    assert_eq!(
+        srv.call("GET", "/api/auth/me", Some(&admin), None).status,
+        200,
+        "session admin perdue au redémarrage"
+    );
+    assert_eq!(
+        srv.call("GET", "/api/auth/me", Some(&visu), None).status,
+        200,
+        "session visu perdue au redémarrage"
+    );
+    assert_eq!(
+        srv.call("GET", "/api/auth/me", Some(&deconnecte), None)
+            .status,
+        401,
+        "session fermée reprise au redémarrage"
+    );
+
+    // Une révocation (compte désactivé) est elle aussi conservée
+    let r = srv.call(
+        "POST",
+        "/api/users",
+        Some(&admin),
+        Some(&json!({
+            "username": "visu",
+            "display_name": "Poste Opérateur Visualisation",
+            "role": "Viewer",
+            "enabled": false,
+        })),
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+    srv.restart();
+    assert_eq!(
+        srv.call("GET", "/api/auth/me", Some(&visu), None).status,
+        401,
+        "session d'un compte désactivé reprise au redémarrage"
+    );
+
+    // Le jeton n'est jamais écrit en clair dans la base
+    fn db_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                db_files(&p, out);
+            } else if p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".db") || n.ends_with(".db-wal"))
+            {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    db_files(srv.dir(), &mut files);
+    assert!(!files.is_empty(), "base SQLite introuvable");
+    for f in files {
+        let bytes = std::fs::read(&f).unwrap_or_default();
+        assert!(
+            !bytes.windows(admin.len()).any(|w| w == admin.as_bytes()),
+            "jeton de session en clair dans {}",
+            f.display()
+        );
+    }
+}
+
 // ============================================================================
 // MODE SÛR
 // ============================================================================
@@ -421,6 +545,58 @@ fn mode_sur_refuse_les_consignes_vers_un_driver_reel() {
         );
         std::thread::sleep(Duration::from_millis(250));
     }
+
+    // Plannings et flux : un automatisme bloqué par le mode sûr est signalé suspendu
+    for (id, target) in [
+        ("PLAN_REEL", MODBUS_SETPOINT),
+        ("PLAN_SIMU", SIMULATED_SETPOINT),
+    ] {
+        let r = srv.call(
+            "POST",
+            "/api/schedules",
+            Some(&admin),
+            Some(&json!({
+                "id": id, "name": id, "target_tag_id": target,
+                "start_time": "07:00", "end_time": "19:00",
+                "active_value": 8.0, "inactive_value": 7.0, "enabled": true,
+            })),
+        );
+        assert_eq!(r.status, 200, "{}", r.text());
+    }
+    let r = srv.call(
+        "POST",
+        "/api/flows",
+        Some(&admin),
+        Some(&json!({
+            "id": "FLUX_REEL", "name": "Flux réel", "description": "", "enabled": true,
+            "nodes": [{ "id": "out", "label": "Sortie", "x": 0.0, "y": 0.0,
+                        "kind": { "node_type": "TagOutput", "target_tag_id": MODBUS_SETPOINT } }],
+            "edges": [],
+        })),
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+    let schedules = srv.call("GET", "/api/schedules", Some(&admin), None).json();
+    let sched = |id: &str| {
+        schedules
+            .as_array()
+            .and_then(|l| l.iter().find(|s| s["id"] == id).cloned())
+            .unwrap_or_else(|| panic!("planning {id} absent : {schedules}"))
+    };
+    let reel = sched("PLAN_REEL");
+    assert!(
+        reel["suspended_reason"]
+            .as_str()
+            .is_some_and(|m| m.contains("Mode sûr")),
+        "{reel}"
+    );
+    assert!(sched("PLAN_SIMU").get("suspended_reason").is_none());
+    let flows = srv.call("GET", "/api/flows", Some(&admin), None).json();
+    let flux = flows
+        .as_array()
+        .and_then(|l| l.iter().find(|f| f["id"] == "FLUX_REEL").cloned())
+        .unwrap_or_else(|| panic!("flux absent : {flows}"));
+    assert_eq!(flux["blocked_outputs"], json!([MODBUS_SETPOINT]), "{flux}");
+    assert!(flux["suspended_reason"].is_string(), "{flux}");
 
     assert!(
         read_log_dir(srv.dir()).contains("MODE SÛR actif"),

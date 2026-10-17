@@ -42,6 +42,9 @@ const state = {
   drivers: [],
   schedules: [],
   systemStatus: null,
+  // Commande de synoptique sélectionnée, en attente d'exécution (voir selectCommand)
+  armedCommand: null,
+  armedTimer: null,
   selectedWidgetId: null,
   selectedFlowNodeId: null,
   wiringSource: null,
@@ -377,7 +380,36 @@ async function bootstrapData() {
   renderAlarmsTable();
   if (!viewer && state.activeTab === 'tagdb') renderDriversAndTagDb();
   renderSchedulesTable();
+  preloadTrendHistory();
   return true;
+}
+
+/** Nombre de points tracés par une courbe de tendance de synoptique. */
+const TREND_POINTS = 55;
+
+/**
+ * Pré-remplit les courbes de tendance des synoptiques avec les derniers points de
+ * l'historique, pour qu'elles ne repartent pas vides à chaque chargement de la page. Les
+ * variables non historisées démarrent vides, et la courbe l'indique.
+ */
+async function preloadTrendHistory() {
+  const tagIds = new Set();
+  state.dashboards.forEach(d => (d.widgets || []).forEach(w => {
+    const tag = w.bound_tag_id && state.tags[w.bound_tag_id];
+    if (w.widget_type === 'TrendChart' && tag && tag.historize) tagIds.add(w.bound_tag_id);
+  }));
+  await Promise.all([...tagIds].map(async tagId => {
+    const res = await getJson(`/api/history/${encodeURIComponent(tagId)}?limit=${TREND_POINTS}`, null);
+    if (!res || !Array.isArray(res.points)) return;
+    const values = res.points
+      .map(p => typeof p.value === 'number' ? p.value : (typeof p.value === 'boolean' ? (p.value ? 1 : 0) : NaN))
+      .filter(Number.isFinite);
+    if (!values.length) return;
+    // Les valeurs reçues en temps réel depuis le chargement restent en fin de courbe
+    const live = (state.history[tagId] || []).slice(1);
+    state.history[tagId] = values.concat(live).slice(-TREND_POINTS);
+  }));
+  if (tagIds.size && state.activeTab === 'synoptic') renderDashboard();
 }
 
 function updateSysInfoPill() {
@@ -632,7 +664,7 @@ function applyTagState(st) {
   if (typeof st.value === 'number') {
     if (!state.history[st.tag_id]) state.history[st.tag_id] = [];
     state.history[st.tag_id].push(st.value);
-    if (state.history[st.tag_id].length > 55) state.history[st.tag_id].shift();
+    if (state.history[st.tag_id].length > TREND_POINTS) state.history[st.tag_id].shift();
   }
   state.pendingTagIds.add(st.tag_id);
 }
@@ -805,6 +837,7 @@ function populateDashboardSelect() {
 }
 
 function selectDashboard(id) {
+  cancelCommand(false);
   state.currentDashboardId = id;
   state.selectedWidgetId = null;
   renderDashboard();
@@ -901,6 +934,7 @@ function renderDashboard() {
 function buildWidgetCard(w) {
   const card = document.createElement('div');
   card.className = 'scada-widget' + (state.selectedWidgetId === w.id ? ' selected' : '');
+  if (state.armedCommand && state.armedCommand.widgetId === w.id) card.classList.add('cmd-armed');
   card.id = `widget-${cssSafe(w.id)}`;
   card.style.left = `${w.x}px`;
   card.style.top = `${w.y}px`;
@@ -1004,7 +1038,7 @@ function buildWidgetBodyHtml(w) {
           <circle cx="50" cy="54" r="8" fill="${color}"/>
         </g>
       </svg>
-      <button class="btn" style="margin-top:6px;" onclick="sendWriteTag(${jsArg(w.bound_tag_id)}, ${!boolVal})">
+      <button class="btn" style="margin-top:6px;" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!boolVal})">
         ${boolVal ? '🟢 MARCHE (Arrêter)' : '⚪ ARRÊT (Démarrer)'}
       </button>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
@@ -1024,7 +1058,7 @@ function buildWidgetBodyHtml(w) {
           <circle cx="50" cy="50" r="8" fill="#fff"/>
         </g>
       </svg>
-      <button class="btn" style="margin-top:6px;" onclick="sendWriteTag(${jsArg(w.bound_tag_id)}, ${!boolVal})">
+      <button class="btn" style="margin-top:6px;" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!boolVal})">
         ${boolVal ? '🌀 SOUFFLAGE ACTIF' : '⚪ VENTILATEUR ARRÊTÉ'}
       </button>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
@@ -1042,7 +1076,7 @@ function buildWidgetBodyHtml(w) {
         <line x1="85" y1="12" x2="85" y2="54" stroke="#38bdf8" stroke-width="4" transform="rotate(${angle} 85 33)"/>
       </svg>
       <div style="font-weight:800;color:#38bdf8;font-size:14px;">Ouverture : ${pct.toFixed(0)} %</div>
-      <input type="range" min="0" max="100" value="${pct}" aria-label="${esc(w.title || w.bound_tag_id || 'Commande')}" onchange="sendWriteTag(${jsArg(w.bound_tag_id)}, parseFloat(this.value))" />
+      <input type="range" min="0" max="100" value="${pct}" aria-label="${esc(w.title || w.bound_tag_id || 'Commande')}" onchange="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, parseFloat(this.value))" />
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
   }
@@ -1095,7 +1129,7 @@ function buildWidgetBodyHtml(w) {
         <rect x="44" y="3" width="32" height="10" rx="3" fill="#f59e0b"/>
       </svg>
       <div style="font-weight:800;font-size:15px;color:#38bdf8;">${pct.toFixed(1)} %</div>
-      <input type="range" min="0" max="100" value="${pct}" aria-label="${esc(w.title || w.bound_tag_id || 'Commande')}" onchange="sendWriteTag(${jsArg(w.bound_tag_id)}, parseFloat(this.value))" />
+      <input type="range" min="0" max="100" value="${pct}" aria-label="${esc(w.title || w.bound_tag_id || 'Commande')}" onchange="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, parseFloat(this.value))" />
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
   }
@@ -1105,10 +1139,10 @@ function buildWidgetBodyHtml(w) {
     return `
       <div class="big-num" style="color:#38bdf8;">${numVal.toFixed(1)} ${unit}</div>
       <div class="setpoint-controls">
-        <button class="btn" onclick="sendWriteTag(${jsArg(w.bound_tag_id)}, ${(numVal - step).toFixed(2)})">-${step}</button>
+        <button class="btn" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${(numVal - step).toFixed(2)})">-${step}</button>
         <input type="number" step="${step}" value="${numVal}" id="sp-in-${cssSafe(w.id)}" aria-label="Nouvelle consigne : ${esc(w.title || w.bound_tag_id || '')}" />
-        <button class="btn" onclick="sendWriteTag(${jsArg(w.bound_tag_id)}, ${(numVal + step).toFixed(2)})">+${step}</button>
-        <button class="btn btn-primary" onclick="sendWriteTag(${jsArg(w.bound_tag_id)}, parseFloat(document.getElementById(${jsArg('sp-in-' + cssSafe(w.id))}).value))">OK</button>
+        <button class="btn" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${(numVal + step).toFixed(2)})">+${step}</button>
+        <button class="btn btn-primary" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, parseFloat(document.getElementById(${jsArg('sp-in-' + cssSafe(w.id))}).value))">OK</button>
       </div>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
@@ -1118,7 +1152,7 @@ function buildWidgetBodyHtml(w) {
     return `
       <div style="margin:8px 0;">
         <button class="btn ${boolVal ? 'btn-primary' : ''}" style="padding:10px 18px;font-size:13px;"
-                onclick="sendWriteTag(${jsArg(w.bound_tag_id)}, ${!boolVal})">
+                onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!boolVal})">
           ${boolVal ? '⚡ COMMUTATEUR : ON (1)' : '⚪ COMMUTATEUR : OFF (0)'}
         </button>
       </div>
@@ -1142,7 +1176,7 @@ function buildWidgetBodyHtml(w) {
         <polyline fill="none" stroke="#38bdf8" stroke-width="2.5" points="${poly}" />
       </svg>
       <div style="display:flex;justify-content:space-between;width:100%;margin-top:5px;font-size:11px;">
-        <span class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</span>
+        <span class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}${tag && !tag.historize ? ' · non historisée (courbe depuis l\'ouverture de la page)' : ''}</span>
         <b style="color:#38bdf8;font-family:Consolas;">${numVal.toFixed(2)} ${unit}</b>
       </div>
     `;
@@ -1173,7 +1207,7 @@ function buildWidgetBodyHtml(w) {
           </div>
           <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
         </div>
-        ${allowWrite ? `<button class="btn" onclick="sendWriteTag(${jsArg(w.bound_tag_id)}, ${!boolVal})">Tester</button>` : ''}
+        ${allowWrite ? `<button class="btn" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!boolVal})">Tester</button>` : ''}
       </div>
     `;
   }
@@ -1191,7 +1225,7 @@ function buildWidgetBodyHtml(w) {
         <circle cx="60" cy="11" r="9" fill="#0b1120" stroke="#f59e0b" stroke-width="2.5"/>
         <text x="60" y="15" text-anchor="middle" fill="#f59e0b" font-size="10" font-weight="bold">M</text>
       </svg>
-      <button class="btn" onclick="sendWriteTag(${jsArg(w.bound_tag_id)}, ${!open})">
+      <button class="btn" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!open})">
         ${open ? '🟢 VANNE OUVERTE' : '🔴 VANNE FERMÉE'}
       </button>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
@@ -1278,7 +1312,7 @@ function buildWidgetBodyHtml(w) {
         <circle cx="50" cy="66" r="4" fill="#fff"/>
         <line x1="50" y1="66" x2="${closed ? 50 : 28}" y2="${closed ? 30 : 34}" stroke="${col}" stroke-width="5"/>
       </svg>
-      <button class="btn" onclick="sendWriteTag(${jsArg(w.bound_tag_id)}, ${!closed})">
+      <button class="btn" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!closed})">
         ${closed ? '⚡ ENCLENCHÉ (FERMÉ)' : '🟢 OUVERT (ISOLÉ)'}
       </button>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Disjoncteur'}</div>
@@ -1355,14 +1389,17 @@ function buildWidgetBodyHtml(w) {
   }
 
   if (w.widget_type === 'PushButton') {
+    // Bouton impulsionnel : un premier appui l'arme (sélection), l'impulsion part ensuite tant
+    // que le bouton est maintenu, dans le délai de sélection
+    const armed = state.armedCommand && state.armedCommand.widgetId === w.id;
     return `
       <button class="btn btn-primary" style="padding:12px 20px;border-radius:30px;font-weight:800;"
-              onmousedown="sendWriteTag(${jsArg(w.bound_tag_id)}, true)"
-              onmouseup="sendWriteTag(${jsArg(w.bound_tag_id)}, false)"
-              onmouseleave="if (event.buttons & 1) sendWriteTag(${jsArg(w.bound_tag_id)}, false)"
-              ontouchstart="event.preventDefault(); sendWriteTag(${jsArg(w.bound_tag_id)}, true)"
-              ontouchend="event.preventDefault(); sendWriteTag(${jsArg(w.bound_tag_id)}, false)">
-        👆 IMPULSION MARCHE
+              onmousedown="pulseCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, true)"
+              onmouseup="pulseCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, false)"
+              onmouseleave="if (event.buttons & 1) pulseCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, false)"
+              ontouchstart="event.preventDefault(); pulseCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, true)"
+              ontouchend="event.preventDefault(); pulseCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, false)">
+        ${armed ? '👆 ARMÉ : MAINTENIR POUR L\'IMPULSION' : '👆 IMPULSION MARCHE'}
       </button>
       <div class="widget-tag-sub" style="margin-top:6px;">${esc(w.bound_tag_id) || 'Bouton Impulsion'}</div>
     `;
@@ -1641,7 +1678,7 @@ function deleteWidget(id) {
 function populateFlowSelect() {
   const sel = document.getElementById('flowSelect');
   sel.innerHTML = state.flows.map(f =>
-    `<option value="${esc(f.id)}" ${f.id === state.currentFlowId ? 'selected' : ''}>${esc(f.name)} ${f.enabled ? '🟢' : '⚪'}</option>`
+    `<option value="${esc(f.id)}" ${f.id === state.currentFlowId ? 'selected' : ''}>${esc(f.name)} ${f.suspended_reason ? '🟠 suspendu' : (f.enabled ? '🟢' : '⚪')}</option>`
   ).join('');
   updateFlowToggleBtn();
 }
@@ -1650,7 +1687,10 @@ function updateFlowToggleBtn() {
   const flow = getActiveFlow();
   const btn = document.getElementById('btnToggleFlow');
   if (!flow || !btn) return;
-  btn.textContent = flow.enabled ? '🟢 Flux Actif' : '⚪ Flux Inactif';
+  btn.textContent = flow.suspended_reason
+    ? '🟠 Flux suspendu (mode sûr)'
+    : (flow.enabled ? '🟢 Flux Actif' : '⚪ Flux Inactif');
+  btn.title = flow.suspended_reason || '';
 }
 
 function selectFlow(id) {
@@ -2095,7 +2135,20 @@ async function saveCurrentFlow(silent) {
   });
   if (!res.ok) {
     alert(`Déploiement refusé : ${await apiError(res)}`);
-  } else if (!silent) {
+    return;
+  }
+  // État « suspendu (mode sûr) » recalculé par le serveur, sans toucher aux graphes en cours
+  // d'édition
+  const views = await getJson('/api/flows', []);
+  views.forEach(v => {
+    const local = state.flows.find(f => f.id === v.id);
+    if (local) {
+      local.suspended_reason = v.suspended_reason;
+      local.blocked_outputs = v.blocked_outputs;
+    }
+  });
+  populateFlowSelect();
+  if (!silent) {
     alert(`Flux "${flow.name}" déployé à chaud !`);
   }
 }
@@ -2187,7 +2240,9 @@ function renderAlarmsTable() {
     tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:#8b9bb4;padding:20px;">Aucune alarme active. Cliquez sur "Tester" sur le pressostat filtre du synoptique pour déclencher une alarme ISA-18.2.</td></tr>`;
     return;
   }
-  const allowAck = state.currentUser && state.currentUser.permissions && state.currentUser.permissions.can_ack_alarms;
+  const perms = (state.currentUser && state.currentUser.permissions) || {};
+  const allowAck = perms.can_ack_alarms;
+  const allowManage = perms.can_manage_alarms;
 
   tbody.innerHTML = state.alarms.map(a => {
     const shelved = isShelved(a);
@@ -2195,7 +2250,7 @@ function renderAlarmsTable() {
     const ackCell = needsAck
       ? (allowAck ? `<button class="btn btn-primary" onclick="ackSingleAlarm(${jsArg(a.id)})">Acquitter</button>` : '<span style="color:#f59e0b;">Non acquittée</span>')
       : '<span style="color:#10b981;">✔ Acquittée</span>';
-    const shelveCell = !allowAck ? '' : shelved
+    const shelveCell = !allowManage ? '' : shelved
       ? `<button class="btn" onclick="unshelveAlarm(${jsArg(a.id)})">⏰ Réveiller</button>`
       : (a.state !== 'Normal' && canShelve(a) ? `<button class="btn" onclick="shelveAlarm(${jsArg(a.id)})" title="Masquer temporairement une alarme connue (8 h maximum)">💤 Sommeil</button>` : '');
     return `
@@ -2250,6 +2305,16 @@ function ackComment() {
 }
 
 async function ackSingleAlarm(alarmId) {
+  // Profil Visualisation : acquittement après confirmation explicite (tracé à son nom)
+  if (state.currentUser && state.currentUser.role === 'Viewer') {
+    const a = state.alarms.find(x => x.id === alarmId);
+    const ok = await confirmDialog(
+      'Acquitter cette alarme ?',
+      `${a ? `${a.tag_id} — ${a.message}` : alarmId}\n\nL'acquittement sera enregistré à votre nom (${state.currentUser.username}).`,
+      '✔ Acquitter'
+    );
+    if (!ok) return;
+  }
   const res = await fetch(`/api/alarms/${encodeURIComponent(alarmId)}/ack`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -2642,6 +2707,15 @@ function populateScheduleTagSelect() {
   sel.innerHTML = writableTags.map(t => `<option value="${esc(t.id)}">${esc(t.id)} (${esc(t.label)})</option>`).join('');
 }
 
+/** État d'un planning : actif, inactif, ou suspendu par le mode sûr (calculé par le serveur). */
+function scheduleStatusBadge(s) {
+  if (!s.enabled) return '<span class="badge-qual q-Uncertain">INACTIF</span>';
+  if (s.suspended_reason) {
+    return `<span class="badge-qual q-Suspended" title="${esc(s.suspended_reason)}">SUSPENDU (mode sûr)</span>`;
+  }
+  return '<span class="badge-qual q-Good">ACTIF</span>';
+}
+
 function renderSchedulesTable() {
   const tbody = document.getElementById('schedulesTableBody');
   if (!tbody) return;
@@ -2653,7 +2727,7 @@ function renderSchedulesTable() {
       <td style="font-family:Consolas;">${esc(s.start_time)} ➔ ${esc(s.end_time)}</td>
       <td style="font-family:Consolas;color:#34d399;font-weight:700;">${esc(JSON.stringify(s.active_value))}</td>
       <td style="font-family:Consolas;color:#94a3b8;">${esc(JSON.stringify(s.inactive_value))}</td>
-      <td>${s.enabled ? '<span class="badge-qual q-Good">ACTIF</span>' : '<span class="badge-qual q-Uncertain">INACTIF</span>'}</td>
+      <td>${scheduleStatusBadge(s)}</td>
       <td>
         <button class="btn" onclick="sendWriteTag(${jsArg(s.target_tag_id)}, ${jsArg(s.active_value)})">Forcer Confort</button>
         <button class="btn" onclick="sendWriteTag(${jsArg(s.target_tag_id)}, ${jsArg(s.inactive_value)})">Forcer Réduit</button>
@@ -2675,7 +2749,9 @@ async function postSchedule(payload) {
     return null;
   }
   const saved = await res.json();
-  state.schedules = state.schedules.filter(s => s.id !== saved.id).concat(saved).sort((a, b) => a.id.localeCompare(b.id));
+  // Relecture de la liste : l'état « suspendu (mode sûr) » est calculé par le serveur
+  state.schedules = await getJson('/api/schedules', state.schedules
+    .filter(s => s.id !== saved.id).concat(saved).sort((a, b) => a.id.localeCompare(b.id)));
   renderSchedulesTable();
   return saved;
 }
@@ -2982,11 +3058,12 @@ async function importProjectBackup(event) {
 // COMMANDES COMMUNES & NAVIGATION
 // ============================================================================
 
+/** Envoie une consigne ; renvoie vrai si le serveur l'a acceptée. */
 async function sendWriteTag(tagId, value) {
-  if (!tagId) return;
+  if (!tagId) return false;
   if (!canWrite()) {
     alert('Votre profil ne permet pas l\'envoi de consignes.');
-    return;
+    return false;
   }
   const res = await fetch(`/api/tags/${encodeURIComponent(tagId)}/write`, {
     method: 'POST',
@@ -2996,17 +3073,203 @@ async function sendWriteTag(tagId, value) {
   if (!res.ok) {
     alert(`Refus d'écriture : ${await apiError(res)}`);
   }
+  return res.ok;
+}
+
+// ============================================================================
+// COMMANDES DES SYNOPTIQUES : SÉLECTION PUIS EXÉCUTION
+// ============================================================================
+// Un clic sur une commande d'un synoptique ne l'envoie pas : il la sélectionne. L'équipement
+// s'encadre et un bandeau « Exécuter / Annuler » apparaît ; la commande ne part que sur
+// « Exécuter », dans le délai de sélection. Passé ce délai, sur « Annuler », sur Échap ou en
+// quittant le synoptique, elle est abandonnée sans rien envoyer.
+
+const COMMAND_SELECT_SECONDS = 10;
+
+/** Valeur de commande lisible (booléen en clair, nombre avec l'unité de la variable). */
+function describeCommandValue(tagId, value) {
+  if (typeof value === 'boolean') return value ? 'MARCHE / OUVERT (1)' : 'ARRÊT / FERMÉ (0)';
+  const tag = state.tags[tagId];
+  const unit = tag && tag.unit ? ` ${tag.unit}` : '';
+  return typeof value === 'number' ? `${Number(value.toFixed(3))}${unit}` : String(value);
+}
+
+function findDashboardWidget(widgetId) {
+  const dash = getActiveDashboard();
+  return dash ? dash.widgets.find(w => w.id === widgetId) : null;
+}
+
+/** Sélectionne une commande (premier temps) ; une nouvelle sélection remplace la précédente. */
+function selectCommand(widgetId, tagId, value, momentary = false) {
+  if (!tagId) return;
+  if (!canWrite()) {
+    notify('Votre profil ne permet pas l\'envoi de consignes.', 'error');
+    return;
+  }
+  if (typeof value === 'number' && !Number.isFinite(value)) {
+    notify('Valeur de consigne invalide', 'error');
+    return;
+  }
+  cancelCommand(false);
+  const w = findDashboardWidget(widgetId);
+  state.armedCommand = {
+    widgetId,
+    tagId,
+    value,
+    momentary,
+    pressed: false,
+    title: (w && w.title) || tagId,
+    expiresAt: Date.now() + COMMAND_SELECT_SECONDS * 1000
+  };
+  state.armedTimer = setInterval(tickArmedCommand, 250);
+  refreshArmedWidget(widgetId);
+  renderCommandBar();
+}
+
+/** Abandonne la commande sélectionnée (sans rien envoyer). */
+function cancelCommand(announce = true) {
+  const c = state.armedCommand;
+  if (state.armedTimer) clearInterval(state.armedTimer);
+  state.armedTimer = null;
+  state.armedCommand = null;
+  const bar = document.getElementById('commandBar');
+  if (bar) bar.remove();
+  if (c) {
+    refreshArmedWidget(c.widgetId);
+    if (announce) notify('Commande annulée : rien n\'a été envoyé');
+  }
+}
+
+/** Second temps : envoie la commande sélectionnée. */
+async function executeArmedCommand() {
+  const c = state.armedCommand;
+  if (!c || c.momentary) return;
+  cancelCommand(false);
+  if (await sendWriteTag(c.tagId, c.value)) {
+    notify(`Commande envoyée : ${c.title} → ${describeCommandValue(c.tagId, c.value)}`);
+  }
+}
+
+/** Bouton impulsionnel : armement au premier appui, puis impulsion (1 puis 0) une seule fois. */
+async function pulseCommand(widgetId, tagId, down) {
+  const c = state.armedCommand;
+  const armed = c && c.momentary && c.widgetId === widgetId;
+  if (down) {
+    if (!armed) {
+      selectCommand(widgetId, tagId, true, true);
+      return;
+    }
+    c.pressed = true;
+    renderCommandBar();
+    await sendWriteTag(tagId, true);
+  } else if (armed && c.pressed) {
+    cancelCommand(false);
+    if (await sendWriteTag(tagId, false)) notify(`Impulsion envoyée : ${c.title}`);
+  }
+}
+
+function tickArmedCommand() {
+  const c = state.armedCommand;
+  if (!c) return;
+  // Pas d'expiration pendant une impulsion : le relâchement doit toujours envoyer le 0
+  if (!c.pressed && Date.now() >= c.expiresAt) {
+    cancelCommand(false);
+    notify('Sélection expirée : aucune commande envoyée', 'error');
+    return;
+  }
+  const left = document.getElementById('commandBarLeft');
+  if (left) left.textContent = `${Math.max(0, Math.ceil((c.expiresAt - Date.now()) / 1000))} s`;
+}
+
+/** Encadre (ou libère) l'équipement de la commande sélectionnée. */
+function refreshArmedWidget(widgetId) {
+  const card = document.getElementById(`widget-${cssSafe(widgetId)}`);
+  if (!card) return;
+  card.classList.toggle('cmd-armed', !!(state.armedCommand && state.armedCommand.widgetId === widgetId));
+  const w = findDashboardWidget(widgetId);
+  const body = document.getElementById(`widget-body-${cssSafe(widgetId)}`);
+  if (w && body && w.widget_type === 'PushButton') renderWidgetBody(body, w);
+}
+
+function renderCommandBar() {
+  const c = state.armedCommand;
+  if (!c) return;
+  let bar = document.getElementById('commandBar');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'commandBar';
+    bar.setAttribute('role', 'alertdialog');
+    bar.setAttribute('aria-label', 'Commande sélectionnée');
+    document.body.appendChild(bar);
+  }
+  const what = c.momentary
+    ? `Bouton impulsionnel armé : <b>${esc(c.title)}</b> (${esc(c.tagId)}). Maintenez le bouton pour envoyer l'impulsion.`
+    : `Commande sélectionnée : <b>${esc(c.title)}</b> (${esc(c.tagId)}) → <b class="cmd-value">${esc(describeCommandValue(c.tagId, c.value))}</b>`;
+  bar.innerHTML = `
+    <span class="cmd-text">${what}</span>
+    <span id="commandBarLeft" class="cmd-left">${COMMAND_SELECT_SECONDS} s</span>
+    ${c.momentary ? '' : '<button id="commandBarExec" class="btn btn-primary" onclick="executeArmedCommand()">▶ Exécuter</button>'}
+    <button class="btn" onclick="cancelCommand()">Annuler</button>
+  `;
+  tickArmedCommand();
+  const exec = document.getElementById('commandBarExec');
+  if (exec) exec.focus();
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && state.armedCommand) cancelCommand();
+});
+
+/**
+ * Fenêtre de confirmation de l'IHM (remplace confirm()) : renvoie une promesse résolue à vrai
+ * sur « Confirmer », à faux sur « Annuler », Échap ou clic hors de la fenêtre.
+ */
+function confirmDialog(title, message, okLabel = 'Confirmer') {
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.className = 'auth-modal confirm-overlay';
+    overlay.style.display = 'flex';
+    overlay.innerHTML = `
+      <div class="card-box confirm-box" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle">
+        <h3 id="confirmTitle">${esc(title)}</h3>
+        <p class="confirm-msg">${esc(message)}</p>
+        <div class="confirm-actions">
+          <button class="btn" data-r="0">Annuler</button>
+          <button class="btn btn-primary" data-r="1">${esc(okLabel)}</button>
+        </div>
+      </div>`;
+    const close = ok => {
+      document.removeEventListener('keydown', onKey, true);
+      overlay.remove();
+      resolve(ok);
+    };
+    const onKey = e => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        close(false);
+      }
+    };
+    overlay.addEventListener('click', e => {
+      if (e.target === overlay) close(false);
+      const r = e.target.closest && e.target.closest('button[data-r]');
+      if (r) close(r.dataset.r === '1');
+    });
+    document.addEventListener('keydown', onKey, true);
+    document.body.appendChild(overlay);
+    overlay.querySelector('button[data-r="1"]').focus();
+  });
 }
 
 function switchTab(tab, btn) {
   // Protection RBAC côté IHM (le serveur applique de toute façon les mêmes règles)
-  if (state.currentUser && state.currentUser.role === 'Viewer' && tab !== 'synoptic') {
+  if (state.currentUser && state.currentUser.role === 'Viewer' && tab !== 'synoptic' && tab !== 'alarms') {
     return;
   }
   if (state.currentUser && state.currentUser.role !== 'Admin' && tab === 'users') {
     return;
   }
 
+  if (tab !== state.activeTab) cancelCommand(false);
   state.activeTab = tab;
   // La bibliothèque de symboles et l'inspecteur ne servent qu'aux synoptiques et aux flux :
   // ailleurs, la colonne de droite est masquée pour laisser la place aux tableaux.
@@ -3035,6 +3298,7 @@ function setMode(mode) {
   if (!state.currentUser || !state.currentUser.permissions || !state.currentUser.permissions.can_edit_studio) {
     mode = 'run';
   }
+  if (mode !== 'run') cancelCommand(false);
   state.mode = mode;
   document.body.classList.toggle('run-mode', mode === 'run');
   document.getElementById('btnModeStudio').className = 'mode-btn' + (mode === 'studio' ? ' active-studio' : '');
@@ -3088,7 +3352,7 @@ function applyUserPermissionsToUi() {
     badgeEl.style.background = 'rgba(16,185,129,0.22)';
     badgeEl.style.color = '#34d399';
     if (hintEl) {
-      hintEl.textContent = '👁️ Visualisation (Dashboards en Lecture Seule)';
+      hintEl.textContent = '👁️ Visualisation (synoptiques en lecture, acquittement des alarmes)';
       hintEl.style.color = '#34d399';
     }
   }
@@ -3099,7 +3363,7 @@ function applyUserPermissionsToUi() {
   };
 
   showEl('navBtn-flow', perms.can_manage_flows);
-  showEl('navBtn-alarms', perms.can_ack_alarms);
+  showEl('navBtn-alarms', perms.can_view_alarms);
   showEl('navBtn-tagdb', perms.can_manage_drivers_tags);
   showEl('navBtn-schedules', perms.can_manage_schedules);
   showEl('navBtn-historian', perms.can_view_historian);
@@ -3114,7 +3378,9 @@ function applyUserPermissionsToUi() {
   showEl('modeSwitchContainer', perms.can_edit_studio, 'flex');
   showEl('synopticStudioActions', perms.can_edit_studio, 'flex');
   showEl('synopticSaveGroup', perms.can_edit_studio, 'flex');
-  showEl('btnBannerAckAll', perms.can_ack_alarms, 'inline-block');
+  showEl('btnBannerAckAll', perms.can_manage_alarms, 'inline-block');
+  showEl('btnAlarmsAckAll', perms.can_manage_alarms, 'inline-block');
+  showEl('btnAlarmsClearNormal', perms.can_manage_alarms, 'inline-block');
 
   document.body.classList.toggle('viewer-only-mode', role === 'Viewer');
   if (!perms.can_edit_studio) setMode('run');
@@ -3124,7 +3390,7 @@ function applyUserPermissionsToUi() {
   const tabAllowed = {
     synoptic: true,
     flow: perms.can_manage_flows,
-    alarms: perms.can_ack_alarms,
+    alarms: perms.can_view_alarms,
     tagdb: perms.can_manage_drivers_tags,
     schedules: perms.can_manage_schedules,
     historian: perms.can_view_historian,

@@ -32,11 +32,11 @@ use crate::{
         is_valid_hhmm, AlarmInstance, AlarmJournalEntry, AlarmLevel, AlarmLifecycleState,
         AlarmSeverity, AuditLogEntry, ComparisonOperator, DashboardLayout, DashboardWidget,
         DriverConfig, DriverRuntimeStats, FlowEdge, FlowExecutionTrace, FlowGraph, FlowNode,
-        FlowNodeKind, HistoryPoint, HistoryResponse, ImportSymbolLibraryRequest, LoginRequest,
-        LoginResponse, ProjectBackupBundle, ProtocolType, Quality, RegisteredTag, ScadaError,
-        ScheduleRule, SymbolLibraryItem, SystemSettings, SystemStatus, TagFullView, TagState,
-        TagValue, UpsertUserRequest, UserAccount, UserPublicView, UserRole, WidgetType,
-        WriteCommand,
+        FlowNodeKind, FlowView, HistoryPoint, HistoryResponse, ImportSymbolLibraryRequest,
+        LoginRequest, LoginResponse, ProjectBackupBundle, ProtocolType, Quality, RegisteredTag,
+        ScadaError, ScheduleRule, ScheduleView, SymbolLibraryItem, SystemSettings, SystemStatus,
+        TagFullView, TagState, TagValue, UpsertUserRequest, UserAccount, UserPublicView, UserRole,
+        WidgetType, WriteCommand,
     },
     security,
 };
@@ -139,7 +139,12 @@ pub struct ScadaCore {
     pub alarms: DashMap<String, AlarmInstance>,
     pub schedules: DashMap<String, ScheduleRule>,
     pub users: DashMap<String, UserAccount>,
+    /// Sessions ouvertes, indexées par l'empreinte de leur jeton ([`security::session_key`]).
     pub sessions: DashMap<String, Session>,
+    /// Sérialise l'écriture des sessions en base (voir `persist_sessions`).
+    sessions_persist_lock: tokio::sync::Mutex<()>,
+    /// Vrai si une date d'activité a changé depuis la dernière écriture des sessions.
+    sessions_dirty: AtomicBool,
     login_failures: DashMap<String, LoginFailure>,
     /// Plafond global des vérifications Argon2 simultanées.
     password_checks: Arc<Semaphore>,
@@ -200,6 +205,8 @@ impl ScadaCore {
             schedules: DashMap::new(),
             users: DashMap::new(),
             sessions: DashMap::new(),
+            sessions_persist_lock: tokio::sync::Mutex::new(()),
+            sessions_dirty: AtomicBool::new(false),
             login_failures: DashMap::new(),
             password_checks: Arc::new(Semaphore::new(PASSWORD_CHECKS_MAX_CONCURRENT)),
             users_persist_lock: tokio::sync::Mutex::new(()),
@@ -1907,6 +1914,41 @@ impl ScadaCore {
         list
     }
 
+    /// Driver réel vers lequel le mode sûr bloque les commandes de `tag_id`, s'il y en a un
+    /// (même règle que [`Self::write_tag`] : les variables internes et simulées restent
+    /// pilotables).
+    pub fn safe_mode_blocked_driver(&self, tag_id: &str) -> Option<String> {
+        if !self.safe_mode {
+            return None;
+        }
+        let driver_id = self.tags_registry.get(tag_id)?.module_source.clone();
+        let simulated = self.drivers_config.get(&driver_id)?.protocol.is_simulated();
+        (!simulated).then_some(driver_id)
+    }
+
+    /// Plannings avec leur état réel : un planning actif dont la variable cible est bloquée
+    /// par le mode sûr est signalé suspendu, au lieu d'apparaître « actif » sans effet.
+    pub fn get_schedule_views(&self) -> Vec<ScheduleView> {
+        self.get_all_schedules()
+            .into_iter()
+            .map(|rule| {
+                let suspended_reason = rule
+                    .enabled
+                    .then(|| self.safe_mode_blocked_driver(&rule.target_tag_id))
+                    .flatten()
+                    .map(|driver| {
+                        format!(
+                            "Mode sûr : aucune commande n'est envoyée à l'équipement '{driver}'"
+                        )
+                    });
+                ScheduleView {
+                    rule,
+                    suspended_reason,
+                }
+            })
+            .collect()
+    }
+
     pub async fn save_schedule(
         &self,
         actor: &str,
@@ -2136,6 +2178,47 @@ impl ScadaCore {
             .collect();
         list.sort_by(|a, b| a.id.cmp(&b.id));
         list
+    }
+
+    /// Vrai si `tag_id` est affichée par une courbe de tendance d'au moins un synoptique.
+    pub fn tag_on_trend_widget(&self, tag_id: &str) -> bool {
+        self.dashboards.iter().any(|d| {
+            d.widgets.iter().any(|w| {
+                w.widget_type == WidgetType::TrendChart && w.bound_tag_id.as_deref() == Some(tag_id)
+            })
+        })
+    }
+
+    /// Flux avec leurs sorties bloquées par le mode sûr (variables d'équipements réels).
+    pub fn get_flow_views(&self) -> Vec<FlowView> {
+        self.get_all_flows()
+            .into_iter()
+            .map(|flow| {
+                let mut blocked_outputs: Vec<String> = flow
+                    .nodes
+                    .iter()
+                    .filter_map(|n| match &n.kind {
+                        FlowNodeKind::TagOutput { target_tag_id } => self
+                            .safe_mode_blocked_driver(target_tag_id)
+                            .map(|_| target_tag_id.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                blocked_outputs.sort();
+                blocked_outputs.dedup();
+                let suspended_reason = (flow.enabled && !blocked_outputs.is_empty()).then(|| {
+                    format!(
+                        "Mode sûr : sortie(s) vers des équipements réels bloquée(s) : {}",
+                        blocked_outputs.join(", ")
+                    )
+                });
+                FlowView {
+                    flow,
+                    suspended_reason,
+                    blocked_outputs,
+                }
+            })
+            .collect()
     }
 
     pub async fn save_flow(&self, actor: &str, flow: FlowGraph) -> Result<FlowGraph, ScadaError> {
@@ -2725,6 +2808,10 @@ impl ScadaCore {
             );
         }
 
+        // Sessions : chargées avant l'éventuelle recréation du compte d'usine ci-dessous, pour
+        // qu'une session d'un ancien compte désactivé ne soit jamais rattachée au nouveau.
+        self.load_sessions(&pool).await;
+
         // Garde-fou : sans aucun administrateur actif, on recrée le compte admin d'usine
         let has_admin = self
             .users
@@ -2927,6 +3014,84 @@ impl ScadaCore {
         }
     }
 
+    /// Écrit en base l'état courant des sessions (table `user_sessions`, réécrite en une
+    /// transaction). Appelée après chaque ouverture ou fermeture de session, et chaque minute
+    /// si des dates d'activité ont changé. Les écritures sont sérialisées et prennent l'état
+    /// au moment de l'écriture : la dernière écrite est toujours la plus récente.
+    pub async fn persist_sessions(&self) {
+        let Some(pool) = &self.db_pool else {
+            return;
+        };
+        let _guard = self.sessions_persist_lock.lock().await;
+        self.sessions_dirty.store(false, Ordering::Relaxed);
+        let snapshot: Vec<(String, Session)> = self
+            .sessions
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        let result = async {
+            let mut tx = pool.begin().await?;
+            sqlx::query("DELETE FROM user_sessions")
+                .execute(&mut *tx)
+                .await?;
+            for (key, s) in &snapshot {
+                sqlx::query(
+                    "INSERT INTO user_sessions (token_hash, username, created_at, last_seen)
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(key)
+                .bind(&s.username)
+                .bind(s.created_at.to_rfc3339())
+                .bind(s.last_seen.to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await
+        }
+        .await;
+        log_db_error("persistance des sessions", result);
+    }
+
+    /// Recharge les sessions non expirées de comptes existants et actifs.
+    async fn load_sessions(&self, pool: &SqlitePool) {
+        let ttl = chrono::Duration::hours(self.session_ttl_hours as i64);
+        let now = Utc::now();
+        let rows =
+            sqlx::query("SELECT token_hash, username, created_at, last_seen FROM user_sessions")
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+        let parse = |s: String| {
+            DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        };
+        for row in rows {
+            let key: String = row.try_get("token_hash").unwrap_or_default();
+            let username: String = row.try_get("username").unwrap_or_default();
+            let (Some(created_at), Some(last_seen)) = (
+                parse(row.try_get("created_at").unwrap_or_default()),
+                parse(row.try_get("last_seen").unwrap_or_default()),
+            ) else {
+                continue;
+            };
+            let user_ok = self.users.get(&username).is_some_and(|u| u.enabled);
+            if key.len() == 64 && user_ok && now - last_seen < ttl {
+                self.sessions.insert(
+                    key,
+                    Session {
+                        username,
+                        created_at,
+                        last_seen,
+                    },
+                );
+            }
+        }
+        if !self.sessions.is_empty() {
+            info!("{} session(s) utilisateur reprise(s)", self.sessions.len());
+        }
+    }
+
     // ========================================================================
     // TÂCHES DE FOND (INGESTION, HISTORIQUE, RÉTENTION, SESSIONS, TÉLÉMÉTRIE)
     // ========================================================================
@@ -3022,12 +3187,21 @@ impl ScadaCore {
 
     fn spawn_session_cleanup_worker(core: Arc<Self>) {
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(600));
+            // Toutes les minutes : purge des sessions expirées et écriture des dates d'activité,
+            // pour qu'un redémarrage ne prolonge ni n'écourte une session de plus d'une minute.
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
             loop {
                 ticker.tick().await;
                 let ttl = chrono::Duration::hours(core.session_ttl_hours as i64);
                 let now = Utc::now();
+                let before = core.sessions.len();
                 core.sessions.retain(|_, s| now - s.last_seen < ttl);
+                if core.sessions.len() != before {
+                    core.sessions_dirty.store(true, Ordering::Relaxed);
+                }
+                if core.sessions_dirty.load(Ordering::Relaxed) {
+                    core.persist_sessions().await;
+                }
                 core.login_failures
                     .retain(|_, f| (now - f.last_at).num_seconds() < 3600);
             }
@@ -3609,7 +3783,7 @@ impl ScadaCore {
             }
             current.last_login_at = Some(now);
             self.sessions.insert(
-                token.clone(),
+                security::session_key(&token),
                 Session {
                     username: current.username.clone(),
                     created_at: now,
@@ -3620,6 +3794,7 @@ impl ScadaCore {
         };
         self.login_failures.remove(&key);
         self.persist_user(&account).await;
+        self.persist_sessions().await;
 
         self.record_audit(
             &account.username,
@@ -3704,9 +3879,10 @@ impl ScadaCore {
         }
     }
 
-    pub fn logout(&self, token: &str) {
+    pub async fn logout(&self, token: &str) {
         let clean = token.strip_prefix("Bearer ").unwrap_or(token).trim();
-        if let Some((_, session)) = self.sessions.remove(clean) {
+        if let Some((_, session)) = self.sessions.remove(&security::session_key(clean)) {
+            self.persist_sessions().await;
             self.record_audit(
                 &session.username,
                 "AUTH",
@@ -3732,14 +3908,17 @@ impl ScadaCore {
 
         let ttl = chrono::Duration::hours(self.session_ttl_hours as i64);
         let now = Utc::now();
+        let key = security::session_key(clean);
         let username = {
-            let mut session = self.sessions.get_mut(clean)?;
+            let mut session = self.sessions.get_mut(&key)?;
             if now - session.last_seen >= ttl {
                 drop(session);
-                self.sessions.remove(clean);
+                self.sessions.remove(&key);
+                self.sessions_dirty.store(true, Ordering::Relaxed);
                 return None;
             }
             session.last_seen = now;
+            self.sessions_dirty.store(true, Ordering::Relaxed);
             session.username.clone()
         };
         self.users
@@ -3811,16 +3990,19 @@ impl ScadaCore {
     }
 
     /// Ferme toutes les sessions ouvertes d'un utilisateur (désactivation, suppression, changement de rôle).
-    fn revoke_user_sessions(&self, username: &str) {
-        self.sessions.retain(|_, s| s.username != username);
+    async fn revoke_user_sessions(&self, username: &str) {
+        self.revoke_user_sessions_except(username, None).await;
     }
 
     /// Ferme les sessions d'un utilisateur sauf `keep` (session de l'administrateur qui modifie
-    /// son propre compte : il n'est pas déconnecté par sa propre action).
-    fn revoke_user_sessions_except(&self, username: &str, keep: Option<&str>) {
-        let keep = keep.map(|t| t.strip_prefix("Bearer ").unwrap_or(t).trim());
+    /// son propre compte : il n'est pas déconnecté par sa propre action). La fermeture est
+    /// écrite en base avant de rendre la main : elle survit à un redémarrage.
+    async fn revoke_user_sessions_except(&self, username: &str, keep: Option<&str>) {
+        let keep =
+            keep.map(|t| security::session_key(t.strip_prefix("Bearer ").unwrap_or(t).trim()));
         self.sessions
-            .retain(|tok, s| s.username != username || keep == Some(tok.as_str()));
+            .retain(|key, s| s.username != username || keep.as_deref() == Some(key.as_str()));
+        self.persist_sessions().await;
     }
 
     fn active_admin_count_excluding(&self, username: &str) -> usize {
@@ -3907,11 +4089,12 @@ impl ScadaCore {
         self.users.insert(uname.clone(), account.clone());
         self.persist_user(&account).await;
         if role_or_state_changed {
-            self.revoke_user_sessions(&uname);
+            self.revoke_user_sessions(&uname).await;
         } else if password_changed {
             // Réinitialisation du mot de passe : les sessions existantes (peut-être celle d'un
             // tiers qui connaissait l'ancien mot de passe) ne doivent pas lui survivre.
-            self.revoke_user_sessions_except(&uname, actor_session);
+            self.revoke_user_sessions_except(&uname, actor_session)
+                .await;
         }
 
         self.record_audit(
@@ -3949,7 +4132,7 @@ impl ScadaCore {
         self.users.remove(&uname).ok_or_else(|| {
             ScadaError::BadRequest(format!("Utilisateur '{}' introuvable", uname))
         })?;
-        self.revoke_user_sessions(&uname);
+        self.revoke_user_sessions(&uname).await;
 
         if let Some(pool) = &self.db_pool {
             log_db_error(
@@ -4026,13 +4209,8 @@ impl ScadaCore {
         };
         self.persist_user(&account).await;
 
-        let keep = current_token
-            .strip_prefix("Bearer ")
-            .unwrap_or(current_token)
-            .trim()
-            .to_string();
-        self.sessions
-            .retain(|tok, s| s.username != account.username || *tok == keep);
+        self.revoke_user_sessions_except(&account.username, Some(current_token))
+            .await;
 
         self.record_audit(
             &account.username,
