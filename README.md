@@ -23,6 +23,7 @@ Plateforme de supervision industrielle **GTC / SCADA / GTB** écrite en Rust : u
 | [docs/INSTALLATION.md](docs/INSTALLATION.md) | Installation, mise à jour et désinstallation (Windows, Linux, mode portable), reprise des données des versions 1.x |
 | [docs/ADMINISTRATION.md](docs/ADMINISTRATION.md) | Configuration, utilitaire desktop, ligne de commande, codes de sortie, mode sûr, dépannage |
 | [docs/DEVELOPPEMENT.md](docs/DEVELOPPEMENT.md) | Architecture, compilation, tests, intégration continue, publication |
+| [docs/SIGNATURE.md](docs/SIGNATURE.md) | Politique de signature de code Authenticode (SignPath Foundation) |
 | [docs/REFONTE_ALPHA.md](docs/REFONTE_ALPHA.md) | Audit, architecture cible, plan de migration, bilan de l'alpha et critères de passage en bêta |
 | [docs/AUDIT_ET_PLAN.md](docs/AUDIT_ET_PLAN.md) | Historique des versions 1.1 à 1.3 |
 
@@ -82,3 +83,19 @@ Un tag dont le « driver » ne correspond à aucun driver déclaré est une **va
 | `consigne` | Conservé pour compatibilité : consigne de `GTB.CTA01.Consigne_Temp`. Préférez `tag("ID")`. |
 
 Les scripts sont limités en nombre d'opérations, en taille de chaînes et de tableaux, et en profondeur d'appel.
+
+## Signature de code
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org)
+
+Les binaires Windows publiés officiellement (moteur, utilitaire d'administration, désinstalleur et installateur) sont signés numériquement par la fondation SignPath lors des publications d'étiquettes de version (`v*`) par la chaîne d'intégration continue GitHub Actions.
+
+Pour le détail des rôles du projet, des engagements de confidentialité (absence totale de télémétrie) et du procédé de signature, consultez la politique complète : [docs/SIGNATURE.md](docs/SIGNATURE.md).
+
+## Licence
+
+Ce projet est distribué sous licence **GPL-3.0-or-later** (GNU General Public License version 3 ou ultérieure).
+
+Copyright © 2026 kevin03L.
+
+Consultez le texte intégral dans le fichier [LICENSE](LICENSE) à la racine du dépôt.

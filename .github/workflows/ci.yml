@@ -51,6 +51,11 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: [fmt, check]
     runs-on: windows-latest
+    # Le contexte « secrets » est interdit dans les conditions « if » des étapes : la présence
+    # des secrets de signature est évaluée ici, une fois pour tout le job.
+    env:
+      SIGNPATH_ACTIF: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' && secrets.SIGNPATH_API_TOKEN != '' }}
+      PFX_ACTIF: ${{ secrets.APEX_SIGN_PFX_BASE64 != '' && secrets.APEX_SIGN_PFX_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -61,10 +66,116 @@ jobs:
           if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
             choco install innosetup -y --no-progress
           }
-      - name: Construction de l'installateur
+      - name: Compilation release des binaires
+        run: cargo build --release --locked -p apex-server -p apex-admin
+
+      # --- Option 1 : Signature par SignPath Foundation ---
+      - name: Téléversement des binaires non signés (SignPath)
+        if: env.SIGNPATH_ACTIF == 'true'
+        id: binaires
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaires-unsigned
+          path: |
+            target/release/apex-scada.exe
+            target/release/apex-scada-admin.exe
+
+      - name: Requête de signature SignPath (binaires)
+        if: env.SIGNPATH_ACTIF == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'apex-supervision' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          artifact-configuration-slug: 'binaires'
+          github-artifact-id: ${{ steps.binaires.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: target/signed-binaries
+
+      - name: Intégration des binaires signés SignPath
+        if: env.SIGNPATH_ACTIF == 'true'
         shell: pwsh
-        run: ./packaging/windows/build-installer.ps1
-      - uses: actions/upload-artifact@v4
+        run: |
+          Get-ChildItem -Path target/signed-binaries -Recurse | Where-Object { $_.Extension -eq '.zip' } | ForEach-Object {
+            Expand-Archive -Path $_.FullName -DestinationPath target/release -Force
+          }
+          Get-ChildItem -Path target/signed-binaries -Recurse | Where-Object { $_.Extension -eq '.exe' } | ForEach-Object {
+            Copy-Item -Path $_.FullName -Destination target/release -Force
+          }
+
+      - name: Construction de l'installateur avant signature (SignPath)
+        if: env.SIGNPATH_ACTIF == 'true'
+        shell: pwsh
+        run: |
+          ./packaging/windows/build-installer.ps1 -SkipBuild -SansSignature
+
+      - name: Téléversement de l'installateur non signé (SignPath)
+        if: env.SIGNPATH_ACTIF == 'true'
+        id: installateur
+        uses: actions/upload-artifact@v4
+        with:
+          name: installateur-unsigned
+          path: dist/apex-supervision-*-windows-x64-setup.exe
+
+      - name: Requête de signature SignPath (installateur)
+        if: env.SIGNPATH_ACTIF == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'apex-supervision' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          artifact-configuration-slug: 'installateur'
+          github-artifact-id: ${{ steps.installateur.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist/signed-installer
+
+      - name: Intégration de l'installateur signé SignPath et recalcul empreinte SHA-256
+        if: env.SIGNPATH_ACTIF == 'true'
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path dist/signed-installer -Recurse | Where-Object { $_.Extension -eq '.zip' } | ForEach-Object {
+            Expand-Archive -Path $_.FullName -DestinationPath dist -Force
+          }
+          Get-ChildItem -Path dist/signed-installer -Recurse | Where-Object { $_.Extension -eq '.exe' } | ForEach-Object {
+            Copy-Item -Path $_.FullName -Destination dist -Force
+          }
+          ./packaging/windows/build-installer.ps1 -RecalculerSha256
+
+      # --- Option 2 : Signature locale PFX (certificat OV alternatif) ---
+      - name: Construction avec signature locale PFX
+        if: env.SIGNPATH_ACTIF != 'true' && env.PFX_ACTIF == 'true'
+        shell: pwsh
+        env:
+          SIGN_PFX_BASE64: ${{ secrets.APEX_SIGN_PFX_BASE64 }}
+          SIGN_PFX_PASSWORD: ${{ secrets.APEX_SIGN_PFX_PASSWORD }}
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "apex-signing-certificate.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
+          $env:APEX_SIGN_PFX = $pfxPath
+          $env:APEX_SIGN_PFX_PASSWORD = $env:SIGN_PFX_PASSWORD
+          ./packaging/windows/build-installer.ps1 -SkipBuild -Signer
+
+      - name: Nettoyage du certificat temporaire PFX
+        if: always() && env.PFX_ACTIF == 'true'
+        shell: pwsh
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "apex-signing-certificate.pfx"
+          if (Test-Path $pfxPath) {
+            Remove-Item -Force $pfxPath
+          }
+
+      # --- Option 3 : Sans configuration SignPath ni PFX (non signé) ---
+      - name: Construction non signée (secours)
+        if: env.SIGNPATH_ACTIF != 'true' && env.PFX_ACTIF != 'true'
+        shell: pwsh
+        run: |
+          Write-Host "::warning::Aucune configuration de signature (SignPath ou PFX) : installateur NON signé"
+          ./packaging/windows/build-installer.ps1 -SkipBuild -SansSignature
+
+      - name: Publication de l'artefact Windows
+        uses: actions/upload-artifact@v4
         with:
           name: windows-x64
           path: |
@@ -135,3 +246,32 @@ jobs:
           path: |
             dist/*.deb
             dist/*.sha256
+
+  release:
+    name: Publication GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [package-windows, package-linux]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Téléchargement des artefacts Windows
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-x64
+          path: dist
+      - name: Téléchargement des artefacts Linux
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64-deb
+          path: dist
+      - name: Publication de la release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.exe
+            dist/*.deb
+            dist/*.sha256
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true

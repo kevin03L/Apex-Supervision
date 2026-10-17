@@ -8,7 +8,7 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish.workspace = true
-license = "LicenseRef-Proprietary"
+license.workspace = true
 readme = "../../README.md"
 
 [[bin]]
@@ -67,6 +67,7 @@ assets = [
     ["../../packaging/linux/apex-scada-admin.desktop", "usr/share/applications/", "644"],
     ["../../packaging/icons/apex-supervision-256.png", "usr/share/icons/hicolor/256x256/apps/apex-supervision.png", "644"],
     ["../../packaging/icons/apex-supervision.svg", "usr/share/icons/hicolor/scalable/apps/apex-supervision.svg", "644"],
+    ["../../LICENSE", "usr/share/doc/apex-supervision/LICENSE", "644"],
     ["../../README.md", "usr/share/doc/apex-supervision/README.md", "644"],
     ["../../docs/INSTALLATION.md", "usr/share/doc/apex-supervision/INSTALLATION.md", "644"],
     ["../../docs/ADMINISTRATION.md", "usr/share/doc/apex-supervision/ADMINISTRATION.md", "644"],

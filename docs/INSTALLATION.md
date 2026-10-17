@@ -22,6 +22,8 @@ Les opérateurs utilisent l'IHM web depuis un navigateur, à l'adresse `http://<
 
 ### 1.2 Installation
 
+> **Smart App Control (Windows 11)** : un installateur non signé est bloqué si Smart App Control est actif ; utiliser un build signé.
+
 1. Vérifiez l'empreinte de l'installateur :
    `Get-FileHash apex-supervision-<version>-windows-x64-setup.exe` doit afficher la valeur du fichier `.sha256` publié avec lui.
 2. Lancez `apex-supervision-<version>-windows-x64-setup.exe` et acceptez l'élévation (UAC).

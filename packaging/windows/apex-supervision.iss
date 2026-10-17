@@ -32,6 +32,9 @@
 #ifndef OutputDir
   #define OutputDir SourceDir + "\dist"
 #endif
+#ifndef SignedUninstallerDir
+  #define SignedUninstallerDir OutputDir
+#endif
 
 #define AppName "Apex Supervision"
 #define ServiceName "ApexSupervision"
@@ -64,6 +67,7 @@ OutputBaseFilename=apex-supervision-{#AppVersion}-windows-x64-setup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+LicenseFile={#SourceDir}\LICENSE
 ; Icône du produit (packaging\icons\generer-icones.ps1) ; les raccourcis et l'entrée
 ; « Applications installées » reprennent celle embarquée dans les exécutables.
 SetupIconFile={#SourceDir}\packaging\icons\apex-supervision.ico
@@ -72,11 +76,18 @@ UninstallDisplayName={#AppName}
 CloseApplications=yes
 RestartApplications=no
 SetupLogging=yes
-; Signature Authenticode (prévue avant la bêta) : déclarer l'outil « signtool » dans ISCC
-; (/Ssigntool="signtool.exe sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /a $f")
-; puis décommenter :
-; SignTool=signtool
-; SignedUninstaller=yes
+; Signature Authenticode (Smart App Control, Windows 11) :
+; outil « apexsign » passé sur la ligne de commande ISCC via /Sapexsign=...
+#ifdef Signer
+SignTool=apexsign
+SignedUninstaller=yes
+SignedUninstallerDir={#SignedUninstallerDir}
+#else
+#ifdef SignedUninstaller
+SignedUninstaller=yes
+SignedUninstallerDir={#SignedUninstallerDir}
+#endif
+#endif
 
 [Languages]
 Name: "fr"; MessagesFile: "compiler:Languages\French.isl"
@@ -88,6 +99,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "{#BinDir}\{#EngineExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BinDir}\{#AdminExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\static\*"; DestDir: "{app}\web"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\bibliotheque_exemple_iso10628.json"; DestDir: "{app}\exemples"; Flags: ignoreversion
 Source: "{#SourceDir}\docs\INSTALLATION.md"; DestDir: "{app}\docs"; Flags: ignoreversion

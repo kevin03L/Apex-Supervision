@@ -120,7 +120,42 @@ Construction locale :
 
 Depuis un poste Windows, la compilation et le paquet se font dans un conteneur `ubuntu:22.04` (glibc 2.35, comme la CI) avec `build-essential`, `curl`, `pkg-config`, les paquets de `LINUX_GUI_DEPS` et rustup. Placez `CARGO_HOME` et `CARGO_TARGET_DIR` dans des volumes Docker nommés : un dossier Windows monté est très lent. Pour tester le paquet, il faut un conteneur avec systemd comme PID 1 (`--privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw`, commande `/sbin/init`). Supprimez `/usr/sbin/policy-rc.d` des images Ubuntu : ce script empêche `apt` de démarrer, d'arrêter et de redémarrer les services, ce qui fausse le test.
 
-**Signature** (prévue avant la bêta) : Authenticode pour les binaires et l'installateur (directive `SignTool` déjà préparée dans le script Inno Setup), et signature du paquet DEB ou d'un dépôt APT.
+### Signature de code (SignPath Foundation)
+
+Apex Supervision s'appuie sur le programme gratuit pour projets open source de **SignPath Foundation** pour signer numériquement ses exécutables Windows (`apex-scada.exe`, `apex-scada-admin.exe`, l'installateur et le désinstalleur) dans la chaîne d'intégration continue GitHub Actions. L'éditeur affiché par Windows est « SignPath Foundation ».
+
+La signature est effectuée **exclusivement par la CI**, sur des étiquettes de version (`v*`), après validation manuelle du propriétaire. Aucune clé privée n'est manipulée sur les postes de travail ni stockée dans le dépôt.
+
+#### Étapes de mise en service pour le propriétaire
+
+1. **Rendre le dépôt public** :
+   Dans les paramètres GitHub du dépôt (`Settings` → `General` → `Danger Zone` → `Change repository visibility`), basculer le dépôt en public (SignPath Foundation exige un dépôt public et sous licence libre approuvée par l'OSI).
+2. **Publier une première version alpha (non signée)** :
+   Poser une étiquette Git (par exemple `v0.4.0-alpha.1`) et la pousser sur GitHub. Le workflow de CI produira une première GitHub Release avec les binaires, l'installateur Windows et le paquet DEB non signés.
+3. **Déposer la candidature sur signpath.org** :
+   Créer un compte sur [signpath.org](https://signpath.org) et soumettre le projet Apex Supervision en indiquant l'adresse du dépôt public et la licence GPL-3.0.
+4. **Configurer SignPath et GitHub** :
+   Une fois la candidature validée par l'équipe de SignPath Foundation :
+   - Installer l'application GitHub de SignPath sur l'organisation ou le compte propriétaire ;
+   - Créer le projet SignPath (par défaut slug : `apex-supervision`) et la politique de signature (par défaut slug : `release-signing`) ;
+   - Dans le projet SignPath, configurer les trois définitions d'artefacts en collant le contenu des fichiers versionnés dans le dépôt :
+     - `.signpath/artifact-configurations/binaires.xml` (slug : `binaires`) ;
+     - `.signpath/artifact-configurations/desinstalleur.xml` (slug : `desinstalleur`) ;
+     - `.signpath/artifact-configurations/installateur.xml` (slug : `installateur`) ;
+   - Définir dans les paramètres GitHub du dépôt (`Settings` → `Secrets and variables` → `Actions`) :
+     - **Secret** `SIGNPATH_API_TOKEN` : jeton d'API SignPath autorisant la soumission des requêtes de signature ;
+     - **Variable** `SIGNPATH_ORGANIZATION_ID` : identifiant de l'organisation SignPath ;
+     - **Variables optionnelles** (si différentes des valeurs par défaut) : `SIGNPATH_PROJECT_SLUG` (`apex-supervision`) et `SIGNPATH_SIGNING_POLICY_SLUG` (`release-signing`).
+5. **Étiqueter une version et approuver la signature** :
+   Créer et pousser l'étiquette de publication (ex. `v0.4.0-alpha.2`). Le job CI soumettra la demande de signature. Le propriétaire reçoit une notification et approuve manuellement la signature dans l'interface SignPath. Les binaires signés sont ensuite intégrés à l'installateur et publiés dans la GitHub Release.
+
+> **Remarque : signature locale ou certificat OV / EV alternatif**
+> La chaîne de construction conserve la prise en charge de la signature Authenticode locale via `packaging/windows/signer.ps1` et `build-installer.ps1 -Signer` :
+> - Certificat PFX : variables `APEX_SIGN_PFX` et `APEX_SIGN_PFX_PASSWORD` (ou secrets CI `APEX_SIGN_PFX_BASE64` et `APEX_SIGN_PFX_PASSWORD`) ;
+> - Certificat magasin / clé matérielle : `APEX_SIGN_THUMBPRINT` ;
+> - Azure Artifact Signing : `APEX_SIGN_ARTIFACT_METADATA`, `APEX_SIGNTOOL` et `APEX_SIGN_DLIB`.
+> En mode local ou avec un certificat d'essai auto-signé, définir `APEX_SIGN_TEST=1`.
+> Remarque sur SmartScreen : même avec un binaire signé, un nouvel éditeur peut devoir bâtir sa réputation auprès de Microsoft SmartScreen avant que les avertissements de premier téléchargement ne disparaissent totalement.
 
 ## 6. Ajouter un paramètre de configuration
 

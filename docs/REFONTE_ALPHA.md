@@ -356,7 +356,7 @@ Anomalie relevée, non corrigée : à la purge sur Ubuntu 22.04, dpkg affiche `d
 En plus des critères du §11 :
 - valider l'installateur Windows et le service sur Windows 10 et 11 (installation, mise à jour depuis une version antérieure, désinstallation avec et sans suppression des données) ;
 - le paquet DEB est validé en conteneur systemd sur Debian 12, Ubuntu 22.04 et 24.04 (§12.2). Restent à valider : des machines réelles, une mise à jour depuis une version antérieure du paquet, l'utilitaire sous Wayland et avec un GPU réel, et un premier passage de la CI sur GitHub. Sur Ubuntu 22.04, polkit 0.105 ignore la règle JavaScript : une authentification est demandée pour chaque action ;
-- licence du logiciel à définir (paquet marqué `LicenseRef-Proprietary`, aucune licence dans le dépôt) ;
+- licence du logiciel arrêtée en GPL-3.0-or-later (texte intégral dans `LICENSE`, métadonnées du workspace et paquet DEB à jour) ;
 - l'utilitaire lance des actions élevées par PowerShell (`Start-Process -Verb RunAs`) : seul le code de sortie est connu, pas le message détaillé ;
 - l'assistant permet d'ouvrir le serveur au réseau alors que les comptes d'usine (`admin/admin123`…) sont encore actifs : une étape « mot de passe administrateur » est à ajouter ;
 - tests automatisés de l'utilitaire desktop (les essais par UI Automation restent manuels) ; les tests d'intégration du serveur sont faits (`crates/apex-server/tests/`).
