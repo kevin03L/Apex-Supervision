@@ -142,57 +142,28 @@ begin
   Result := ServiceExistedBefore;
 end;
 
+procedure RunRequired(AppExe, Args: String);
+var Code: Integer;
+begin
+  if not Exec(AppExe, Args, '', SW_HIDE, ewWaitUntilTerminated, Code) then
+    RaiseException('Impossible de lancer : ' + Args);
+  Log(Format('%s : code %d', [Args, Code]));
+  if Code <> 0 then
+    RaiseException('Échec de ' + Args + ' (code ' + IntToStr(Code) + ')');
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
-var
-  Code: Integer;
-  AppExe: String;
+var AppExe: String;
 begin
   if CurStep = ssPostInstall then
   begin
     AppExe := ExpandConstant('{app}\{#EngineExe}');
-
-    // 1. Installation ou mise à jour du service (sans condition not ServiceExists)
-    Log('Exécution : service install');
-    if Exec(AppExe, 'service install', '', SW_HIDE, ewWaitUntilTerminated, Code) then
-    begin
-      Log(Format('service install : code %d', [Code]));
-      if Code <> 0 then
-        Log('Avertissement : code de retour non nul pour service install');
-    end
-    else
-      Log('Échec du lancement de service install');
-
-    // 2. Application des permissions sur %ProgramData%
-    Log('Exécution : service permissions');
-    if Exec(AppExe, 'service permissions', '', SW_HIDE, ewWaitUntilTerminated, Code) then
-      Log(Format('service permissions : code %d', [Code]))
-    else
-      Log('Échec du lancement de service permissions');
-
-    // 3. Migration si configuration existante
+    RunRequired(AppExe, 'service install');
+    RunRequired(AppExe, 'service permissions');
     if ConfigExists then
-    begin
-      Log('Exécution : config migrate');
-      if Exec(AppExe, ExpandConstant('config migrate --config "{#ConfigFile}"'), '', SW_HIDE, ewWaitUntilTerminated, Code) then
-        Log(Format('config migrate : code %d', [Code]))
-      else
-        Log('Échec du lancement de config migrate');
-    end;
-
-    // 4. Démarrage ou redémarrage du service
+      RunRequired(AppExe, ExpandConstant('config migrate --config "{#ConfigFile}"'));
     if ServiceWasRunning or ((not ServiceExisted) and ConfigExists) then
-    begin
-      Log('Exécution : service start');
-      if Exec(AppExe, 'service start', '', SW_HIDE, ewWaitUntilTerminated, Code) then
-      begin
-        Log(Format('service start : code %d', [Code]));
-        if Code <> 0 then
-          Log('Avertissement : le service n''a pas pu démarrer automatiquement (code ' + IntToStr(Code) + ')');
-      end
-      else
-        Log('Échec du lancement de service start');
-    end;
-
+      RunRequired(AppExe, 'service start');
     InstallDone := True;
   end;
 end;

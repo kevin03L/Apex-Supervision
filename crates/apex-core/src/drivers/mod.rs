@@ -955,6 +955,10 @@ impl IndustrialDriver for ModbusTcpDriver {
                 loop {
                     tokio::select! {
                         Some(cmd) = write_rx.recv() => {
+                        if core_ref.safe_mode {
+                            core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, "Mode sûr actif côté driver");
+                            continue;
+                        }
                             let start_w = Instant::now();
                             match execute_modbus_write(&mut ctx, &cmd).await {
                                 Ok(Ok(())) => {
@@ -1684,9 +1688,18 @@ impl IndustrialDriver for MqttDriver {
             let mut subscribed: std::collections::HashSet<String> = Default::default();
             let mut connected = false;
             let mut resync = tokio::time::interval(Duration::from_secs(2));
+            let mut retry_at = tokio::time::Instant::now();
             loop {
                 tokio::select! {
                     Some(cmd) = write_rx.recv() => {
+                        if core_ref.safe_mode {
+                            core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, "Mode sûr actif côté driver");
+                            continue;
+                        }
+                        if !connected {
+                            core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, "MQTT déconnecté");
+                            continue;
+                        }
                         let topic = mqtt_topic(&cmd.protocol_address).to_string();
                         if topic.contains(['+', '#']) {
                             core_ref.record_driver_write_rejected(
@@ -1697,7 +1710,7 @@ impl IndustrialDriver for MqttDriver {
                             continue;
                         }
                         match encode_mqtt_write_payload(&cmd.protocol_address, &cmd.value) {
-                            Ok(payload) => match client.publish(topic, QoS::AtLeastOnce, false, payload).await {
+                            Ok(payload) => match client.try_publish(topic, QoS::AtLeastOnce, false, payload) {
                                 Ok(()) => core_ref.record_driver_write_accepted(&config.id),
                                 Err(e) => core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, &e.to_string()),
                             },
@@ -1722,7 +1735,7 @@ impl IndustrialDriver for MqttDriver {
                             });
                         }
                     }
-                    ev = eventloop.poll() => {
+                    ev = async { tokio::time::sleep_until(retry_at).await; eventloop.poll().await } => {
                         match ev {
                             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                                 core_ref.record_driver_poll(&config.id, true, 5, None);
@@ -1750,16 +1763,7 @@ impl IndustrialDriver for MqttDriver {
                                 for tag in core_ref.get_tags_for_driver(&config.id) {
                                     let (topic, _) = mqtt_split_address(&tag.protocol_address);
                                     if mqtt_topic_matches(topic, &publish.topic) {
-                                        if let Some(val) = extract_mqtt_tag_value(&tag.protocol_address, &payload_str) {
-                                            if let Ok(coerced) = val.coerce_to(tag.data_type) {
-                                                let _ = core_tx.send(TagState {
-                                                    tag_id: tag.id.clone(),
-                                                    value: coerced,
-                                                    quality: Quality::Good,
-                                                    timestamp: Utc::now(),
-                                                }).await;
-                                            }
-                                        }
+                                        let _ = core_tx.send(mqtt_state(&tag, &payload_str)).await;
                                     }
                                 }
                             }
@@ -1769,7 +1773,7 @@ impl IndustrialDriver for MqttDriver {
                                 core_ref.record_driver_poll(&config.id, false, 0, Some(err.to_string()));
                                 let tags = core_ref.get_tags_for_driver(&config.id);
                                 publish_bad_disconnect_for_all(&tags, &core_tx).await;
-                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                retry_at = tokio::time::Instant::now() + Duration::from_secs(5);
                             }
                         }
                     }
@@ -1824,6 +1828,30 @@ pub async fn discover_driver_tags(config: &DriverConfig) -> Result<Vec<Registere
         return Err(why);
     }
     bacnet::discover(&config.id, &config.endpoint).await
+}
+
+/// Un message invalide dégrade immédiatement la qualité, y compris une clé JSON absente.
+fn mqtt_state(tag: &RegisteredTag, payload: &str) -> TagState {
+    let value = extract_mqtt_tag_value(&tag.protocol_address, payload)
+        .and_then(|v| v.coerce_to(tag.data_type).ok());
+    TagState {
+        tag_id: tag.id.clone(),
+        quality: if value.is_some() {
+            Quality::Good
+        } else {
+            Quality::BadDisconnect
+        },
+        value: value.unwrap_or_else(|| fallback_value(tag.data_type)),
+        timestamp: Utc::now(),
+    }
+}
+
+pub fn check_mqtt_write(address: &str) -> Result<(), String> {
+    let topic = mqtt_topic(address);
+    if topic.is_empty() || topic.len() > u16::MAX as usize || topic.contains(['+', '#', '\0']) {
+        return Err("Sujet MQTT d'écriture invalide".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2168,5 +2196,31 @@ mod tests {
 
         assert_eq!(ok_tag.2, Quality::Good);
         assert_eq!(err_tag.2, Quality::BadDisconnect);
+    }
+
+    #[test]
+    fn vague2_mqtt_message_invalide_degrade_qualite() {
+        let mut tag = build_local_modbus_plc_config(15502).tags[0].clone();
+        tag.protocol_address = "capteur/temperature".into();
+        tag.data_type = TagDataType::Float;
+        for payload in ["NaN", "inf", "SENSOR_FAULT"] {
+            assert_eq!(mqtt_state(&tag, payload).quality, Quality::BadDisconnect);
+        }
+        assert_eq!(mqtt_state(&tag, "12.5").quality, Quality::Good);
+        for address in ["", "bat/+/cmd", "bat/#", "nul\0cmd"] {
+            assert!(check_mqtt_write(address).is_err());
+        }
+        assert!(check_mqtt_write("bat/cmd").is_ok());
+    }
+    #[test]
+    fn vague2_mqtt_publication_file_pleine_non_bloquante() {
+        let (client, _eventloop) =
+            AsyncClient::new(MqttOptions::new("essai", "127.0.0.1", 18830), 1);
+        client
+            .try_publish("test", QoS::AtLeastOnce, false, "1")
+            .unwrap();
+        assert!(client
+            .try_publish("test", QoS::AtLeastOnce, false, "2")
+            .is_err());
     }
 }

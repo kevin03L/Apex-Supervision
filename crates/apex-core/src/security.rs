@@ -88,6 +88,11 @@ pub fn is_password_hash(stored: &str) -> bool {
 }
 
 pub fn validate_new_password(plain: &str) -> Result<(), ScadaError> {
+    if plain.len() > 256 {
+        return Err(ScadaError::BadRequest(
+            "Le mot de passe ne doit pas dépasser 256 octets".into(),
+        ));
+    }
     if plain.chars().count() < MIN_PASSWORD_LEN {
         return Err(ScadaError::BadRequest(format!(
             "Le mot de passe doit contenir au moins {} caractères",
@@ -869,6 +874,15 @@ fn push_escaped(out: &mut String, s: &str, attribute: bool) {
 // TESTS
 // ============================================================================
 
+/// Le schéma HTTP est insensible à la casse, le jeton reste strictement inchangé.
+pub fn bearer_token(raw: &str) -> &str {
+    let raw = raw.trim();
+    match raw.split_once(' ') {
+        Some((scheme, token)) if scheme.eq_ignore_ascii_case("Bearer") => token.trim(),
+        _ => raw,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1192,5 +1206,15 @@ mod tests {
         assert!(clean.contains(r#"style="fill:url(#rg);stroke:currentColor;stroke-width:3""#));
         assert!(clean.contains("P&amp;1</text>"));
         assert_eq!(sanitize_svg(&clean).unwrap(), clean);
+    }
+
+    #[test]
+    fn vague2_politique_mot_de_passe_et_bearer() {
+        assert!(validate_new_password(&"a".repeat(256)).is_ok());
+        assert!(validate_new_password(&"a".repeat(257)).is_err());
+        assert!(validate_new_password(&"é".repeat(129)).is_err());
+        for schema in ["Bearer", "bearer", "bEaReR"] {
+            assert_eq!(bearer_token(&format!("{schema} Secret")), "Secret");
+        }
     }
 }

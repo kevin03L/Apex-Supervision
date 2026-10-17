@@ -732,7 +732,10 @@ pub fn to_app_value(addr: &BacnetAddress, value: &TagValue) -> Result<AppValue, 
             TagValue::Bool(b) => AppValue::Boolean(*b),
             TagValue::Int(i) if *i >= 0 => AppValue::Unsigned(*i as u64),
             TagValue::Int(i) => AppValue::Signed(*i),
-            TagValue::Float(f) => AppValue::Real(*f as f32),
+            TagValue::Float(f) if f.is_finite() && f.abs() <= f32::MAX as f64 => {
+                AppValue::Real(*f as f32)
+            }
+            TagValue::Float(_) => return Err("Valeur hors de la plage REAL".into()),
             TagValue::Text(s) => AppValue::CharString(s.clone()),
         });
     }
@@ -848,6 +851,10 @@ impl BacnetDriver {
                 loop {
                     tokio::select! {
                         Some(cmd) = write_rx.recv() => {
+                        if core_ref.safe_mode {
+                            core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, "Mode sûr actif côté driver");
+                            continue;
+                        }
                             let started = Instant::now();
                             let prepared = BacnetAddress::parse(&cmd.protocol_address)
                                 .and_then(|a| to_app_value(&a, &cmd.value).map(|v| (a, v)));
@@ -1264,5 +1271,18 @@ mod tests {
         // 5. Invoke ID différent -> ignoré (None)
         let other_apdu = vec![0x30, invoke + 1, service, 0x00];
         assert!(BacnetClient::handle_apdu_reply(&other_apdu, invoke, service).is_none());
+    }
+
+    #[test]
+    fn vague2_bacnet_propriete_secondaire_refuse_non_finis() {
+        let addr = BacnetAddress {
+            object_type: 2,
+            instance: 1,
+            property: 111,
+            priority: 16,
+        };
+        for v in [f64::NAN, f64::INFINITY, f64::MAX] {
+            assert!(to_app_value(&addr, &TagValue::Float(v)).is_err());
+        }
     }
 }

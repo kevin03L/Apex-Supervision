@@ -737,6 +737,10 @@ impl S7Driver {
                 loop {
                     tokio::select! {
                         Some(cmd) = write_rx.recv() => {
+                        if core_ref.safe_mode {
+                            core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, "Mode sûr actif côté driver");
+                            continue;
+                        }
                             let started = Instant::now();
                             // Interprétation de l'adresse selon le type de la variable (comme en lecture)
                             let data_type = core_ref

@@ -295,6 +295,8 @@ impl Connection {
             .map_err(|e| format!("Endpoint OPC-UA refusé : {}", e))?;
         session.disable_reconnects();
         let mut event_loop = event_loop.spawn();
+        // La garde couvre aussi l'abandon de la future avant la création de Connection.
+        let mut opening_guard = AbortOnDrop(Some(event_loop.abort_handle()));
         tokio::select! {
             status = &mut event_loop => {
                 let status = status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
@@ -302,7 +304,10 @@ impl Connection {
             }
             connected = tokio::time::timeout(OPCUA_TIMEOUT, session.wait_for_connection()) => {
                 match connected {
-                    Ok(true) => Ok(Connection { session, event_loop }),
+                    Ok(true) => {
+                        opening_guard.0.take();
+                        Ok(Connection { session, event_loop })
+                    }
                     _ => {
                         event_loop.abort();
                         Err(format!("Pas de réponse de {} en {} s", endpoint_url, OPCUA_TIMEOUT.as_secs()))
@@ -456,6 +461,10 @@ impl OpcUaDriver {
                     }
                     tokio::select! {
                         Some(cmd) = write_rx.recv() => {
+                        if core_ref.safe_mode {
+                            core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, "Mode sûr actif côté driver");
+                            continue;
+                        }
                             let started = Instant::now();
                             let node = match parse_node_id(&cmd.protocol_address) {
                                 Ok(n) => n,
@@ -601,6 +610,15 @@ async fn poll_opcua_tags(
     Ok(out)
 }
 
+struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,5 +732,13 @@ mod tests {
                 assert!(handle.is_finished());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn vague2_annulation_ouverture_annule_tache() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let guard = AbortOnDrop(Some(task.abort_handle()));
+        drop(guard);
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 }

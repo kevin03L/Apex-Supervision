@@ -109,9 +109,6 @@ impl FlowEngineRuntime {
                     cov_res = cov_rx.recv() => {
                         match cov_res {
                             Ok(tag_state) => {
-                                if tag_state.quality != Quality::Good || core.is_acquisition_paused() {
-                                    continue;
-                                }
                                 evaluate_flows_for_tag(&core, &tag_state, &rhai_engine).await;
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -169,52 +166,68 @@ pub fn build_industrial_rhai_engine(core: Arc<ScadaCore>) -> Engine {
     apply_rhai_sandbox(&mut engine);
 
     let core_for_num = Arc::clone(&core);
-    engine.register_fn("tag", move |tag_id: &str| -> f64 {
-        if core_for_num.is_acquisition_paused() {
-            return 0.0;
-        }
-        core_for_num
-            .tags_state
-            .get(tag_id)
-            .filter(|s| s.quality == Quality::Good)
-            .and_then(|s| s.value.as_f64())
-            .unwrap_or(0.0)
-    });
+    engine.register_fn(
+        "tag",
+        move |tag_id: &str| -> Result<f64, Box<rhai::EvalAltResult>> {
+            if core_for_num.is_acquisition_paused() {
+                return Err("Acquisition en pause".into());
+            }
+            core_for_num
+                .tags_state
+                .get(tag_id)
+                .filter(|s| s.quality == Quality::Good)
+                .and_then(|s| s.value.as_f64())
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| "Variable numérique indisponible".into())
+        },
+    );
 
     let core_for_bool = Arc::clone(&core);
-    engine.register_fn("tag_bool", move |tag_id: &str| -> bool {
-        if core_for_bool.is_acquisition_paused() {
-            return false;
-        }
-        core_for_bool
-            .tags_state
-            .get(tag_id)
-            .filter(|s| s.quality == Quality::Good)
-            .and_then(|s| s.value.as_bool())
-            .unwrap_or(false)
-    });
+    engine.register_fn(
+        "tag_bool",
+        move |tag_id: &str| -> Result<bool, Box<rhai::EvalAltResult>> {
+            if core_for_bool.is_acquisition_paused() {
+                return Err("Acquisition en pause".into());
+            }
+            core_for_bool
+                .tags_state
+                .get(tag_id)
+                .filter(|s| s.quality == Quality::Good)
+                .and_then(|s| s.value.as_bool())
+                .ok_or_else(|| "Variable booléenne indisponible".into())
+        },
+    );
 
     let core_for_text = Arc::clone(&core);
-    engine.register_fn("tag_text", move |tag_id: &str| -> String {
-        if core_for_text.is_acquisition_paused() {
-            return String::new();
-        }
-        core_for_text
-            .tags_state
-            .get(tag_id)
-            .filter(|s| s.quality == Quality::Good)
-            .map(|s| match &s.value {
-                TagValue::Text(t) => t.clone(),
-                TagValue::Bool(b) => b.to_string(),
-                TagValue::Int(i) => i.to_string(),
-                TagValue::Float(f) => f.to_string(),
-            })
-            .unwrap_or_default()
-    });
+    engine.register_fn(
+        "tag_text",
+        move |tag_id: &str| -> Result<String, Box<rhai::EvalAltResult>> {
+            if core_for_text.is_acquisition_paused() {
+                return Err("Acquisition en pause".into());
+            }
+            core_for_text
+                .tags_state
+                .get(tag_id)
+                .filter(|s| s.quality == Quality::Good)
+                .map(|s| match &s.value {
+                    TagValue::Text(t) => t.clone(),
+                    TagValue::Bool(b) => b.to_string(),
+                    TagValue::Int(i) => i.to_string(),
+                    TagValue::Float(f) => f.to_string(),
+                })
+                .ok_or_else(|| "Variable texte indisponible".into())
+        },
+    );
 
-    engine.register_fn("clamp", |val: f64, min_v: f64, max_v: f64| -> f64 {
-        val.clamp(min_v, max_v)
-    });
+    engine.register_fn(
+        "clamp",
+        |val: f64, min_v: f64, max_v: f64| -> Result<f64, Box<rhai::EvalAltResult>> {
+            if !val.is_finite() || !min_v.is_finite() || !max_v.is_finite() || min_v > max_v {
+                return Err("Bornes ou valeur de clamp invalides".into());
+            }
+            Ok(val.clamp(min_v, max_v))
+        },
+    );
 
     engine
 }
@@ -231,6 +244,9 @@ pub async fn trigger_flow_now(core: &Arc<ScadaCore>, flow_id: &str) -> Result<us
         .map(|f| f.clone())
         .ok_or_else(|| format!("Flux '{}' introuvable", flow_id))?;
 
+    core.flow_runtime
+        .gate_inputs
+        .retain(|key, _| !key.starts_with(&format!("{}/", flow.id)));
     let rhai_engine = shared_engine(core);
     let mut executed = 0usize;
 
@@ -260,6 +276,18 @@ async fn evaluate_all_enabled_flows_once(core: &Arc<ScadaCore>, rhai_engine: &Ar
         .collect();
 
     for flow in active_flows {
+        if flow.nodes.iter().any(|n| match &n.kind {
+            FlowNodeKind::TagInput { tag_id } => !core
+                .tags_state
+                .get(tag_id)
+                .is_some_and(|s| s.quality == Quality::Good),
+            _ => false,
+        }) {
+            core.flow_runtime.forget_flow(&flow.id);
+        }
+        core.flow_runtime
+            .gate_inputs
+            .retain(|key, _| !key.starts_with(&format!("{}/", flow.id)));
         for node in &flow.nodes {
             if let FlowNodeKind::TagInput { tag_id } = &node.kind {
                 if let Some(st) = core.tags_state.get(tag_id).map(|s| s.clone()) {
@@ -277,31 +305,10 @@ async fn evaluate_flows_for_tag(
     tag_state: &TagState,
     rhai_engine: &Arc<Engine>,
 ) {
-    if tag_state.quality != Quality::Good || core.is_acquisition_paused() {
-        return;
-    }
-    // Seuls les flux qui lisent ce tag sont copiés (évite de cloner tous les graphes à chaque COV)
-    let listens_to_tag = |f: &FlowGraph| {
-        f.nodes.iter().any(
-            |n| matches!(&n.kind, FlowNodeKind::TagInput { tag_id } if tag_id == &tag_state.tag_id),
-        )
-    };
-    let active_flows: Vec<FlowGraph> = core
-        .flows
-        .iter()
-        .filter(|f| f.value().enabled && listens_to_tag(f.value()))
-        .map(|f| f.value().clone())
-        .collect();
-
-    for flow in active_flows {
-        for start_node in &flow.nodes {
-            if let FlowNodeKind::TagInput { tag_id } = &start_node.kind {
-                if tag_id == &tag_state.tag_id {
-                    run_flow_from_entry_node(core, &flow, start_node, tag_state, rhai_engine).await;
-                }
-            }
-        }
-    }
+    // Une lecture Rhai peut dépendre de tout tag : reconstruire les entrées des portes
+    // à chaque évaluation évite de réutiliser une autorisation devenue indisponible.
+    let _ = tag_state;
+    evaluate_all_enabled_flows_once(core, rhai_engine).await;
 }
 
 async fn run_flow_from_entry_node(
@@ -325,7 +332,7 @@ async fn run_flow_from_entry_node(
     while let Some((current_node_id, upstream_node_id, current_val, depth)) = queue.pop() {
         if depth >= MAX_FLOW_DEPTH {
             warn!("Profondeur maximale DAG atteinte sur '{}'", flow.id);
-            break;
+            continue;
         }
 
         let Some(current_node) = flow.nodes.iter().find(|n| n.id == current_node_id) else {
@@ -412,6 +419,11 @@ async fn run_flow_from_entry_node(
                 max_out,
                 reverse_acting,
             } => {
+                if ![kp, ki, kd, min_out, max_out].iter().all(|v| v.is_finite())
+                    || min_out > max_out
+                {
+                    continue;
+                }
                 let Some(pv) = current_val.as_f64() else {
                     continue;
                 };
@@ -425,7 +437,7 @@ async fn run_flow_from_entry_node(
                             // Consigne présente mais non Good (Uncertain ou BadDisconnect) : ne pas réguler
                             continue;
                         }
-                        None => 21.0,
+                        None => continue,
                     }
                 } else {
                     21.0
@@ -468,6 +480,15 @@ async fn run_flow_from_entry_node(
                     .entry(qualified_node_key.clone())
                     .or_default();
                 inputs_map.insert(upstream_node_id.clone(), in_bool);
+
+                if flow
+                    .edges
+                    .iter()
+                    .filter(|e| e.to_node == current_node.id)
+                    .any(|e| !inputs_map.contains_key(&e.id))
+                {
+                    continue;
+                }
 
                 let vals: Vec<bool> = inputs_map.values().copied().collect();
                 let result_bool = match gate {
@@ -533,6 +554,9 @@ async fn run_flow_from_entry_node(
                     }
                     // Un seul avertissement par nœud en échec, jusqu'au retour à la normale
                     Err(err) => {
+                        core.flow_runtime
+                            .timer_since
+                            .retain(|key, _| !key.starts_with(&format!("{}/", flow.id)));
                         if core.flow_runtime.failing_scripts.insert(key, ()).is_none() {
                             warn!(
                                 "Erreur Rhai dans le nœud '{}' (flux '{}') : {} (avertissement unique jusqu'au rétablissement)",
@@ -597,16 +621,22 @@ async fn run_flow_from_entry_node(
             }
         }
 
-        if let FlowNodeKind::Threshold { .. } = &current_node.kind {
+        if matches!(
+            &current_node.kind,
+            FlowNodeKind::Threshold { .. }
+                | FlowNodeKind::Hysteresis { .. }
+                | FlowNodeKind::LogicGate { .. }
+        ) {
             let cond = match next_value {
                 TagValue::Bool(b) => b,
                 _ => false,
             };
             for edge in flow.edges.iter().filter(|e| e.from_node == current_node.id) {
                 let (edge_val, port_name) = match edge.from_port.as_str() {
-                    "true" => (TagValue::Bool(cond), "true"),
-                    "false" => (TagValue::Bool(!cond), "false"),
-                    _ => (TagValue::Bool(cond), "out"),
+                    "true" if cond => (TagValue::Bool(true), "true"),
+                    "false" if !cond => (TagValue::Bool(true), "false"),
+                    "out" => (TagValue::Bool(cond), "out"),
+                    _ => continue,
                 };
                 core.emit_flow_trace(FlowExecutionTrace {
                     flow_id: flow.id.clone(),
@@ -617,12 +647,7 @@ async fn run_flow_from_entry_node(
                     timestamp: Utc::now(),
                 });
 
-                queue.push((
-                    edge.to_node.clone(),
-                    current_node.id.clone(),
-                    edge_val,
-                    depth + 1,
-                ));
+                queue.push((edge.to_node.clone(), edge.id.clone(), edge_val, depth + 1));
             }
             continue;
         }
@@ -648,7 +673,7 @@ async fn run_flow_from_entry_node(
 
             queue.push((
                 edge.to_node.clone(),
-                current_node.id.clone(),
+                edge.id.clone(),
                 next_value.clone(),
                 depth + 1,
             ));
@@ -1155,11 +1180,10 @@ mod tests {
         core.register_tag(internal_tag("INT.Mesure", 0.0), None);
         let engine = shared_engine(&core);
 
-        // 1. Rhai : tag() et tag_bool() renvoient les valeurs de repli tant que la qualité n'est pas Good
-        let val: f64 = engine.eval(r#"tag("INT.Mesure")"#).unwrap();
-        assert_eq!(val, 0.0);
-        let b: bool = engine.eval(r#"tag_bool("INT.Mesure")"#).unwrap();
-        assert!(!b);
+        // Aucune valeur de repli ne doit autoriser une commande.
+        assert!(engine.eval::<f64>(r#"tag("INT.Mesure")"#).is_err());
+        assert!(engine.eval::<bool>(r#"tag_bool("INT.Mesure")"#).is_err());
+        assert!(engine.eval::<String>(r#"tag_text("INT.Mesure")"#).is_err());
 
         // Mise à jour en Quality::Good
         core.tags_state.insert(
@@ -1174,10 +1198,9 @@ mod tests {
         let val: f64 = engine.eval(r#"tag("INT.Mesure")"#).unwrap();
         assert_eq!(val, 42.5);
 
-        // Pause de l'acquisition : tag() doit renvoyer 0.0
+        // Pause : la lecture doit échouer.
         core.set_acquisition_paused("test", true);
-        let val: f64 = engine.eval(r#"tag("INT.Mesure")"#).unwrap();
-        assert_eq!(val, 0.0);
+        assert!(engine.eval::<f64>(r#"tag("INT.Mesure")"#).is_err());
         core.set_acquisition_paused("test", false);
 
         // 2. PidController : ne régule pas si le tag de consigne est en Uncertain
@@ -1441,7 +1464,7 @@ mod tests {
                 FlowEdge {
                     id: "e2".into(),
                     from_node: "th".into(),
-                    from_port: "true".into(),
+                    from_port: "out".into(),
                     to_node: "out".into(),
                     to_port: "in".into(),
                 },
@@ -1462,9 +1485,10 @@ mod tests {
         .await;
         assert_eq!(out(&core), TagValue::Bool(true));
 
-        // 2e coup : 5.0 <= 10.0 => la branche "true" reçoit le front descendant Bool(false)
+        // 2e coup : 5.0 <= 10.0 => la sortie "out" reçoit le front descendant Bool(false)
         run_flow_from_entry_node(&core, &flow, &flow.nodes[0], &input("INT.In", 5.0), &engine)
             .await;
         assert_eq!(out(&core), TagValue::Bool(false));
     }
+    include!("flow_vague2_tests.rs");
 }

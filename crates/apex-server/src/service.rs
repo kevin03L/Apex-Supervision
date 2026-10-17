@@ -208,13 +208,17 @@ fn install(config: Option<PathBuf>) -> Result<String, String> {
                     if let Some(cfg) = &config {
                         bin_cmd.push_str(&format!(" --config \"{}\"", cfg.display()));
                     }
-                    let _ = std::process::Command::new("sc.exe")
+                    let result = std::process::Command::new("sc.exe")
                         .args([
                             "config",
                             version::SERVICE_NAME,
                             &format!("binPath= {}", bin_cmd),
                         ])
-                        .output();
+                        .output()
+                        .map_err(|e| format!("Mise à jour du service impossible : {}", e))?;
+                    if !result.status.success() {
+                        return Err("Échec de mise à jour du service".into());
+                    }
                     s
                 }
                 Err(_) => return Err(format!("création du service impossible : {}", explain(&e))),

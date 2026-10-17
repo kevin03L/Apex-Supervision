@@ -693,6 +693,14 @@ function updateWidgetProp(prop, val) {
   const w = findDashboardWidget(state.selectedWidgetId);
   if (!w) return;
   if (!w.properties) w.properties = {};
+  if (prop === 'min' || prop === 'max') {
+    const min = prop === 'min' ? val : (w.properties.min ?? 0);
+    const max = prop === 'max' ? val : (w.properties.max ?? 100);
+    if (!Number.isFinite(min) || !Number.isFinite(max) || min > max) {
+      notify('Bornes invalides : le minimum doit être inférieur ou égal au maximum.', 'error');
+      return;
+    }
+  }
   w.properties[prop] = val;
   renderDashboard();
 }
@@ -918,7 +926,6 @@ function buildWidgetBodyHtml(w) {
 
   if (w.widget_type === 'IndicatorLed') {
     const ledColor = boolVal ? '#ef4444' : '#10b981';
-    const allowWrite = canWrite();
     return `
       <div style="display:flex;align-items:center;gap:10px;">
         <div style="width:22px;height:22px;border-radius:50%;background:${ledColor};box-shadow:0 0 14px ${ledColor};"></div>
@@ -1118,6 +1125,7 @@ function buildWidgetBodyHtml(w) {
   }
 
   if (w.widget_type === 'PushButton') {
+    if (!allowWrite) return '<span class="badge syn-badge-ro">Lecture seule</span>';
     // Bouton impulsionnel : un premier appui l'arme (sélection), l'impulsion part ensuite tant
     // que le bouton est maintenu, dans le délai de sélection
     const armed = state.armedCommand && state.armedCommand.widgetId === w.id;
@@ -1128,7 +1136,7 @@ function buildWidgetBodyHtml(w) {
               onmouseleave="if (event.buttons & 1) pulseCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, false)"
               ontouchstart="event.preventDefault(); pulseCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, true)"
               ontouchend="event.preventDefault(); pulseCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, false)">
-        ${armed ? 'ARMÉ : MAINTENIR POUR L\'IMPULSION' : 'IMPULSION MARCHE'}
+        ${armed ? 'ARMÉ : IMPULSION DE 1 SECONDE' : 'IMPULSION MARCHE'}
       </button>
       <div class="widget-tag-sub" style="margin-top:6px;">${esc(w.bound_tag_id) || 'Bouton Impulsion'}</div>
     `;
@@ -1307,16 +1315,6 @@ function cancelCommand(announce = true) {
   if (bar) bar.remove();
   if (c) {
     refreshArmedWidget(c.widgetId);
-    if (c.pressed) {
-      c.pressed = false;
-      const writePromise = c.pendingWrite;
-      (async () => {
-        if (writePromise) {
-          try { await writePromise; } catch (_) {}
-        }
-        await sendWriteTag(c.tagId, false);
-      })();
-    }
     if (announce) notify('Commande annulée : rien n\'a été envoyé');
   }
 }
@@ -1340,29 +1338,14 @@ async function pulseCommand(widgetId, tagId, down) {
       selectCommand(widgetId, tagId, true, true);
       return;
     }
+    if (c.pressed) return;
     c.pressed = true;
-    renderCommandBar();
-    cleanupGlobalPulseListeners();
-    const releaseHandler = () => {
-      cleanupGlobalPulseListeners();
-      pulseCommand(widgetId, tagId, false);
-    };
-    window.__pulseReleaseHandler = releaseHandler;
-    window.addEventListener('mouseup', releaseHandler);
-    window.addEventListener('touchend', releaseHandler);
-    window.addEventListener('touchcancel', releaseHandler);
-
-    c.pendingWrite = sendWriteTag(tagId, true);
-    await c.pendingWrite;
-  } else if (armed && c.pressed) {
-    cleanupGlobalPulseListeners();
-    c.pressed = false;
-    const writePromise = c.pendingWrite;
     cancelCommand(false);
-    if (writePromise) {
-      try { await writePromise; } catch (_) {}
-    }
-    if (await sendWriteTag(tagId, false)) notify(`Impulsion envoyée : ${c.title}`);
+    try {
+      const response = await fetch(`/api/tags/${encodeURIComponent(tagId)}/pulse`, { method: 'POST' });
+      if (!response.ok) throw new Error('Impulsion refusée par le serveur');
+      notify('Impulsion de 1 seconde envoyée, remise à zéro gérée par le serveur');
+    } catch (e) { notify(e.message, 'error'); }
   }
 }
 
@@ -1401,7 +1384,7 @@ function renderCommandBar() {
     document.body.appendChild(bar);
   }
   const what = c.momentary
-    ? `Bouton impulsionnel armé : <b>${esc(c.title)}</b> (${esc(c.tagId)}). Maintenez le bouton pour envoyer l'impulsion.`
+    ? `Bouton impulsionnel armé : <b>${esc(c.title)}</b> (${esc(c.tagId)}). Appuyez pour envoyer une impulsion de 1 seconde.`
     : `Commande sélectionnée : <b>${esc(c.title)}</b> (${esc(c.tagId)}) → <b class="cmd-value">${esc(describeCommandValue(c.tagId, c.value))}</b>`;
   bar.innerHTML = `
     <span class="cmd-text">${what}</span>

@@ -242,3 +242,7 @@ sudo systemctl start apex-scada
 | Moteur joignable ? | `curl http://127.0.0.1:3000/api/health` |
 
 L'onglet « Diagnostics » de l'utilitaire enchaîne toutes ces vérifications et produit un rapport à joindre à une demande d'assistance.
+
+Si l'assistant de première configuration est annulé, le service reste arrêté.
+Terminez la configuration dans l'utilitaire d'administration, puis démarrez le service
+avec cet utilitaire ou la commande `apex-scada service start` avant de quitter le poste.

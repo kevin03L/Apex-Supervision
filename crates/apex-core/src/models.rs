@@ -131,6 +131,9 @@ impl TagValue {
     }
 
     pub fn coerce_to(&self, target: TagDataType) -> Result<TagValue, ScadaError> {
+        if matches!(self, TagValue::Float(f) if !f.is_finite()) {
+            return Err(ScadaError::BadRequest("Valeur non finie interdite".into()));
+        }
         match (self, target) {
             (TagValue::Bool(b), TagDataType::Bool) => Ok(TagValue::Bool(*b)),
             (TagValue::Int(i), TagDataType::Int) => Ok(TagValue::Int(*i)),
@@ -138,7 +141,8 @@ impl TagValue {
             (TagValue::Text(s), TagDataType::Text) => Ok(TagValue::Text(s.clone())),
             (TagValue::Int(i), TagDataType::Float) => Ok(TagValue::Float(*i as f64)),
             (TagValue::Float(f), TagDataType::Int) => {
-                if !f.is_finite() {
+                if !f.is_finite() || f.round() < i64::MIN as f64 || f.round() >= -(i64::MIN as f64)
+                {
                     return Err(ScadaError::TypeMismatch {
                         expected: "Int (fini)".to_string(),
                         actual: format!("{:?}", f),
@@ -155,18 +159,19 @@ impl TagValue {
                         actual: format!("{:?}", other),
                     })
             }
-            (other, TagDataType::Float) => {
-                other
-                    .as_f64()
-                    .map(TagValue::Float)
-                    .ok_or_else(|| ScadaError::TypeMismatch {
-                        expected: "Float".to_string(),
-                        actual: format!("{:?}", other),
-                    })
-            }
-            (other, TagDataType::Int) => other
+            (other, TagDataType::Float) => other
                 .as_f64()
                 .filter(|v| v.is_finite())
+                .map(TagValue::Float)
+                .ok_or_else(|| ScadaError::TypeMismatch {
+                    expected: "Float".to_string(),
+                    actual: format!("{:?}", other),
+                }),
+            (other, TagDataType::Int) => other
+                .as_f64()
+                .filter(|v| {
+                    v.is_finite() && v.round() >= i64::MIN as f64 && v.round() < -(i64::MIN as f64)
+                })
                 .map(|v| TagValue::Int(v.round() as i64))
                 .ok_or_else(|| ScadaError::TypeMismatch {
                     expected: "Int (fini)".to_string(),
@@ -630,6 +635,9 @@ pub struct ScheduleRule {
     pub start_time: String,
     /// Heure de fin au format `"HH:MM"` (ex: `"19:00"`).
     pub end_time: String,
+    /// Journée complète explicite, sans modifier le sens des anciens créneaux vides.
+    #[serde(default)]
+    pub full_day: bool,
     /// Valeur appliquée pendant la plage active (Mode Confort).
     pub active_value: TagValue,
     /// Valeur appliquée hors plage (Mode Réduit / Nuit).
@@ -672,6 +680,9 @@ impl ScheduleRule {
     /// et une heure `"HH:MM"` donnés. Une plage qui passe minuit (ex. 22:00 → 06:00) est
     /// rattachée à son jour de début.
     pub fn is_active_at(&self, weekday: u8, hhmm: &str) -> bool {
+        if self.full_day {
+            return self.days.contains(&weekday);
+        }
         let yesterday = if weekday <= 1 { 7 } else { weekday - 1 };
         let today_on = self.days.contains(&weekday);
         if self.start_time <= self.end_time {
@@ -1144,6 +1155,7 @@ mod tests {
             target_tag_id: "t".into(),
             start_time: start.into(),
             end_time: end.into(),
+            full_day: false,
             active_value: TagValue::Float(1.0),
             inactive_value: TagValue::Float(0.0),
             enabled: true,
@@ -1209,5 +1221,20 @@ mod tests {
         let cfg: TagAlarmConfig = serde_json::from_str(r#"{"enabled":true,"high":27.0}"#).unwrap();
         assert!(!cfg.shelving_disabled);
         assert!(cfg.deadband.is_none());
+    }
+
+    #[test]
+    fn vague2_conversions_refusent_non_finis_et_saturation() {
+        for v in [
+            TagValue::Text("NaN".into()),
+            TagValue::Text("inf".into()),
+            TagValue::Float(f64::INFINITY),
+        ] {
+            assert!(v.coerce_to(TagDataType::Float).is_err());
+            assert!(v.coerce_to(TagDataType::Int).is_err());
+        }
+        for v in [1e30, -1e30, -(i64::MIN as f64)] {
+            assert!(TagValue::Float(v).coerce_to(TagDataType::Int).is_err());
+        }
     }
 }

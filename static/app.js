@@ -762,6 +762,13 @@ function connectRealtimeSocket() {
     try { msg = JSON.parse(evt.data); } catch (_) { return; }
 
     if (msg.event === 'InitialSnapshot') {
+      cancelCommand(false);
+      state.tags = {};
+      state.flows = msg.data.flows || [];
+      // Retirer immédiatement les anciennes liaisons avant le rechargement asynchrone.
+      state.dashboards = [];
+      state.symbols = [];
+      reloadProjectResources();
       msg.data.tags.forEach(t => { state.tags[t.id] = t; });
       state.alarms = msg.data.alarms || [];
       if (state.currentUser && state.currentUser.role !== 'Viewer') {
@@ -1709,7 +1716,7 @@ function renderDriversCardsOnly() {
           <button class="btn" onclick="restartDriver(${id})">Redémarrer</button>
           <button class="btn" onclick="editDriverInForm(${id})">Modifier</button>
           ${canDiscoverTags(d)
-            ? `<button class="btn" onclick="browseDriverTags(${id})" title="Catalogue de démonstration du protocole simulé">Découvrir</button>`
+            ? `<button class="btn" onclick="browseDriverTags(${id})" title="Découvrir les objets BACnet/IP">Découvrir</button>`
             : ''}
           <button class="btn btn-danger" onclick="deleteDriver(${id})">Suppr.</button>
         </div>
@@ -1911,7 +1918,7 @@ async function browseDriverTags(driverId) {
     renderTagCatalogTable();
     populateHistorianSelect();
     populateScheduleTagSelect();
-    notify(`${discovered.length} variable(s) de démonstration ajoutée(s)`);
+    notify(`${discovered.length} variable(s) découverte(s) et ajoutée(s) au catalogue`);
   } else {
     notify(await apiError(res), 'error');
   }
@@ -2130,7 +2137,7 @@ function renderSchedulesTable() {
       <td><b>${esc(s.name)}</b></td>
       <td class="mono" style="color:var(--accent);">${esc(s.target_tag_id)}</td>
       <td>${esc(formatDays(s.days))}</td>
-      <td class="mono">${esc(s.start_time)} → ${esc(s.end_time)}</td>
+      <td class="mono">${s.full_day ? 'Journée complète (24 h)' : `${esc(s.start_time)} → ${esc(s.end_time)}`}</td>
       <td class="mono" style="color:var(--run);font-weight:700;">${esc(JSON.stringify(s.active_value))}</td>
       <td class="mono" style="color:var(--muted);">${esc(JSON.stringify(s.inactive_value))}</td>
       <td>${scheduleStatusBadge(s)}</td>
@@ -2151,6 +2158,7 @@ function openNewScheduleModal() {
   document.getElementById('schedName').value = '';
   document.getElementById('schedStart').value = '07:00';
   document.getElementById('schedEnd').value = '19:00';
+  document.getElementById('schedFullDay').checked = false;
   updateScheduleValueInputs();
   const selTag = state.tags[document.getElementById('schedTagSelect').value];
   if (selTag && selTag.data_type === 'Bool') {
@@ -2175,6 +2183,7 @@ function editScheduleInForm(id) {
   updateScheduleValueInputs();
   document.getElementById('schedStart').value = s.start_time;
   document.getElementById('schedEnd').value = s.end_time;
+  document.getElementById('schedFullDay').checked = !!s.full_day;
   document.getElementById('schedActiveVal').value = String(s.active_value);
   document.getElementById('schedInactiveVal').value = String(s.inactive_value);
   renderScheduleDaysPicker(Array.isArray(s.days) ? s.days : [1, 2, 3, 4, 5, 6, 7]);
@@ -2206,30 +2215,15 @@ async function createScheduleRule() {
   }
   const tagId = document.getElementById('schedTagSelect').value;
   const targetTag = state.tags[tagId];
-  const isBool = targetTag && targetTag.data_type === 'Bool';
-  const isInt = targetTag && targetTag.data_type === 'Int';
-  const rawActive = document.getElementById('schedActiveVal').value.trim();
-  const rawInactive = document.getElementById('schedInactiveVal').value.trim();
-
   let active_value;
   let inactive_value;
-  if (isBool) {
-    active_value = (rawActive.toLowerCase() === 'true' || rawActive === '1');
-    inactive_value = (rawInactive.toLowerCase() === 'true' || rawInactive === '1');
-  } else if (isInt) {
-    active_value = parseInt(rawActive, 10);
-    inactive_value = parseInt(rawInactive, 10);
-    if (isNaN(active_value) || isNaN(inactive_value)) {
-      notify('Valeur de consigne entière invalide.', 'error');
-      return;
-    }
-  } else {
-    active_value = parseFloat(rawActive);
-    inactive_value = parseFloat(rawInactive);
-    if (isNaN(active_value) || isNaN(inactive_value)) {
-      notify('Valeur de consigne numérique invalide.', 'error');
-      return;
-    }
+  try {
+    active_value = parseInputForTag(targetTag.data_type, document.getElementById('schedActiveVal').value.trim());
+    inactive_value = parseInputForTag(targetTag.data_type, document.getElementById('schedInactiveVal').value.trim());
+    if (active_value === null || inactive_value === null) return;
+  } catch (e) {
+    notify(e.message, 'error');
+    return;
   }
 
   const existing = editingScheduleId && state.schedules.find(s => s.id === editingScheduleId);
@@ -2239,6 +2233,7 @@ async function createScheduleRule() {
     target_tag_id: tagId,
     start_time: document.getElementById('schedStart').value,
     end_time: document.getElementById('schedEnd').value,
+    full_day: document.getElementById('schedFullDay').checked,
     active_value,
     inactive_value,
     enabled: existing ? existing.enabled : true,
@@ -3057,4 +3052,19 @@ async function deleteCustomSymbol(id) {
   } else {
     notify(await apiError(res), 'error');
   }
+}
+
+let projectResourceGeneration = 0;
+async function reloadProjectResources() {
+  const generation = ++projectResourceGeneration;
+  const [dashboards, symbols] = await Promise.all([
+    getJson('/api/dashboards', []), getJson('/api/symbols', [])
+  ]);
+  if (generation !== projectResourceGeneration) return;
+  state.dashboards = dashboards;
+  state.symbols = symbols;
+  if (!dashboards.some(d => d.id === state.currentDashboardId)) {
+    state.currentDashboardId = dashboards[0]?.id || null;
+  }
+  renderDashboard();
 }

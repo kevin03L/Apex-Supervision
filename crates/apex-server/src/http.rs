@@ -148,6 +148,7 @@ pub fn router(state: AppState, web_dir: &FsPath) -> Router {
         .route("/api/tags", get(api_get_tags).post(api_upsert_tag))
         .route("/api/tags/:id", delete(api_delete_tag))
         .route("/api/tags/:id/write", post(api_write_tag))
+        .route("/api/tags/:id/pulse", post(api_pulse_tag))
         // --- DRIVERS ---
         .route("/api/drivers", get(api_get_drivers).post(api_add_driver))
         .route(
@@ -679,6 +680,23 @@ async fn api_delete_tag(
     require_supervisor(&user)?;
     state.core.delete_tag(&user.0.username, &tag_id).await?;
     Ok(Json(serde_json::json!({ "deleted": tag_id })))
+}
+
+async fn api_pulse_tag(
+    Path(tag_id): Path<String>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<TagState>, ApiError> {
+    require_supervisor(&user)?;
+    let updated = state.core.pulse_tag(&tag_id).await?;
+    state.core.record_audit(
+        &user.0.username,
+        "CONSIGNE",
+        "PULSE_TAG",
+        &tag_id,
+        "Impulsion de 1 seconde, extinction côté serveur",
+    );
+    Ok(Json(updated))
 }
 
 async fn api_write_tag(

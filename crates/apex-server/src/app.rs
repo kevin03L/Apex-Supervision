@@ -470,14 +470,21 @@ fn write_control_token(path: &std::path::Path, token: &str) -> std::io::Result<(
             .truncate(true)
             .mode(0o640)
             .open(path)?;
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o640))?;
         file.write_all(token.as_bytes())?;
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, token)?;
-    }
+
     #[cfg(windows)]
     {
+        // Recréer un fichier vide retire les ACL explicites d'un ancien jeton.
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
         // S-22: Sous Windows (mode manuel/portable), restreindre les ACL à SYSTEM, Administrateurs et compte courant
         let path_str = path.display().to_string();
         let username = std::env::var("USERNAME").unwrap_or_default();
@@ -491,9 +498,16 @@ fn write_control_token(path: &std::path::Path, token: &str) -> std::io::Result<(
         if !username.is_empty() {
             grant_args.push(format!("{}:(F)", username));
         }
-        let _ = std::process::Command::new("icacls")
+        let result = std::process::Command::new("icacls")
             .args(&grant_args)
-            .output();
+            .output()?;
+        if !result.status.success() {
+            return Err(std::io::Error::other(
+                "Restriction des permissions du jeton impossible",
+            ));
+        }
+        use std::io::Write;
+        file.write_all(token.as_bytes())?;
     }
     Ok(())
 }
@@ -570,6 +584,25 @@ mod tests {
         write_control_token(&token_path, token_value).expect("écriture du jeton");
         let read = std::fs::read_to_string(&token_path).expect("lecture du jeton");
         assert_eq!(read, token_value);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&token_path).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+        #[cfg(windows)]
+        {
+            let result = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", "$allowed = @('S-1-5-18', 'S-1-5-32-544', [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value); $acl = Get-Acl -LiteralPath $env:APEX_TOKEN_TEST_PATH; if (!$acl.AreAccessRulesProtected) { exit 1 }; foreach ($ace in $acl.Access) { if ($ace.IsInherited -or $allowed -notcontains $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value) { exit 2 } }; exit 0"])
+                .env("APEX_TOKEN_TEST_PATH", &token_path).output().unwrap();
+            assert!(
+                result.status.success(),
+                "ACL du jeton trop larges : {:?}",
+                result
+            );
+        }
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
