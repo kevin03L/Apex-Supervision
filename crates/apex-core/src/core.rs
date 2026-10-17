@@ -29,13 +29,14 @@ use crate::{
     drivers::spawn_driver_task,
     flow_engine::FlowEngineRuntime,
     models::{
-        is_valid_hhmm, AlarmInstance, AlarmJournalEntry, AlarmLifecycleState, AlarmSeverity,
-        AuditLogEntry, ComparisonOperator, DashboardLayout, DashboardWidget, DriverConfig,
-        DriverRuntimeStats, FlowEdge, FlowExecutionTrace, FlowGraph, FlowNode, FlowNodeKind,
-        HistoryPoint, HistoryResponse, ImportSymbolLibraryRequest, LoginRequest, LoginResponse,
-        ProjectBackupBundle, Quality, RegisteredTag, ScadaError, ScheduleRule, SymbolLibraryItem,
-        SystemSettings, SystemStatus, TagFullView, TagState, TagValue, UpsertUserRequest,
-        UserAccount, UserPublicView, UserRole, WidgetType, WriteCommand,
+        is_valid_hhmm, AlarmInstance, AlarmJournalEntry, AlarmLevel, AlarmLifecycleState,
+        AlarmSeverity, AuditLogEntry, ComparisonOperator, DashboardLayout, DashboardWidget,
+        DriverConfig, DriverRuntimeStats, FlowEdge, FlowExecutionTrace, FlowGraph, FlowNode,
+        FlowNodeKind, HistoryPoint, HistoryResponse, ImportSymbolLibraryRequest, LoginRequest,
+        LoginResponse, ProjectBackupBundle, ProtocolType, Quality, RegisteredTag, ScadaError,
+        ScheduleRule, SymbolLibraryItem, SystemSettings, SystemStatus, TagFullView, TagState,
+        TagValue, UpsertUserRequest, UserAccount, UserPublicView, UserRole, WidgetType,
+        WriteCommand,
     },
     security,
 };
@@ -329,8 +330,11 @@ impl ScadaCore {
         mut config: DriverConfig,
     ) -> Result<Vec<TagFullView>, ScadaError> {
         security::validate_id("driver", &config.id)?;
+        // Simulation désactivée : un driver simulé n'est ni enregistré ni persisté
+        self.ensure_protocol_available(&config.protocol)?;
         for tag in &config.tags {
             security::validate_id("tag", &tag.id)?;
+            validate_tag_for_protocol(&config.protocol, tag)?;
         }
         let driver_id = config.id.clone();
         self.abort_driver_task(&driver_id);
@@ -360,6 +364,18 @@ impl ScadaCore {
         );
 
         start_result.map(|_| views)
+    }
+
+    /// Refuse un protocole simulé (simulateur GTB, OPC-UA, BACnet/IP, S7) quand la simulation est
+    /// désactivée : aucun chemin (ajout, import, démarrage) ne doit l'enregistrer ni le persister.
+    fn ensure_protocol_available(&self, protocol: &ProtocolType) -> Result<(), ScadaError> {
+        if protocol.is_simulated() && !self.simulation_enabled {
+            return Err(ScadaError::BadRequest(format!(
+                "Protocole {:?} simulé (valeurs fictives) : indisponible quand la simulation est désactivée ([simulation] enabled = false)",
+                protocol
+            )));
+        }
+        Ok(())
     }
 
     /// Démarre la tâche d'acquisition et met à jour les statistiques de la configuration.
@@ -488,14 +504,16 @@ impl ScadaCore {
         actor: &str,
         driver_id: &str,
     ) -> Result<DriverConfig, ScadaError> {
-        self.abort_driver_task(driver_id);
-
         let mut config = self
             .drivers_config
             .get(driver_id)
             .map(|d| d.clone())
             .ok_or_else(|| ScadaError::DriverNotFound(driver_id.to_string()))?;
+        // Driver simulé hérité d'une base où la simulation était active : il reste arrêté et
+        // son état voulu n'est pas repassé à « actif » en base.
+        self.ensure_protocol_available(&config.protocol)?;
 
+        self.abort_driver_task(driver_id);
         config.enabled = true;
         config.tags = self.get_tags_for_driver(driver_id);
         config.stats = DriverRuntimeStats::default();
@@ -647,6 +665,31 @@ impl ScadaCore {
         Ok(tag_ids.len())
     }
 
+    /// « Auto-Découverte » : déclare le catalogue de démonstration d'un driver simulé.
+    ///
+    /// Réservée aux protocoles simulés (OPC-UA, BACnet/IP, S7) avec la simulation active.
+    /// Refusée pour un driver réel (Modbus TCP, MQTT) : aucune variable n'est inventée, en
+    /// particulier aucune consigne inscriptible à une adresse inconnue de l'équipement.
+    pub async fn discover_driver_tags(
+        &self,
+        actor: &str,
+        driver_id: &str,
+    ) -> Result<Vec<TagFullView>, ScadaError> {
+        let protocol = self
+            .drivers_config
+            .get(driver_id)
+            .map(|d| d.protocol.clone())
+            .ok_or_else(|| ScadaError::DriverNotFound(driver_id.to_string()))?;
+        self.ensure_protocol_available(&protocol)?;
+        let discovered = crate::drivers::discover_protocol_tags(driver_id, &protocol)
+            .map_err(ScadaError::BadRequest)?;
+        let mut views = Vec::with_capacity(discovered.len());
+        for tag in discovered {
+            views.push(self.upsert_tag(actor, tag).await?);
+        }
+        Ok(views)
+    }
+
     /// Arrête toutes les tâches d'acquisition (extinction, mise hors tension) sans modifier
     /// l'état voulu des drivers : ils redémarreront au prochain rallumage.
     pub fn stop_all_drivers(&self) {
@@ -746,6 +789,23 @@ impl ScadaCore {
         }
     }
 
+    /// Commande refusée par l'équipement (exception Modbus) ou invalide pour son adresse : la
+    /// liaison reste saine, donc ni alarme de communication ni passage des variables en défaut.
+    /// L'erreur est visible sur la carte du driver et tracée dans le journal d'audit.
+    pub fn record_driver_write_rejected(&self, driver_id: &str, tag_id: &str, err: &str) {
+        if let Some(mut drv) = self.drivers_config.get_mut(driver_id) {
+            drv.stats.frames_err += 1;
+            drv.stats.last_error = Some(format!("Écriture refusée sur '{}' : {}", tag_id, err));
+        }
+        self.record_audit(
+            driver_id,
+            "CONSIGNE",
+            "WRITE_REJECTED",
+            tag_id,
+            &format!("Commande refusée par l'équipement : {}", err),
+        );
+    }
+
     pub fn get_tags_for_driver(&self, driver_id: &str) -> Vec<RegisteredTag> {
         let mut list: Vec<RegisteredTag> = self
             .tags_registry
@@ -831,6 +891,13 @@ impl ScadaCore {
             return Err(ScadaError::BadRequest(
                 "Le facteur d'échelle doit être un nombre non nul".to_string(),
             ));
+        }
+        let protocol = self
+            .drivers_config
+            .get(&tag.module_source)
+            .map(|d| d.protocol.clone());
+        if let Some(protocol) = protocol {
+            validate_tag_for_protocol(&protocol, &tag)?;
         }
 
         // Un changement de driver retire le tag de l'ancienne configuration
@@ -931,13 +998,17 @@ impl ScadaCore {
         self.ingest_state(incoming, true)
     }
 
-    fn ingest_state(&self, mut incoming: TagState, apply_scaling: bool) -> bool {
+    /// `from_device` : valeur brute remontée par un driver (mise à l'échelle puis filtrage COV par
+    /// la bande morte du tag). Sinon, écriture directe d'une variable interne : la valeur demandée
+    /// est enregistrée telle quelle, sans filtre de bande morte, pour que l'état reflète
+    /// exactement la valeur renvoyée à l'opérateur ou au flux.
+    fn ingest_state(&self, mut incoming: TagState, from_device: bool) -> bool {
         let tag_meta_opt = self.tags_registry.get(&incoming.tag_id).map(|t| t.clone());
 
         if let Some(meta) = &tag_meta_opt {
             let has_scaling =
                 (meta.scale_factor - 1.0).abs() > 1e-9 || meta.scale_offset.abs() > 1e-9;
-            if apply_scaling && has_scaling && meta.data_type == crate::models::TagDataType::Float {
+            if from_device && has_scaling && meta.data_type == crate::models::TagDataType::Float {
                 if let (TagValue::Float(_) | TagValue::Int(_), Some(raw)) =
                     (&incoming.value, incoming.value.as_f64())
                 {
@@ -956,7 +1027,11 @@ impl ScadaCore {
             }
         }
 
-        let deadband = tag_meta_opt.as_ref().map(|t| t.deadband).unwrap_or(0.02);
+        let deadband = if from_device {
+            tag_meta_opt.as_ref().map(|t| t.deadband).unwrap_or(0.02)
+        } else {
+            0.0
+        };
         let historize = tag_meta_opt.as_ref().map(|t| t.historize).unwrap_or(true);
 
         let should_broadcast = match self.tags_state.get(&incoming.tag_id) {
@@ -1004,14 +1079,29 @@ impl ScadaCore {
         if state.quality != Quality::Good {
             return;
         }
-        let currently_active = self.alarms.get(&meta.id).is_some_and(|a| {
-            matches!(
-                a.state,
-                AlarmLifecycleState::ActiveUnack | AlarmLifecycleState::ActiveAck
-            )
-        });
-        let reason = compute_alarm_reason(meta, &state.value, currently_active);
-        self.apply_alarm_transition(&meta.id, &meta.id, &meta.label, reason, state.value.clone());
+        // Niveau de l'alarme active : la bande morte ne retarde que sa disparition
+        let active_level = self
+            .alarms
+            .get(&meta.id)
+            .filter(|a| {
+                matches!(
+                    a.state,
+                    AlarmLifecycleState::ActiveUnack | AlarmLifecycleState::ActiveAck
+                )
+            })
+            .and_then(|a| a.level);
+        let (reason, level) = match compute_alarm_reason(meta, &state.value, active_level) {
+            Some((msg, sev, lvl)) => (Some((msg, sev)), Some(lvl)),
+            None => (None, None),
+        };
+        self.apply_alarm_transition(
+            &meta.id,
+            &meta.id,
+            &meta.label,
+            reason,
+            level,
+            state.value.clone(),
+        );
     }
 
     /// Applique le cycle de vie ISA-18.2 à une alarme (apparition, aggravation, disparition,
@@ -1022,6 +1112,7 @@ impl ScadaCore {
         source_id: &str,
         label: &str,
         reason: Option<(String, AlarmSeverity)>,
+        level: Option<AlarmLevel>,
         trigger_value: TagValue,
     ) {
         let mut changed = false;
@@ -1055,6 +1146,7 @@ impl ScadaCore {
                     changed = true;
                 }
                 existing.message = msg;
+                existing.level = level;
                 existing.severity = sev;
             }
             (Some((msg, sev)), None) => {
@@ -1073,6 +1165,7 @@ impl ScadaCore {
                     ack_comment: None,
                     shelved_until: None,
                     shelved_by: None,
+                    level,
                 };
                 self.alarms.insert(alarm_id.to_string(), instance);
                 changed = true;
@@ -1141,6 +1234,7 @@ impl ScadaCore {
             driver_id,
             &name,
             reason,
+            None,
             TagValue::Bool(connected),
         );
     }
@@ -1679,10 +1773,11 @@ impl ScadaCore {
                 d.stats.running,
                 d.stats.connected,
                 d.protocol.is_simulated(),
+                d.protocol.clone(),
             )
         });
 
-        let Some((running, connected, simulated)) = driver_status else {
+        let Some((running, connected, simulated, protocol)) = driver_status else {
             // Variable interne (mémoire) : pas d'équipement à piloter
             self.ingest_state(requested_state.clone(), false);
             return Ok(requested_state);
@@ -1694,6 +1789,21 @@ impl ScadaCore {
                 "Mode sûr actif : aucune commande n'est envoyée à l'équipement '{}'",
                 tag_meta.module_source
             )));
+        }
+
+        // Valeur brute envoyée à l'équipement, contrôlée avant l'envoi : une valeur hors plage
+        // du registre (ou une adresse non écrivable) est refusée ici, avec une erreur renvoyée à
+        // l'opérateur ou au flux, au lieu d'être saturée ou rejetée plus tard par le driver.
+        let device_value = to_device_value(&tag_meta, &coerced_value);
+        if protocol == ProtocolType::ModbusTcp {
+            crate::drivers::check_modbus_write(&tag_meta.protocol_address, &device_value).map_err(
+                |e| {
+                    ScadaError::BadRequest(format!(
+                        "Consigne refusée pour '{}' ({}) : {}",
+                        tag_meta.id, tag_meta.protocol_address, e
+                    ))
+                },
+            )?;
         }
 
         if !running {
@@ -1723,7 +1833,7 @@ impl ScadaCore {
         let cmd = WriteCommand {
             tag_id: tag_meta.id.clone(),
             protocol_address: tag_meta.protocol_address.clone(),
-            value: to_device_value(&tag_meta, &coerced_value),
+            value: device_value,
         };
         sender.try_send(cmd).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => ScadaError::DriverError(format!(
@@ -1984,6 +2094,9 @@ impl ScadaCore {
     pub async fn save_flow(&self, actor: &str, flow: FlowGraph) -> Result<FlowGraph, ScadaError> {
         validate_flow(&flow)?;
         self.flows.insert(flow.id.clone(), flow.clone());
+        // Graphe redéployé : les mémoires d'exécution (dernières sorties écrites, scripts en
+        // échec) repartent de zéro pour que la nouvelle version s'applique immédiatement.
+        self.flow_runtime.forget_flow(&flow.id);
 
         if let Some(pool) = &self.db_pool {
             let json_payload = serde_json::to_string(&flow)
@@ -2008,6 +2121,7 @@ impl ScadaCore {
         self.flows
             .remove(id)
             .ok_or_else(|| ScadaError::FlowNotFound(id.to_string()))?;
+        self.flow_runtime.forget_flow(id);
         if let Some(pool) = &self.db_pool {
             log_db_error(
                 "suppression flux",
@@ -2280,10 +2394,36 @@ impl ScadaCore {
     ) -> Result<serde_json::Value, ScadaError> {
         let mut errors: Vec<String> = Vec::new();
         let mut counts = [0usize; 5];
+        // Drivers non importés (protocole simulé sans simulation, configuration invalide) :
+        // leurs variables sont écartées elles aussi.
+        let mut ignored_drivers: std::collections::HashSet<String> = Default::default();
+        let mut ignored_tags = 0usize;
+        // Variables écartées à l'import de leur driver (déjà signalées dans le rapport)
+        let mut ignored_tag_ids: std::collections::HashSet<String> = Default::default();
 
         for mut drv in bundle.drivers {
             drv.stats = DriverRuntimeStats::default();
             let id = drv.id.clone();
+            if let Err(e) = self.ensure_protocol_available(&drv.protocol) {
+                errors.push(format!(
+                    "Driver '{}' ignoré, avec ses variables : {}",
+                    id, e
+                ));
+                ignored_drivers.insert(id);
+                continue;
+            }
+            // Une variable invalide pour le protocole (ex. registre d'entrée Modbus déclaré
+            // inscriptible) est écartée seule, sans faire échouer l'import de tout le driver.
+            let protocol = drv.protocol.clone();
+            drv.tags
+                .retain(|tag| match validate_tag_for_protocol(&protocol, tag) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        errors.push(format!("Tag '{}' ignoré : {}", tag.id, e));
+                        ignored_tag_ids.insert(tag.id.clone());
+                        false
+                    }
+                });
             match self.register_and_start_driver(actor, drv).await {
                 Ok(_) => counts[0] += 1,
                 // Un driver déclaré mais non démarrable (équipement absent) reste importé
@@ -2291,15 +2431,32 @@ impl ScadaCore {
                     counts[0] += 1;
                     errors.push(format!("Driver '{}' importé mais non démarré : {}", id, e));
                 }
-                Err(e) => errors.push(format!("Driver '{}' : {}", id, e)),
+                Err(e) => {
+                    errors.push(format!("Driver '{}' : {}", id, e));
+                    ignored_drivers.insert(id);
+                }
             }
         }
         for tag in bundle.tags {
+            // Sans son driver, la variable deviendrait une variable interne : elle est écartée
+            if ignored_drivers.contains(&tag.module_source) {
+                ignored_tags += 1;
+                continue;
+            }
+            if ignored_tag_ids.contains(&tag.id) {
+                continue;
+            }
             let id = tag.id.clone();
             match self.upsert_tag(actor, tag).await {
                 Ok(_) => counts[1] += 1,
                 Err(e) => errors.push(format!("Tag '{}' : {}", id, e)),
             }
+        }
+        if ignored_tags > 0 {
+            errors.push(format!(
+                "{} variable(s) rattachée(s) à un driver non importé, ignorée(s)",
+                ignored_tags
+            ));
         }
         for dash in bundle.dashboards {
             let id = dash.id.clone();
@@ -2339,6 +2496,8 @@ impl ScadaCore {
             "dashboards": counts[2],
             "flows": counts[3],
             "schedules": counts[4],
+            "ignored_drivers": ignored_drivers.len(),
+            "ignored_tags": ignored_tags,
             "errors": errors,
         }))
     }
@@ -4207,15 +4366,17 @@ fn severity_rank(sev: AlarmSeverity) -> u8 {
 
 /// Calcule la raison d'alarme d'une valeur (ou `None` si la valeur est normale).
 ///
-/// Ordre de priorité : défaut TOR, HH, H, LL, L. Quand l'alarme est déjà active, les seuils sont
-/// décalés de la bande morte d'alarme pour éviter le bagotement autour d'un seuil.
+/// Ordre de priorité : défaut TOR, HH, H, LL, L. La bande morte d'alarme ne sert qu'à retarder la
+/// disparition du niveau actif (`active_level`) : elle s'applique au seuil de ce niveau et aux
+/// seuils moins graves du même côté (H quand HH est actif, L quand LL est actif), jamais à un
+/// seuil plus grave. Une escalade H → HH n'a donc lieu qu'au franchissement réel de HH.
 /// Les messages sont stables (sans la valeur courante) : la valeur de déclenchement est
 /// conservée à part dans `trigger_value`.
 fn compute_alarm_reason(
     meta: &RegisteredTag,
     value: &TagValue,
-    currently_active: bool,
-) -> Option<(String, AlarmSeverity)> {
+    active_level: Option<AlarmLevel>,
+) -> Option<(String, AlarmSeverity, AlarmLevel)> {
     let cfg = &meta.alarm_config;
     if !cfg.enabled {
         return None;
@@ -4227,7 +4388,7 @@ fn compute_alarm_reason(
                 .message
                 .clone()
                 .unwrap_or_else(|| format!("Défaut actif sur {}", meta.label));
-            return Some((msg, cfg.severity));
+            return Some((msg, cfg.severity, AlarmLevel::Tor));
         }
         if matches!(value, TagValue::Bool(_)) {
             return None;
@@ -4239,8 +4400,23 @@ fn compute_alarm_reason(
         return None;
     }
     let unit = meta.unit.as_deref().unwrap_or("");
-    let band = |threshold: f64| -> f64 {
-        if !currently_active {
+    // Niveaux couverts par la bande morte : le niveau actif et les moins graves du même côté
+    let banded = |level: AlarmLevel| -> bool {
+        matches!(
+            (active_level, level),
+            (
+                Some(AlarmLevel::HighHigh),
+                AlarmLevel::HighHigh | AlarmLevel::High
+            ) | (Some(AlarmLevel::High), AlarmLevel::High)
+                | (
+                    Some(AlarmLevel::LowLow),
+                    AlarmLevel::LowLow | AlarmLevel::Low
+                )
+                | (Some(AlarmLevel::Low), AlarmLevel::Low)
+        )
+    };
+    let band = |level: AlarmLevel, threshold: f64| -> f64 {
+        if !banded(level) {
             return 0.0;
         }
         cfg.deadband
@@ -4253,34 +4429,38 @@ fn compute_alarm_reason(
     };
 
     if let Some(hh) = cfg.high_high {
-        if num >= hh - band(hh) {
+        if num >= hh - band(AlarmLevel::HighHigh, hh) {
             return Some((
                 with_context(format!("Seuil Très Haut dépassé (HH ≥ {}{})", hh, unit)),
                 AlarmSeverity::Critical,
+                AlarmLevel::HighHigh,
             ));
         }
     }
     if let Some(h) = cfg.high {
-        if num >= h - band(h) {
+        if num >= h - band(AlarmLevel::High, h) {
             return Some((
                 with_context(format!("Seuil Haut dépassé (H ≥ {}{})", h, unit)),
                 cfg.severity,
+                AlarmLevel::High,
             ));
         }
     }
     if let Some(ll) = cfg.low_low {
-        if num <= ll + band(ll) {
+        if num <= ll + band(AlarmLevel::LowLow, ll) {
             return Some((
                 with_context(format!("Seuil Très Bas franchi (LL ≤ {}{})", ll, unit)),
                 AlarmSeverity::Critical,
+                AlarmLevel::LowLow,
             ));
         }
     }
     if let Some(l) = cfg.low {
-        if num <= l + band(l) {
+        if num <= l + band(AlarmLevel::Low, l) {
             return Some((
                 with_context(format!("Seuil Bas franchi (L ≤ {}{})", l, unit)),
                 cfg.severity,
+                AlarmLevel::Low,
             ));
         }
     }
@@ -4376,7 +4556,21 @@ fn sanitize_dashboard(layout: &mut DashboardLayout) -> Result<(), ScadaError> {
     Ok(())
 }
 
-/// Valide les identifiants d'un flux (nœuds, câbles, ports) et la cohérence des liaisons.
+/// Contrôle propre au protocole du driver d'une variable (adresse écrivable pour Modbus TCP).
+fn validate_tag_for_protocol(
+    protocol: &ProtocolType,
+    tag: &RegisteredTag,
+) -> Result<(), ScadaError> {
+    match protocol {
+        ProtocolType::ModbusTcp => {
+            crate::drivers::validate_modbus_tag(tag).map_err(ScadaError::BadRequest)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Valide les identifiants d'un flux (nœuds, câbles, ports), la cohérence des liaisons et la
+/// syntaxe des scripts Rhai (un script invalide est refusé à l'enregistrement).
 fn validate_flow(flow: &FlowGraph) -> Result<(), ScadaError> {
     security::validate_id("flux", &flow.id)?;
     let mut node_ids = std::collections::HashSet::new();
@@ -4384,6 +4578,14 @@ fn validate_flow(flow: &FlowGraph) -> Result<(), ScadaError> {
         security::validate_id("nœud", &n.id)?;
         if !node_ids.insert(n.id.as_str()) {
             return Err(ScadaError::BadRequest(format!("Nœud '{}' dupliqué", n.id)));
+        }
+        if let FlowNodeKind::RhaiScript { script } = &n.kind {
+            crate::flow_engine::check_rhai_script(script).map_err(|e| {
+                ScadaError::BadRequest(format!(
+                    "Script Rhai invalide dans le nœud '{}' ({}) : {}",
+                    n.label, n.id, e
+                ))
+            })?;
         }
     }
     for e in &flow.edges {
@@ -4515,18 +4717,18 @@ mod tests {
     #[test]
     fn alarm_levels_and_priority() {
         let t = alarmed_tag();
-        assert!(compute_alarm_reason(&t, &TagValue::Float(20.0), false).is_none());
-        let (msg, sev) = compute_alarm_reason(&t, &TagValue::Float(28.0), false).unwrap();
+        assert!(compute_alarm_reason(&t, &TagValue::Float(20.0), None).is_none());
+        let (msg, sev, _) = compute_alarm_reason(&t, &TagValue::Float(28.0), None).unwrap();
         assert_eq!(sev, AlarmSeverity::High);
         assert!(msg.contains("H ≥ 27"));
         assert_eq!(
-            compute_alarm_reason(&t, &TagValue::Float(31.5), false)
+            compute_alarm_reason(&t, &TagValue::Float(31.5), None)
                 .unwrap()
                 .1,
             AlarmSeverity::Critical
         );
         assert_eq!(
-            compute_alarm_reason(&t, &TagValue::Float(14.0), false)
+            compute_alarm_reason(&t, &TagValue::Float(14.0), None)
                 .unwrap()
                 .1,
             AlarmSeverity::High
@@ -4537,13 +4739,13 @@ mod tests {
     fn alarm_deadband_prevents_chattering() {
         let t = alarmed_tag();
         // Bande morte par défaut sur H=27 : max(2 × 0.05, 1 % de 27) = 0.27
-        assert!(compute_alarm_reason(&t, &TagValue::Float(26.9), false).is_none());
+        assert!(compute_alarm_reason(&t, &TagValue::Float(26.9), None).is_none());
         assert!(
-            compute_alarm_reason(&t, &TagValue::Float(26.9), true).is_some(),
+            compute_alarm_reason(&t, &TagValue::Float(26.9), Some(AlarmLevel::High)).is_some(),
             "reste active dans la bande morte"
         );
         assert!(
-            compute_alarm_reason(&t, &TagValue::Float(26.7), true).is_none(),
+            compute_alarm_reason(&t, &TagValue::Float(26.7), Some(AlarmLevel::High)).is_none(),
             "disparaît sous seuil - bande morte"
         );
     }
@@ -4551,10 +4753,10 @@ mod tests {
     #[test]
     fn alarm_messages_are_stable() {
         let t = alarmed_tag();
-        let a = compute_alarm_reason(&t, &TagValue::Float(28.1), false)
+        let a = compute_alarm_reason(&t, &TagValue::Float(28.1), None)
             .unwrap()
             .0;
-        let b = compute_alarm_reason(&t, &TagValue::Float(29.4), false)
+        let b = compute_alarm_reason(&t, &TagValue::Float(29.4), None)
             .unwrap()
             .0;
         assert_eq!(
@@ -4574,13 +4776,334 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            compute_alarm_reason(&t, &TagValue::Bool(true), false)
+            compute_alarm_reason(&t, &TagValue::Bool(true), None)
                 .unwrap()
                 .0,
             "Encrassement filtre"
         );
-        assert!(compute_alarm_reason(&t, &TagValue::Bool(false), true).is_none());
+        assert!(compute_alarm_reason(&t, &TagValue::Bool(false), Some(AlarmLevel::Tor)).is_none());
         t.alarm_config.enabled = false;
-        assert!(compute_alarm_reason(&t, &TagValue::Bool(true), false).is_none());
+        assert!(compute_alarm_reason(&t, &TagValue::Bool(true), None).is_none());
+    }
+
+    /// Tag de démonstration MODBUS.GF01.Temp_Eau_Glacee : H 12,5 / HH 15, bande morte COV 0,05.
+    fn eau_glacee() -> RegisteredTag {
+        crate::drivers::build_local_modbus_plc_config(5502)
+            .tags
+            .into_iter()
+            .find(|t| t.id == "MODBUS.GF01.Temp_Eau_Glacee")
+            .unwrap()
+    }
+
+    #[test]
+    fn alarm_deadband_never_escalates_to_hh_or_ll() {
+        let t = eau_glacee();
+        // H actif, valeur juste sous HH (bande HH = max(0,1 ; 0,15) = 0,15) : pas d'escalade
+        let (_, sev, lvl) =
+            compute_alarm_reason(&t, &TagValue::Float(14.9), Some(AlarmLevel::High)).unwrap();
+        assert_eq!((sev, lvl), (AlarmSeverity::High, AlarmLevel::High));
+        // Franchissement réel de HH : escalade
+        let (_, sev, lvl) =
+            compute_alarm_reason(&t, &TagValue::Float(15.0), Some(AlarmLevel::High)).unwrap();
+        assert_eq!((sev, lvl), (AlarmSeverity::Critical, AlarmLevel::HighHigh));
+        // HH actif : la bande retarde sa disparition
+        assert_eq!(
+            compute_alarm_reason(&t, &TagValue::Float(14.9), Some(AlarmLevel::HighHigh))
+                .unwrap()
+                .2,
+            AlarmLevel::HighHigh
+        );
+        // HH actif, retour sous H dans la bande de H : l'alarme reste au niveau H
+        assert_eq!(
+            compute_alarm_reason(&t, &TagValue::Float(12.45), Some(AlarmLevel::HighHigh))
+                .unwrap()
+                .2,
+            AlarmLevel::High
+        );
+        assert!(compute_alarm_reason(&t, &TagValue::Float(12.0), Some(AlarmLevel::High)).is_none());
+
+        // Même règle côté bas : L actif, valeur juste au-dessus de LL
+        let mut t = alarmed_tag();
+        t.alarm_config.low_low = Some(12.0);
+        let (_, sev, lvl) =
+            compute_alarm_reason(&t, &TagValue::Float(12.05), Some(AlarmLevel::Low)).unwrap();
+        assert_eq!((sev, lvl), (AlarmSeverity::High, AlarmLevel::Low));
+        assert_eq!(
+            compute_alarm_reason(&t, &TagValue::Float(12.0), Some(AlarmLevel::Low))
+                .unwrap()
+                .2,
+            AlarmLevel::LowLow
+        );
+        // Un niveau actif d'un côté n'élargit pas les seuils de l'autre côté
+        assert!(compute_alarm_reason(&t, &TagValue::Float(15.1), Some(AlarmLevel::High)).is_none());
+    }
+
+    fn engine_options(simulation_enabled: bool) -> EngineOptions {
+        EngineOptions {
+            simulation_enabled,
+            ..Default::default()
+        }
+    }
+
+    fn good(tag_id: &str, v: f64) -> TagState {
+        TagState {
+            tag_id: tag_id.to_string(),
+            value: TagValue::Float(v),
+            quality: Quality::Good,
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn active_h_alarm_is_not_aggravated_below_hh() {
+        let core = ScadaCore::new(None, &engine_options(true));
+        let t = eau_glacee();
+        core.register_tag(t.clone(), None);
+        core.process_incoming_state(good(&t.id, 13.0));
+        let a = core.alarms.get(&t.id).map(|a| a.clone()).unwrap();
+        assert_eq!(
+            (a.severity, a.level),
+            (AlarmSeverity::High, Some(AlarmLevel::High))
+        );
+        core.acknowledge_alarm(&t.id, "test", None).unwrap();
+        core.process_incoming_state(good(&t.id, 14.9));
+        let a = core.alarms.get(&t.id).map(|a| a.clone()).unwrap();
+        assert_eq!(a.severity, AlarmSeverity::High, "pas d'alarme HH sous 15");
+        assert_eq!(
+            a.state,
+            AlarmLifecycleState::ActiveAck,
+            "pas de réacquittement"
+        );
+        core.process_incoming_state(good(&t.id, 15.2));
+        let a = core.alarms.get(&t.id).map(|a| a.clone()).unwrap();
+        assert_eq!(
+            (a.severity, a.level, a.state),
+            (
+                AlarmSeverity::Critical,
+                Some(AlarmLevel::HighHigh),
+                AlarmLifecycleState::ActiveUnack
+            )
+        );
+    }
+
+    fn driver(id: &str, protocol: ProtocolType, tags: Vec<RegisteredTag>) -> DriverConfig {
+        DriverConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            protocol,
+            endpoint: "127.0.0.1:1".to_string(),
+            unit_id: 1,
+            poll_interval_ms: 1000,
+            // Aucun démarrage : aucune connexion n'est tentée pendant les tests
+            enabled: false,
+            tags,
+            stats: DriverRuntimeStats::default(),
+        }
+    }
+
+    fn driver_tag(id: &str, source: &str, address: &str, writable: bool) -> RegisteredTag {
+        let mut t = tag(1.0, 0.0);
+        t.id = id.to_string();
+        t.module_source = source.to_string();
+        t.protocol_address = address.to_string();
+        t.writable = writable;
+        t
+    }
+
+    #[tokio::test]
+    async fn simulated_drivers_are_never_registered_without_simulation() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        let sim = driver(
+            "OPC_DEMO",
+            ProtocolType::OpcUa,
+            vec![driver_tag("OPC_DEMO.T1", "OPC_DEMO", "ns=2;s=T1", false)],
+        );
+        let err = core
+            .register_and_start_driver("test", sim.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.http_status(), 400);
+        assert!(!core.drivers_config.contains_key("OPC_DEMO"));
+        assert!(!core.tags_registry.contains_key("OPC_DEMO.T1"));
+
+        // Import : le driver simulé et ses variables sont écartés, avec un rapport explicite
+        let mb = driver(
+            "MB_01",
+            ProtocolType::ModbusTcp,
+            vec![driver_tag("MB_01.T1", "MB_01", "HR:0:FLOAT32", false)],
+        );
+        let bundle = ProjectBackupBundle {
+            exported_at: Utc::now(),
+            version: APP_VERSION.to_string(),
+            drivers: vec![sim.clone(), mb],
+            tags: vec![
+                driver_tag("OPC_DEMO.T1", "OPC_DEMO", "ns=2;s=T1", false),
+                driver_tag("MB_01.T1", "MB_01", "HR:0:FLOAT32", false),
+            ],
+            dashboards: vec![],
+            flows: vec![],
+            schedules: vec![],
+        };
+        let report = core.import_project_bundle("test", bundle).await.unwrap();
+        assert_eq!(report["drivers"], 1);
+        assert_eq!(report["ignored_drivers"], 1);
+        assert_eq!(report["ignored_tags"], 1);
+        assert!(report["errors"][0]
+            .as_str()
+            .unwrap()
+            .contains("Driver 'OPC_DEMO' ignoré"));
+        assert!(!core.drivers_config.contains_key("OPC_DEMO"));
+        assert!(!core.tags_registry.contains_key("OPC_DEMO.T1"));
+        assert!(core.tags_registry.contains_key("MB_01.T1"));
+
+        // Driver simulé hérité de la base : le démarrage est refusé et l'état voulu reste « arrêté »
+        core.drivers_config.insert("OPC_DEMO".to_string(), sim);
+        let err = core
+            .start_or_restart_driver("test", "OPC_DEMO")
+            .await
+            .unwrap_err();
+        assert_eq!(err.http_status(), 400);
+        assert!(!core.drivers_config.get("OPC_DEMO").unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn discovery_is_refused_on_real_drivers() {
+        let core = ScadaCore::new(None, &engine_options(true));
+        core.register_and_start_driver("test", driver("MB_01", ProtocolType::ModbusTcp, vec![]))
+            .await
+            .unwrap();
+        core.register_and_start_driver("test", driver("MQ_01", ProtocolType::Mqtt, vec![]))
+            .await
+            .unwrap();
+        for id in ["MB_01", "MQ_01"] {
+            let err = core.discover_driver_tags("test", id).await.unwrap_err();
+            assert_eq!(err.http_status(), 400);
+            assert!(core.get_tags_for_driver(id).is_empty(), "{}", id);
+        }
+        core.register_and_start_driver("test", driver("S7_01", ProtocolType::SiemensS7, vec![]))
+            .await
+            .unwrap();
+        assert!(!core
+            .discover_driver_tags("test", "S7_01")
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Simulation désactivée : découverte refusée même pour un protocole simulé
+        let prod = ScadaCore::new(None, &engine_options(false));
+        prod.drivers_config.insert(
+            "S7_01".to_string(),
+            driver("S7_01", ProtocolType::SiemensS7, vec![]),
+        );
+        assert_eq!(
+            prod.discover_driver_tags("test", "S7_01")
+                .await
+                .unwrap_err()
+                .http_status(),
+            400
+        );
+        assert!(prod.get_tags_for_driver("S7_01").is_empty());
+    }
+
+    #[tokio::test]
+    async fn modbus_writes_are_checked_before_sending() {
+        let core = ScadaCore::new(None, &engine_options(true));
+        // Une entrée TOR ou un registre d'entrée ne peut pas être déclaré inscriptible
+        let bad = driver(
+            "MB_BAD",
+            ProtocolType::ModbusTcp,
+            vec![driver_tag("MB_BAD.DI", "MB_BAD", "DI:0", true)],
+        );
+        assert_eq!(
+            core.register_and_start_driver("test", bad)
+                .await
+                .unwrap_err()
+                .http_status(),
+            400
+        );
+        assert!(!core.drivers_config.contains_key("MB_BAD"));
+
+        let mut u16_tag = driver_tag("MB_01.U16", "MB_01", "HR:20:UINT16", true);
+        u16_tag.data_type = TagDataType::Int;
+        core.register_and_start_driver(
+            "test",
+            driver("MB_01", ProtocolType::ModbusTcp, vec![u16_tag]),
+        )
+        .await
+        .unwrap();
+        let ir = driver_tag("MB_01.IR", "MB_01", "IR:4:FLOAT32", true);
+        assert_eq!(
+            core.upsert_tag("test", ir).await.unwrap_err().http_status(),
+            400
+        );
+
+        // Hors plage : 400 avant l'envoi, au lieu d'une saturation silencieuse
+        for v in [80_000_i64, -1] {
+            let err = core
+                .write_tag("MB_01.U16", TagValue::Int(v))
+                .await
+                .unwrap_err();
+            assert_eq!(err.http_status(), 400, "{}", v);
+        }
+        // Dans la plage : la commande passe le contrôle (refusée ensuite car le driver est arrêté)
+        let err = core
+            .write_tag("MB_01.U16", TagValue::Int(40_000))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ScadaError::DriverError(_)), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn internal_variable_write_bypasses_deadband() {
+        let core = ScadaCore::new(None, &engine_options(true));
+        let mut t = driver_tag("INT.Consigne", "INTERNE", "", true);
+        t.deadband = 0.5;
+        core.register_tag(t, Some(TagValue::Float(20.0)));
+        let written = core
+            .write_tag("INT.Consigne", TagValue::Float(20.3))
+            .await
+            .unwrap();
+        assert_eq!(written.value, TagValue::Float(20.3));
+        assert_eq!(
+            core.tags_state.get("INT.Consigne").unwrap().value,
+            TagValue::Float(20.3),
+            "l'état reflète la valeur écrite malgré la bande morte"
+        );
+    }
+
+    fn rhai_flow(script: &str) -> FlowGraph {
+        FlowGraph {
+            id: "f".into(),
+            name: "f".into(),
+            description: String::new(),
+            enabled: true,
+            nodes: vec![FlowNode {
+                id: "n1".into(),
+                label: "Calcul".into(),
+                x: 0.0,
+                y: 0.0,
+                kind: FlowNodeKind::RhaiScript {
+                    script: script.into(),
+                },
+            }],
+            edges: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_rhai_script_is_rejected_at_save() {
+        assert!(validate_flow(&rhai_flow("val * 2.0 + tag(\"X\")")).is_ok());
+        let err = validate_flow(&rhai_flow("let x = ;")).unwrap_err();
+        assert_eq!(err.http_status(), 400);
+        assert!(err.to_string().contains("Calcul"), "{}", err);
+        assert!(validate_flow(&rhai_flow("  ")).is_err());
+
+        let core = ScadaCore::new(None, &engine_options(true));
+        assert!(core.save_flow("test", rhai_flow("if (")).await.is_err());
+        assert!(!core.flows.contains_key("f"));
+        // Les flux de démonstration restent valides
+        for f in core.get_all_flows() {
+            assert!(validate_flow(&f).is_ok(), "{}", f.id);
+        }
     }
 }

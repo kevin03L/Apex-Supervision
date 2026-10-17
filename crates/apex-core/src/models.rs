@@ -298,6 +298,21 @@ pub struct AlarmInstance {
     pub shelved_until: Option<DateTime<Utc>>,
     #[serde(default)]
     pub shelved_by: Option<String>,
+    /// Niveau de seuil à l'origine de l'alarme active (la bande morte d'alarme ne s'applique
+    /// qu'à ce niveau). Absent pour une alarme de communication ou une alarme d'avant la v1.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<AlarmLevel>,
+}
+
+/// Niveau d'une alarme de variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AlarmLevel {
+    /// Défaut tout-ou-rien (valeur booléenne attendue).
+    Tor,
+    HighHigh,
+    High,
+    LowLow,
+    Low,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
