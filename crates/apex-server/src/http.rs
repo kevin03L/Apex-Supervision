@@ -19,15 +19,15 @@ use apex_core::{
     models::{
         AckAlarmRequest, AlarmInstance, AlarmJournalEntry, AuditLogEntry, ChangePasswordRequest,
         DashboardLayout, DriverConfig, FlowGraph, HistoryResponse, ImportSymbolLibraryRequest,
-        LoginRequest, LoginResponse, ProjectBackupBundle, RegisteredTag, ScadaError, ScheduleRule,
-        SymbolLibraryItem, SystemStatus, TagFullView, TagState, UpsertUserRequest, UserAccount,
-        UserPublicView, UserRole, WriteTagRequest, WsServerMessage,
+        LoginRequest, LoginResponse, ProjectBackupBundle, ProtocolType, RegisteredTag, ScadaError,
+        ScheduleRule, SymbolLibraryItem, SystemStatus, TagFullView, TagState, UpsertUserRequest,
+        UserAccount, UserPublicView, UserRole, WriteTagRequest, WsServerMessage,
     },
 };
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        ConnectInfo, Path, Query, Request, State,
+        ConnectInfo, DefaultBodyLimit, Path, Query, Request, State,
     },
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
@@ -96,7 +96,15 @@ struct CurrentUser(UserAccount);
 #[derive(Clone)]
 struct AuthToken(String);
 
+/// Taille maximale d'une archive projet importée : l'export, sans limite, duplique les tags
+/// (dans chaque driver et dans le catalogue) et embarque les SVG des synoptiques.
+pub const PROJECT_IMPORT_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Taille maximale d'une bibliothèque de symboles importée (SVG, draw.io, JSON).
+pub const SYMBOL_IMPORT_MAX_BYTES: usize = 16 * 1024 * 1024;
+
 /// Construit le routeur complet (API protégée, routes publiques, IHM statique).
+///
+/// Les autres routes gardent la limite par défaut d'axum (2 Mo par corps de requête).
 pub fn router(state: AppState, web_dir: &FsPath) -> Router {
     // Routes protégées : session obligatoire (contrôle des rôles dans chaque handler)
     let protected = Router::new()
@@ -108,7 +116,10 @@ pub fn router(state: AppState, web_dir: &FsPath) -> Router {
         .route("/api/users/:username", delete(api_delete_user))
         // --- BIBLIOTHÈQUES DE SYMBOLES ---
         .route("/api/symbols", get(api_get_symbols))
-        .route("/api/symbols/import", post(api_import_symbols))
+        .route(
+            "/api/symbols/import",
+            post(api_import_symbols).layer(DefaultBodyLimit::max(SYMBOL_IMPORT_MAX_BYTES)),
+        )
         .route(
             "/api/symbols/install-pack/:pack_id",
             post(api_install_symbol_pack),
@@ -125,7 +136,10 @@ pub fn router(state: AppState, web_dir: &FsPath) -> Router {
         .route("/api/system/shutdown", post(api_system_shutdown))
         .route("/api/system/restart", post(api_system_restart))
         .route("/api/system/export", get(api_system_export))
-        .route("/api/system/import", post(api_system_import))
+        .route(
+            "/api/system/import",
+            post(api_system_import).layer(DefaultBodyLimit::max(PROJECT_IMPORT_MAX_BYTES)),
+        )
         .route("/api/audit", get(api_get_audit_logs))
         // --- TAG DATABASE ---
         .route("/api/tags", get(api_get_tags).post(api_upsert_tag))
@@ -618,17 +632,25 @@ async fn api_add_driver(
         .into());
     }
     if config.protocol.is_simulated() && !state.core.simulation_enabled {
-        return Err(ScadaError::BadRequest(format!(
-            "Le protocole {:?} n'est pas encore implémenté : il n'existe qu'en simulation \n             (activez [simulation] enabled = true pour l'utiliser en démonstration)",
-            config.protocol
-        ))
-        .into());
+        return Err(ScadaError::BadRequest(simulation_only_message(&config.protocol)).into());
     }
     let views = state
         .core
         .register_and_start_driver(&user.0.username, config)
         .await?;
     Ok(Json(views))
+}
+
+/// Refus d'un driver réservé à la simulation alors qu'elle est désactivée.
+fn simulation_only_message(protocol: &ProtocolType) -> String {
+    let what = match protocol {
+        ProtocolType::Simulator => "Le simulateur GTB est un driver de démonstration".to_string(),
+        other => format!("Le protocole {other:?} n'a pas encore de driver réel (valeurs simulées)"),
+    };
+    format!(
+        "{what} : il n'est disponible que lorsque la simulation est active \
+         ([simulation] enabled = true dans la configuration du moteur)"
+    )
 }
 
 async fn api_update_driver(
@@ -1162,5 +1184,29 @@ async fn handle_realtime_socket(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refus_hors_simulation_sur_une_ligne_et_adapte_au_protocole() {
+        for protocol in [
+            ProtocolType::Simulator,
+            ProtocolType::OpcUa,
+            ProtocolType::BacnetIp,
+            ProtocolType::SiemensS7,
+        ] {
+            let message = simulation_only_message(&protocol);
+            assert!(!message.contains('\n'), "{message}");
+            assert!(!message.contains("  "), "{message}");
+            assert!(message.contains("[simulation] enabled = true"), "{message}");
+        }
+        let simulator = simulation_only_message(&ProtocolType::Simulator);
+        assert!(simulator.contains("simulateur GTB"), "{simulator}");
+        assert!(!simulator.contains("driver réel"), "{simulator}");
+        assert!(simulation_only_message(&ProtocolType::OpcUa).contains("OpcUa"));
     }
 }

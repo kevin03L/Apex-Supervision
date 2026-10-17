@@ -137,8 +137,8 @@ Les drivers **OPC-UA, BACnet/IP et Siemens S7 sont simulés** à ce stade : ils 
 | Quoi | Comment |
 |---|---|
 | Configuration (`apex-scada.toml`) | Automatique à chaque modification (20 versions dans `…/config/backups/`). Restauration depuis l'onglet « Sauvegardes ». |
-| Projet (drivers, variables, synoptiques, flux, plannings) | IHM web, onglet « Historian & Système » : export et import JSON. |
-| Base complète (historique, comptes, audit) | Moteur arrêté : copie du fichier `apex-scada.db`, ainsi que des fichiers `-wal` et `-shm` s'ils existent. |
+| Projet (drivers, variables, synoptiques, flux, plannings) | IHM web, onglet « Historian & Système » : export et import JSON (fichier `apex_supervision_projet_<date>.json`, 64 Mo au plus à l'import). |
+| Base complète (historique, comptes, audit) | Moteur arrêté : copie du fichier `apex-scada.db`, ainsi que des fichiers `-wal` et `-shm` s'ils existent (après un arrêt propre, le journal est reporté dans `apex-scada.db`, qui se suffit alors à lui-même). |
 
 ---
 

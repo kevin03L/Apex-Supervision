@@ -217,14 +217,14 @@ Les versions 1.x enregistraient tout dans `rust_scada_flow.db`, dans le dossier 
 apex-scada migrate-legacy --from "<dossier ou fichier rust_scada_flow.db>"
 ```
 
-La base est **copiée** dans le répertoire des données, et la source n'est jamais modifiée. Si une base existe déjà à la destination, `--force` la remplace après l'avoir sauvegardée en `.bak-<date>`.
+La base est **copiée** dans le répertoire des données, et la source n'est jamais modifiée. Si une base existe déjà à la destination, `--force` la remplace après l'avoir sauvegardée **en entier** (journal WAL compris, sauvegarde vérifiée) sous `<base>.bak-<date>` ; si cette sauvegarde est impossible, rien n'est remplacé. Au démarrage, le moteur ne suggère la reprise que si sa base est encore vide.
 
 - **Windows** : dans une invite administrateur, ou par l'assistant de configuration, qui propose la reprise lorsqu'il détecte une ancienne base (le service est arrêté pendant la copie puis relancé).
 - **Linux (paquet)** : la copie prend le propriétaire du répertoire des données, même lancée avec sudo :
 
 ```bash
 sudo systemctl stop apex-scada
-sudo apex-scada migrate-legacy --from /chemin/rust_scada_flow.db --force      --config /etc/apex-supervision/apex-scada.toml
+sudo apex-scada migrate-legacy --from /chemin/rust_scada_flow.db --force --config /etc/apex-supervision/apex-scada.toml
 sudo systemctl start apex-scada
 ```
 

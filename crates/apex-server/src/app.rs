@@ -136,7 +136,8 @@ pub async fn run(
         return Err(StartupError::new(
             exit::CONFIG,
             format!(
-                "logiciel non installé : « {} » n'existe pas. Installez Apex Supervision, ou lancez                  une instance portable avec --config <fichier>.",
+                "logiciel non installé : « {} » n'existe pas. Installez Apex Supervision, ou lancez \
+                 une instance portable avec --config <fichier>.",
                 eff.layout
                     .config_file
                     .parent()
@@ -243,12 +244,12 @@ pub async fn run(
         StartupError::new(exit::DATABASE, message)
     })?;
     info!("Base SQLite : {} (mode WAL)", db_file.display());
-    if !db_file.exists()
-        || std::fs::metadata(&db_file)
-            .map(|m| m.len() < 8192)
-            .unwrap_or(false)
-    {
-        hint_legacy_database(layout);
+    // Ancienne base à reprendre ? Seulement si la base actuelle ne contient encore rien : son
+    // contenu est lu par SQLite (journal WAL compris), la taille du fichier ne dit rien.
+    match legacy::is_blank_database(&pool).await {
+        Ok(true) => hint_legacy_database(layout),
+        Ok(false) => {}
+        Err(e) => warn!("Lecture du contenu de la base impossible : {e}"),
     }
 
     // 6. Moteur
@@ -267,7 +268,8 @@ pub async fn run(
         simulation_enabled: cfg.simulation.enabled,
         modbus_slave_port: cfg.simulation.modbus_slave_port,
     };
-    let core = ScadaCore::new(Some(pool), &options);
+    // Le pool est partagé avec le moteur ; cette copie sert à le fermer à l'arrêt propre.
+    let core = ScadaCore::new(Some(pool.clone()), &options);
     let default_drivers = if cfg.simulation.enabled {
         vec![
             GtbSimulatorDriver::new_default("SIM_GTB_01", Arc::clone(&core)).config(),
@@ -359,6 +361,7 @@ pub async fn run(
     let _ = std::fs::remove_file(&token_file);
     // Laisse aux écrivains (historique, alarmes, audit) le temps de vider leurs files
     tokio::time::sleep(Duration::from_millis(1200)).await;
+    close_database(&pool).await;
     info!("{} arrêté proprement.", apex_config::version::PRODUCT_NAME);
 
     served.map_err(|e| StartupError::new(exit::FAILURE, format!("serveur web interrompu : {e}")))
@@ -372,7 +375,23 @@ fn display_host(ip: std::net::IpAddr) -> String {
     }
 }
 
+/// Ferme la base à l'arrêt propre : le journal WAL est reporté dans le fichier principal, qui
+/// se suffit alors à lui-même (copie, sauvegarde ou reprise sans les fichiers `-wal`/`-shm`).
+async fn close_database(pool: &sqlx::SqlitePool) {
+    if let Err(e) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(pool)
+        .await
+    {
+        warn!("Report du journal WAL dans la base impossible : {e}");
+    }
+    // Attend la restitution des connexions ; SQLite reporte le journal et le supprime à la
+    // fermeture de la dernière.
+    pool.close().await;
+}
+
 /// Signale la présence d'une base d'une version antérieure, sans jamais la migrer d'office.
+/// Appelée seulement si la base actuelle ne contient encore aucune donnée : la reprise
+/// (`--force`) remplacera donc une base vide, elle-même sauvegardée au préalable.
 fn hint_legacy_database(layout: &Layout) {
     let mut candidates = vec![layout.data_dir.clone()];
     if let Some(dir) = layout.config_file.parent() {
@@ -383,12 +402,26 @@ fn hint_legacy_database(layout: &Layout) {
     }
     if let Some(found) = candidates.iter().find_map(|d| legacy::find_legacy_db(d)) {
         warn!(
-            "Base d'une version antérieure détectée ({}) : pour reprendre ses données, arrêtez le moteur \
-             puis exécutez « apex-scada migrate-legacy --from \"{}\" --force »",
+            "Base d'une version antérieure détectée ({}) alors que la base actuelle est encore vide : \
+             pour reprendre ses données, arrêtez le moteur puis exécutez « {} » (la base vide créée \
+             par ce démarrage est remplacée, après sauvegarde)",
             found.display(),
-            found.display()
+            legacy_command(&found, layout)
         );
     }
+}
+
+/// Commande de reprise conseillée. En mode portable, `--config` désigne l'instance : sans lui,
+/// la commande viserait l'installation système.
+fn legacy_command(found: &std::path::Path, layout: &Layout) -> String {
+    let mut command = format!(
+        "apex-scada migrate-legacy --from \"{}\" --force",
+        found.display()
+    );
+    if layout.kind == LayoutKind::Portable {
+        command.push_str(&format!(" --config \"{}\"", layout.config_file.display()));
+    }
+    command
 }
 
 /// Écrit le jeton de contrôle local avec des permissions restreintes.
@@ -439,5 +472,33 @@ async fn wait_os_signal() {
                 let _ = tokio::signal::ctrl_c().await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reprise_conseillee_designe_l_instance_portable() {
+        let base = std::env::temp_dir().join("apex-app-hint");
+        let found = base.join("v1").join(legacy::LEGACY_DB_FILE);
+        let portable = Layout::portable(&base);
+        let command = legacy_command(&found, &portable);
+        assert!(
+            command.starts_with("apex-scada migrate-legacy --from"),
+            "{command}"
+        );
+        assert!(
+            command.ends_with(&format!(
+                "--force --config \"{}\"",
+                portable.config_file.display()
+            )),
+            "{command}"
+        );
+
+        let system = Layout::system();
+        let command = legacy_command(&found, &system);
+        assert!(!command.contains("--config"), "{command}");
     }
 }

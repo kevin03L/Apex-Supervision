@@ -157,8 +157,24 @@ async function getJson(url, fallback) {
   }
 }
 
+/** Tailles maximales acceptées par le serveur (http.rs : PROJECT_IMPORT_MAX_BYTES, SYMBOL_IMPORT_MAX_BYTES). */
+const PROJECT_IMPORT_MAX_BYTES = 64 * 1024 * 1024;
+const SYMBOL_IMPORT_MAX_BYTES = 16 * 1024 * 1024;
+
+function formatMegabytes(bytes) {
+  return `${(bytes / (1024 * 1024)).toLocaleString('fr-FR', { maximumFractionDigits: 1 })} Mo`;
+}
+
+/** Message d'un envoi refusé car trop volumineux (HTTP 413 ou contrôle préalable). */
+function payloadTooLargeMessage(maxBytes, actualBytes) {
+  const size = actualBytes ? ` (${formatMegabytes(actualBytes)})` : '';
+  const limit = maxBytes ? ` : ${formatMegabytes(maxBytes)} au maximum` : '';
+  return `Contenu trop volumineux${size} : le serveur refuse les envois de cette taille${limit}.`;
+}
+
 /** Lit le message d'erreur JSON d'une réponse API. */
-async function apiError(res) {
+async function apiError(res, maxBytes) {
+  if (res.status === 413) return payloadTooLargeMessage(maxBytes);
   try {
     const body = await res.json();
     return body.message || `Erreur HTTP ${res.status}`;
@@ -256,7 +272,11 @@ async function bootstrapData() {
 function updateSysInfoPill() {
   const el = document.getElementById('sysInfoPill');
   const st = state.systemStatus;
-  if (el && st) el.textContent = `v${st.version} · PLC Modbus 127.0.0.1:${st.modbus_slave_port}`;
+  if (!el || !st) return;
+  // L'automate Modbus embarqué n'existe qu'avec la simulation active
+  el.textContent = st.simulation_enabled
+    ? `v${st.version} · PLC Modbus simulé 127.0.0.1:${st.modbus_slave_port}`
+    : `v${st.version}`;
 }
 
 function getActiveDashboard() {
@@ -328,11 +348,19 @@ async function confirmServerShutdown() {
   if (!confirm('Confirmer la MISE HORS TENSION de l\'application Apex Supervision ?\nTous les drivers industriels seront déconnectés proprement.')) {
     return;
   }
+  let res;
   try {
-    const res = await fetch('/api/system/standby', { method: 'POST' });
-    if (res.ok) state.systemStatus = await res.json();
-  } catch (_) {}
-
+    res = await fetch('/api/system/standby', { method: 'POST' });
+  } catch (_) {
+    alert('Serveur injoignable : la mise hors tension n\'a pas été effectuée.');
+    return;
+  }
+  // L'écran « hors tension » ne s'affiche que si le serveur a accepté la demande
+  if (!res.ok) {
+    alert(`Mise hors tension refusée : ${await apiError(res)}`);
+    return;
+  }
+  state.systemStatus = await res.json().catch(() => state.systemStatus);
   showPowerOffOverlay();
 }
 
@@ -342,11 +370,11 @@ function showPowerOffOverlay() {
   document.getElementById('powerOverlayTitle').style.color = '#ef4444';
   document.getElementById('powerOverlayTitle').textContent = 'Application Apex Supervision Arrêtée (Hors Tension)';
   document.getElementById('powerOverlayMsg').innerHTML = `
-    Tous les drivers industriels (Automate Modbus TCP, Simulateur GTB, MQTT) ont été arrêtés proprement.<br>
+    Tous les drivers industriels ont été arrêtés proprement.<br>
     L'acquisition temps réel est hors tension.<br><br>
     <div style="display:flex;gap:12px;justify-content:center;margin-top:16px;flex-wrap:wrap;">
       <button class="btn btn-success" style="padding:10px 20px;font-size:14px;" onclick="powerOnFromStandby()">⚡ Rallumer / Redémarrer l'Application</button>
-      <button class="btn btn-danger" style="padding:10px 16px;font-size:12px;" onclick="terminateOsProcess()">🛑 Quitter définitivement le serveur Windows (.exe)</button>
+      <button class="btn btn-danger" style="padding:10px 16px;font-size:12px;" onclick="terminateOsProcess()">🛑 Arrêter définitivement le moteur apex-scada</button>
     </div>
   `;
   overlay.style.display = 'flex';
@@ -373,17 +401,31 @@ async function powerOnFromStandby() {
 }
 
 async function terminateOsProcess() {
-  if (!confirm('Voulez-vous fermer définitivement le processus serveur Windows (rust-scada-flow.exe) ?')) {
+  if (!confirm('Voulez-vous arrêter définitivement le moteur apex-scada ?\nL\'IHM restera indisponible jusqu\'à sa relance.')) {
     return;
   }
+  // Pas de reconnexion temps réel pendant l'arrêt ; rétabli si la demande échoue
   state.shuttingDown = true;
-  document.getElementById('powerOverlayMsg').innerHTML = `
-    Le processus serveur Windows <code>rust-scada-flow.exe</code> a été arrêté.<br><br>
-    Pour le relancer ultérieurement, double-cliquez sur <code>Demarrer-SCADA.bat</code> ou exécutez <code>cargo run</code>.
-  `;
+  let res;
   try {
-    await fetch('/api/system/shutdown', { method: 'POST' });
-  } catch (_) {}
+    res = await fetch('/api/system/shutdown', { method: 'POST' });
+  } catch (_) {
+    state.shuttingDown = false;
+    alert('Serveur injoignable : l\'arrêt n\'a pas pu être demandé.');
+    return;
+  }
+  if (!res.ok) {
+    state.shuttingDown = false;
+    alert(`Arrêt refusé : ${await apiError(res)}`);
+    return;
+  }
+  // Message affiché seulement une fois l'arrêt accepté par le serveur (réponse 2xx)
+  document.getElementById('powerOverlayMsg').innerHTML = `
+    Le moteur <code>apex-scada</code> est arrêté.<br><br>
+    Relancez-le depuis l'utilitaire Apex Supervision, ou par le service :
+    <code>apex-scada service start</code> (Windows, invite administrateur)
+    ou <code>sudo systemctl start apex-scada</code> (Linux).
+  `;
 }
 
 // ============================================================================
@@ -2681,7 +2723,11 @@ async function exportProjectBackup() {
   const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `rust_scada_flow_backup_${Date.now()}.json`;
+  // Horodatage local lisible et valide dans un nom de fichier : AAAA-MM-JJ_HH-MM-SS
+  const d = new Date();
+  const p2 = n => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}_${p2(d.getHours())}-${p2(d.getMinutes())}-${p2(d.getSeconds())}`;
+  a.download = `apex_supervision_projet_${stamp}.json`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
@@ -2697,13 +2743,19 @@ async function importProjectBackup(event) {
     alert('Fichier JSON invalide.');
     return;
   }
+  const body = JSON.stringify(bundle);
+  const size = new Blob([body]).size;
+  if (size > PROJECT_IMPORT_MAX_BYTES) {
+    alert(`Import refusé : ${payloadTooLargeMessage(PROJECT_IMPORT_MAX_BYTES, size)}`);
+    return;
+  }
   const res = await fetch('/api/system/import', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(bundle)
+    body
   });
   if (!res.ok) {
-    alert(`Import refusé : ${await apiError(res)}`);
+    alert(`Import refusé : ${await apiError(res, PROJECT_IMPORT_MAX_BYTES)}`);
     return;
   }
   const r = await res.json();
@@ -3086,8 +3138,9 @@ async function installBuiltinPack(packId) {
 async function handleSymbolFileUpload(event) {
   const file = event.target.files[0];
   if (!file) return;
-  if (file.size > 1024 * 1024) {
-    alert('Fichier trop volumineux (1 Mo maximum).');
+  // Moitié de la limite du serveur : l'encodage JSON du contenu peut presque doubler sa taille
+  if (file.size > SYMBOL_IMPORT_MAX_BYTES / 2) {
+    alert(`Fichier trop volumineux (${formatMegabytes(SYMBOL_IMPORT_MAX_BYTES / 2)} maximum).`);
     return;
   }
   const text = await file.text();
@@ -3104,10 +3157,16 @@ async function submitSymbolImport() {
     raw_content: document.getElementById('symImportRaw').value,
     animate_rotation: document.getElementById('symImportAnim').checked
   };
+  const body = JSON.stringify(payload);
+  const size = new Blob([body]).size;
+  if (size > SYMBOL_IMPORT_MAX_BYTES) {
+    alert(`Erreur d'import : ${payloadTooLargeMessage(SYMBOL_IMPORT_MAX_BYTES, size)}`);
+    return;
+  }
   const res = await fetch('/api/symbols/import', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
+    body
   });
   if (res.ok) {
     const imported = await res.json();
@@ -3116,7 +3175,7 @@ async function submitSymbolImport() {
     closeSymbolLibraryModal();
     alert(`${imported.length} symbole(s) industriel(s) importé(s) dans la section "📦 Bibliothèques Importées" de la Palette Studio !`);
   } else {
-    alert(`Erreur d'import : ${await apiError(res)}`);
+    alert(`Erreur d'import : ${await apiError(res, SYMBOL_IMPORT_MAX_BYTES)}`);
   }
 }
 
