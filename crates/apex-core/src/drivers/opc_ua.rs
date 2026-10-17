@@ -163,7 +163,7 @@ impl NodeKind {
             let v: i128 = match value {
                 TagValue::Int(i) => *i as i128,
                 TagValue::Bool(b) => *b as i128,
-                TagValue::Float(f) if f.fract() == 0.0 && f.is_finite() => *f as i128,
+                TagValue::Float(f) if f.is_finite() => f.round() as i128,
                 _ => return Err(format!("valeur entière attendue pour un nœud {:?}", self)),
             };
             if v < min || v > max {
@@ -250,6 +250,12 @@ fn quality_of(status: Option<StatusCode>) -> Quality {
 struct Connection {
     session: Arc<Session>,
     event_loop: tokio::task::JoinHandle<StatusCode>,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.event_loop.abort();
+    }
 }
 
 impl Connection {
@@ -621,8 +627,18 @@ mod tests {
             NodeKind::Int16.to_variant(&TagValue::Int(-300)).unwrap(),
             Variant::Int16(-300)
         );
+        assert_eq!(
+            NodeKind::Int16.to_variant(&TagValue::Float(215.3)).unwrap(),
+            Variant::Int16(215)
+        );
         assert!(NodeKind::Int16.to_variant(&TagValue::Int(70000)).is_err());
         assert!(NodeKind::UInt16.to_variant(&TagValue::Int(-1)).is_err());
+        assert_eq!(
+            NodeKind::UInt16
+                .to_variant(&TagValue::Float(215.7))
+                .unwrap(),
+            Variant::UInt16(216)
+        );
         assert_eq!(
             NodeKind::Double.to_variant(&TagValue::Int(21)).unwrap(),
             Variant::Double(21.0)
@@ -637,5 +653,45 @@ mod tests {
             Quality::BadDisconnect
         );
         assert_eq!(quality_of(Some(StatusCode::Uncertain)), Quality::Uncertain);
+    }
+
+    #[tokio::test]
+    async fn connection_drop_aborts_event_loop() {
+        let task: tokio::task::JoinHandle<StatusCode> = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        let handle = task.abort_handle();
+        assert!(!handle.is_finished());
+
+        // On vérifie que le drop de Connection appelle bien abort()
+        // Créons un client minimal sans connexion réseau
+        let pki = std::env::temp_dir().join("apex-test-opcua-drop");
+        let client = ClientBuilder::new()
+            .create_sample_keypair(false)
+            .trust_server_certs(true)
+            .pki_dir(pki)
+            .client();
+        if let Ok(mut client) = client {
+            let endpoint: EndpointDescription = (
+                "opc.tcp://127.0.0.1:4840",
+                "None",
+                MessageSecurityMode::None,
+                UserTokenPolicy::anonymous(),
+            )
+                .into();
+            if let Ok((session, _)) =
+                client.connect_to_endpoint_directly(endpoint, IdentityToken::Anonymous)
+            {
+                let conn = Connection {
+                    session,
+                    event_loop: task,
+                };
+                drop(conn);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                assert!(handle.is_finished());
+            }
+        }
     }
 }

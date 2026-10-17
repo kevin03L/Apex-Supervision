@@ -1527,6 +1527,39 @@ fn mqtt_topic_matches(filter: &str, topic: &str) -> bool {
     }
 }
 
+/// Encode la charge utile d'écriture pour un équipement MQTT.
+/// Si l'adresse cible comporte une clé JSON (`sujet#clé`), la valeur est encapsulée dans un objet JSON `{"clé": valeur}`.
+/// Sinon, la valeur scalaire ou textuelle est directement sérialisée en JSON.
+fn encode_mqtt_write_payload(
+    protocol_address: &str,
+    value: &TagValue,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let (_topic, json_key) = mqtt_split_address(protocol_address);
+    if let Some(key) = json_key {
+        let mut map = serde_json::Map::new();
+        map.insert(key.to_string(), serde_json::to_value(value)?);
+        serde_json::to_vec(&serde_json::Value::Object(map))
+    } else {
+        serde_json::to_vec(value)
+    }
+}
+
+/// Extrait la valeur d'une variable depuis la charge utile d'un message MQTT reçu.
+/// Si l'adresse spécifie une clé JSON (`sujet#clé`), la clé doit être présente dans l'objet JSON.
+/// Si la clé est absente, aucun repli vers `Text` n'est effectué pour ne pas écraser les autres variables du sujet.
+fn extract_mqtt_tag_value(protocol_address: &str, payload_str: &str) -> Option<TagValue> {
+    let (_topic, json_key) = mqtt_split_address(protocol_address);
+    if let Some(key) = json_key {
+        let v = serde_json::from_str::<serde_json::Value>(payload_str).ok()?;
+        let field = v.get(key)?.clone();
+        serde_json::from_value::<TagValue>(field).ok()
+    } else {
+        serde_json::from_str::<TagValue>(payload_str)
+            .ok()
+            .or_else(|| Some(TagValue::Text(payload_str.to_string())))
+    }
+}
+
 pub struct MqttDriver {
     config: DriverConfig,
     core: Arc<ScadaCore>,
@@ -1605,7 +1638,7 @@ impl IndustrialDriver for MqttDriver {
                             );
                             continue;
                         }
-                        match serde_json::to_vec(&cmd.value) {
+                        match encode_mqtt_write_payload(&cmd.protocol_address, &cmd.value) {
                             Ok(payload) => match client.publish(topic, QoS::AtLeastOnce, false, payload).await {
                                 Ok(()) => core_ref.record_driver_write_accepted(&config.id),
                                 Err(e) => core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, &e.to_string()),
@@ -1614,13 +1647,21 @@ impl IndustrialDriver for MqttDriver {
                         }
                     }
                     _ = resync.tick(), if connected => {
+                        let mut to_sub = Vec::new();
                         for tag in core_ref.get_tags_for_driver(&config.id) {
                             let topic = mqtt_topic(&tag.protocol_address).to_string();
-                            if !subscribed.contains(&topic)
-                                && client.subscribe(topic.clone(), QoS::AtLeastOnce).await.is_ok()
-                            {
-                                subscribed.insert(topic);
+                            if !subscribed.contains(&topic) {
+                                subscribed.insert(topic.clone());
+                                to_sub.push(topic);
                             }
+                        }
+                        if !to_sub.is_empty() {
+                            let client_c = client.clone();
+                            tokio::spawn(async move {
+                                for t in to_sub {
+                                    let _ = client_c.subscribe(t, QoS::AtLeastOnce).await;
+                                }
+                            });
                         }
                     }
                     ev = eventloop.poll() => {
@@ -1628,32 +1669,38 @@ impl IndustrialDriver for MqttDriver {
                             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                                 core_ref.record_driver_poll(&config.id, true, 5, None);
                                 connected = true;
+                                let mut stale = 0usize;
+                                while write_rx.try_recv().is_ok() {
+                                    stale += 1;
+                                }
+                                if stale > 0 {
+                                    warn!(
+                                        "Driver MQTT '{}' : {} commande(s) d'écriture en attente purgée(s) à la reconnexion",
+                                        config.id, stale
+                                    );
+                                }
                                 // Nouvelle session : tous les abonnements sont à refaire
                                 subscribed.clear();
                                 resync.reset_immediately();
                             }
                             Ok(Event::Incoming(Packet::Publish(publish))) => {
                                 core_ref.record_driver_poll(&config.id, true, 3, None);
+                                if core_ref.is_acquisition_paused() {
+                                    continue;
+                                }
                                 let payload_str = String::from_utf8_lossy(&publish.payload);
                                 for tag in core_ref.get_tags_for_driver(&config.id) {
-                                    let (topic, json_key) = mqtt_split_address(&tag.protocol_address);
+                                    let (topic, _) = mqtt_split_address(&tag.protocol_address);
                                     if mqtt_topic_matches(topic, &publish.topic) {
-                                        let extracted = if let Some(key) = json_key {
-                                            serde_json::from_str::<serde_json::Value>(&payload_str)
-                                                .ok()
-                                                .and_then(|v| v.get(key).cloned())
-                                                .and_then(|v| serde_json::from_value::<TagValue>(v).ok())
-                                        } else {
-                                            serde_json::from_str::<TagValue>(&payload_str).ok()
-                                        };
-                                        let val = extracted.unwrap_or_else(|| TagValue::Text(payload_str.to_string()));
-                                        if let Ok(coerced) = val.coerce_to(tag.data_type) {
-                                            let _ = core_tx.send(TagState {
-                                                tag_id: tag.id.clone(),
-                                                value: coerced,
-                                                quality: Quality::Good,
-                                                timestamp: Utc::now(),
-                                            }).await;
+                                        if let Some(val) = extract_mqtt_tag_value(&tag.protocol_address, &payload_str) {
+                                            if let Ok(coerced) = val.coerce_to(tag.data_type) {
+                                                let _ = core_tx.send(TagState {
+                                                    tag_id: tag.id.clone(),
+                                                    value: coerced,
+                                                    quality: Quality::Good,
+                                                    timestamp: Utc::now(),
+                                                }).await;
+                                            }
                                         }
                                     }
                                 }
@@ -1931,5 +1978,46 @@ mod tests {
         assert!(mqtt_topic_matches("bat/#", "bat/ta01/temp"));
         assert!(mqtt_topic_matches("bat/#", "bat"));
         assert!(!mqtt_topic_matches("bat/ta01", "bat/ta01/temp"));
+    }
+
+    #[test]
+    fn mqtt_json_key_payload_encoding_and_extraction() {
+        // 1. Écriture avec clé JSON : encapsulée dans un objet {"clé": valeur}
+        let payload_bytes =
+            encode_mqtt_write_payload("bat/cta01#consigne", &TagValue::Float(21.5)).unwrap();
+        let json_val: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+        assert_eq!(json_val, serde_json::json!({ "consigne": 21.5 }));
+
+        // 2. Écriture sans clé JSON : scalaire direct
+        let payload_bytes = encode_mqtt_write_payload("bat/cta01", &TagValue::Float(21.5)).unwrap();
+        let json_val: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+        assert_eq!(json_val, serde_json::json!(21.5));
+
+        // 3. Réception avec clé JSON présente : extraction correcte
+        let raw_json = r#"{"consigne": 21.5, "temp_ext": 14.2}"#;
+        assert_eq!(
+            extract_mqtt_tag_value("bat/cta01#consigne", raw_json),
+            Some(TagValue::Float(21.5))
+        );
+        assert_eq!(
+            extract_mqtt_tag_value("bat/cta01#temp_ext", raw_json),
+            Some(TagValue::Float(14.2))
+        );
+
+        // 4. Réception avec clé JSON absente : None (jamais de repli vers Text qui écraserait les variables)
+        assert_eq!(
+            extract_mqtt_tag_value("bat/cta01#autre_cle", raw_json),
+            None
+        );
+
+        // 5. Réception sans clé JSON : parsing scalaire ou repli vers Text
+        assert_eq!(
+            extract_mqtt_tag_value("bat/cta01", "21.5"),
+            Some(TagValue::Float(21.5))
+        );
+        assert_eq!(
+            extract_mqtt_tag_value("bat/cta01", "texte brut"),
+            Some(TagValue::Text("texte brut".into()))
+        );
     }
 }

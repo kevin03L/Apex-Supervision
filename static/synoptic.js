@@ -84,8 +84,6 @@ function inspectTagDirect(tagId) {
   const tag = state.tags[tagId];
   if (!tag) return;
   const box = document.getElementById('inspectorContent');
-  const val = tag.state ? tag.state.value : '';
-  const writeAllowed = tag.writable && canWrite();
   box.innerHTML = `
     <div style="border-bottom:1px solid var(--border);padding-bottom:8px;">
       <div style="color:var(--accent);font-weight:700;font-family:Consolas;">${esc(tag.id)}</div>
@@ -99,25 +97,39 @@ function inspectTagDirect(tagId) {
       <label>Source / Adresse Protocole</label>
       <input readonly value="${esc(tag.module_source)} — ${esc(tag.protocol_address)}" />
     </div>
-    ${writeAllowed ? `
-      <div class="form-group">
-        <label>Forcer / Envoyer une Consigne</label>
-        <div style="display:flex;gap:6px;">
-          <input id="directWriteVal" value="${esc(val)}" />
-          <button class="btn btn-primary" onclick="sendWriteTag(${jsArg(tag.id)}, parseInputForTag(${jsArg(tag.data_type)}, document.getElementById('directWriteVal').value))">Envoyer</button>
-        </div>
-      </div>
-    ` : `<p style="color:#8b9bb4;font-size:11px;">${tag.writable ? 'Envoi de consignes non autorisé pour votre profil.' : 'Variable en lecture seule (Capteur / Mesure).'}</p>`}
+    <p style="color:#8b9bb4;font-size:11px;">${tag.writable ? 'Variable pilotable (sélectionnez un widget synoptique pour armer une commande en deux temps).' : 'Variable en lecture seule (Capteur / Mesure).'}</p>
   `;
 }
 
 function parseInputForTag(dataType, rawStr) {
   if (dataType === 'Bool') {
     const s = String(rawStr).toLowerCase().trim();
-    return s === 'true' || s === '1' || s === 'on' || s === 'marche';
+    if (s === 'true' || s === '1' || s === 'on' || s === 'marche') {
+      return true;
+    }
+    if (s === 'false' || s === '0' || s === 'off' || s === 'arret' || s === 'arrêt') {
+      return false;
+    }
+    if (typeof notify === 'function') {
+      notify(`Valeur booléenne invalide : « ${s} ». Valeurs acceptées : 1/0, on/off, marche/arret, true/false.`, 'error');
+    }
+    return null;
   }
-  if (dataType === 'Float' || dataType === 'Int') {
-    return parseFloat(rawStr);
+  if (dataType === 'Float') {
+    const v = parseFloat(rawStr);
+    if (!Number.isFinite(v)) {
+      if (typeof notify === 'function') notify('Valeur flottante invalide.', 'error');
+      return null;
+    }
+    return v;
+  }
+  if (dataType === 'Int') {
+    const v = parseFloat(rawStr);
+    if (!Number.isFinite(v)) {
+      if (typeof notify === 'function') notify('Valeur entière invalide.', 'error');
+      return null;
+    }
+    return Math.round(v);
   }
   return rawStr;
 }
@@ -1151,6 +1163,10 @@ function updateBoundWidgetsInPlace(tagId) {
       if (w.widget_type === 'SetpointButton' && document.activeElement && document.activeElement.id === `sp-in-${cssSafe(w.id)}`) {
         return;
       }
+      // Ne pas remplacer le corps DOM d'un bouton impulsionnel armé ou en cours d'appui
+      if (w.widget_type === 'PushButton' && state.armedCommand && state.armedCommand.widgetId === w.id) {
+        return;
+      }
       const el = document.getElementById(`widget-body-${cssSafe(w.id)}`);
       if (el) renderWidgetBody(el, w);
     }
@@ -1226,8 +1242,18 @@ function selectCommand(widgetId, tagId, value, momentary = false) {
   renderCommandBar();
 }
 
-/** Abandonne la commande sélectionnée (sans rien envoyer). */
+function cleanupGlobalPulseListeners() {
+  if (window.__pulseReleaseHandler) {
+    window.removeEventListener('mouseup', window.__pulseReleaseHandler);
+    window.removeEventListener('touchend', window.__pulseReleaseHandler);
+    window.removeEventListener('touchcancel', window.__pulseReleaseHandler);
+    window.__pulseReleaseHandler = null;
+  }
+}
+
+/** Abandonne la commande sélectionnée (sans rien envoyer, sauf remise à zéro d'impulsion si en cours). */
 function cancelCommand(announce = true) {
+  cleanupGlobalPulseListeners();
   const c = state.armedCommand;
   if (state.armedTimer) clearInterval(state.armedTimer);
   state.armedTimer = null;
@@ -1236,6 +1262,16 @@ function cancelCommand(announce = true) {
   if (bar) bar.remove();
   if (c) {
     refreshArmedWidget(c.widgetId);
+    if (c.pressed) {
+      c.pressed = false;
+      const writePromise = c.pendingWrite;
+      (async () => {
+        if (writePromise) {
+          try { await writePromise; } catch (_) {}
+        }
+        await sendWriteTag(c.tagId, false);
+      })();
+    }
     if (announce) notify('Commande annulée : rien n\'a été envoyé');
   }
 }
@@ -1261,9 +1297,26 @@ async function pulseCommand(widgetId, tagId, down) {
     }
     c.pressed = true;
     renderCommandBar();
-    await sendWriteTag(tagId, true);
+    cleanupGlobalPulseListeners();
+    const releaseHandler = () => {
+      cleanupGlobalPulseListeners();
+      pulseCommand(widgetId, tagId, false);
+    };
+    window.__pulseReleaseHandler = releaseHandler;
+    window.addEventListener('mouseup', releaseHandler);
+    window.addEventListener('touchend', releaseHandler);
+    window.addEventListener('touchcancel', releaseHandler);
+
+    c.pendingWrite = sendWriteTag(tagId, true);
+    await c.pendingWrite;
   } else if (armed && c.pressed) {
+    cleanupGlobalPulseListeners();
+    c.pressed = false;
+    const writePromise = c.pendingWrite;
     cancelCommand(false);
+    if (writePromise) {
+      try { await writePromise; } catch (_) {}
+    }
     if (await sendWriteTag(tagId, false)) notify(`Impulsion envoyée : ${c.title}`);
   }
 }
