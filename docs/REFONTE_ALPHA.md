@@ -308,10 +308,10 @@ La version est définie **une seule fois** (`[workspace.package] version`) et pr
 
 | Vérification | Résultat |
 |---|---|
-| `cargo test --workspace` (Windows, windows-gnu) | ✅ 81 tests réussis (dont 5 pour l'icône et la version Windows) |
+| `cargo test --workspace` (Windows, windows-gnu) | ✅ 142 tests réussis après les audits de contrôle (§12.5) : apex-core 66, apex-server 13 unitaires + 19 d'intégration, apex-admin 17, apex-config 23, apex-build 4 |
 | `cargo clippy --workspace --all-targets -- -D warnings` (Windows) | ✅ aucun avertissement |
 | `clippy -D warnings` de `apex-admin` et `apex-config` pour `x86_64-unknown-linux-gnu` | ✅ compilation croisée sans avertissement |
-| Compilation Linux complète, sous Docker (`ubuntu:22.04`, glibc 2.35, Rust 1.99.1, paquets de `LINUX_GUI_DEPS`) : `cargo build --release --locked -p apex-server -p apex-admin`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo fmt --all --check` | ✅ exécutée : aucune erreur, aucun avertissement, **76 tests réussis**. Le code `cfg(unix)` / `cfg(not(windows))` n'a demandé aucune correction. Le symbole le plus récent requis est `GLIBC_2.35` : il faut glibc 2.35 ou plus récente. |
+| Compilation Linux complète, sous Docker (`ubuntu:22.04`, glibc 2.35, Rust 1.99.1, paquets de `LINUX_GUI_DEPS`) : `cargo build --release --locked -p apex-server -p apex-admin`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo fmt --all --check` | ✅ exécutée : aucune erreur, aucun avertissement, **142 tests réussis** (relancé après les corrections des audits). Le code `cfg(unix)` / `cfg(not(windows))` n'a demandé aucune correction. Le symbole le plus récent requis est `GLIBC_2.35` : il faut glibc 2.35 ou plus récente. |
 | `cargo fmt --check` | ✅ appliqué à tout le workspace (commit dédié) |
 | Moteur en mode portable (Windows) : démarrage, `/api/health`, 2ᵉ instance (code 4, PID affiché), port occupé (code 5), configuration invalide (code 3), arrêt propre par jeton, `config migrate` v0 → v1, `migrate-legacy` sur une copie de la base 1.x (source inchangée, empreinte SHA-256 identique) | ✅ exécuté |
 | Utilitaire desktop piloté par UI Automation : assistant complet, enregistrement, démarrage du moteur, tableau de bord, configuration, diagnostics, arrêt avec confirmation, erreur de port | ✅ exécuté |
@@ -325,9 +325,9 @@ La version est définie **une seule fois** (`[workspace.package] version`) et pr
 | Icône du raccourci Linux (`Icon=apex-supervision`, thème `hicolor`) | ⚠️ non vérifié : paquet DEB non construit ici |
 | `service install` sans droits administrateur : refus explicite, aucun répertoire créé | ✅ exécuté |
 | Service Windows installé et piloté (SCM) | ⚠️ **à valider manuellement** : il faut les droits administrateur |
-| Installateur Windows | ⚠️ **compilé** par Inno Setup (`apex-supervision-0.4.0-alpha.1-windows-x64-setup.exe`), **non exécuté**. Installation, mise à jour et désinstallation restent à valider sur Windows 10 et 11. |
+| Installateur Windows | ⚠️ **compilé** par Inno Setup (recompilé après les audits) (`apex-supervision-0.4.0-alpha.1-windows-x64-setup.exe`), **non exécuté**. Installation, mise à jour et désinstallation restent à valider sur Windows 10 et 11. |
 | Paquet DEB : `cargo install cargo-deb --locked` (3.8.0) puis `cargo deb -p apex-server --no-build` | ✅ construit (`apex-supervision_0.4.0~alpha.1-1_amd64.deb`, 10,5 Mo, deux constructions successives identiques octet pour octet). Une seule correction : le résumé du paquet dépassait 79 caractères et cargo-deb le coupait sur deux lignes ; la `description` d'`apex-server` a été raccourcie. |
-| Paquet DEB testé sous Docker avec **systemd réel** (PID 1, `--privileged --cgroupns=host`) sur **Ubuntu 22.04** (systemd 249), **Debian 12** (systemd 252) et **Ubuntu 24.04** (systemd 255) | ✅ 35 vérifications réussies sur chaque distribution : `apt install` ; utilisateur et groupe `apex-scada` ; `/etc/apex-supervision/apex-scada.toml` en `0660 root:apex-scada` (dossier `2775`, `backups/` en `2770`) ; écoute par défaut sur `127.0.0.1:3000` ; service actif et activé ; `/api/health` (`"status":"ok"`, `run_mode` `service`) ; IHM web servie depuis `/usr/share/apex-supervision/web` ; `config check` ; `systemctl stop` puis « arrêté proprement » dans `journalctl` (`Result=success`, code 0) ; deux `restart` ; mise à jour par réinstallation (service relancé, nouveau PID, droits rétablis) ; `apt remove` (service arrêté, configuration, données et compte conservés) ; `apt purge` (configuration, données, journaux, compte, groupe et lien d'activation supprimés) ; réinstallation après purge. |
+| Paquet DEB testé sous Docker avec **systemd réel** (PID 1, `--privileged --cgroupns=host`) sur **Ubuntu 22.04** (systemd 249), **Debian 12** (systemd 252) et **Ubuntu 24.04** (systemd 255) | ✅ 35 vérifications réussies sur chaque distribution, rejouées après les audits avec l'unité `Type=notify` et le nouveau `postinst` (dans le conteneur Ubuntu, `/usr/sbin/policy-rc.d`, qui bloque tout démarrage de service pendant `apt`, est retiré au préalable, comme sur une vraie machine) : `apt install` ; utilisateur et groupe `apex-scada` ; `/etc/apex-supervision/apex-scada.toml` en `0660 root:apex-scada` (dossier `2775`, `backups/` en `2770`) ; écoute par défaut sur `127.0.0.1:3000` ; service actif et activé ; `/api/health` (`"status":"ok"`) ; IHM web servie depuis `/usr/share/apex-supervision/web` ; `config check` ; `systemctl stop` puis « arrêté proprement » dans `journalctl` (`Result=success`, code 0) ; deux `restart` ; mise à jour par réinstallation (service relancé, nouveau PID, droits rétablis) ; `apt remove` (service arrêté, configuration, données et compte conservés) ; `apt purge` (configuration, données, journaux, compte, groupe et lien d'activation supprimés) ; réinstallation après purge. |
 | Mise à jour avec conversion de la configuration (fichier v0 sans `config_version`), Ubuntu 22.04 | ✅ `postinst` convertit le fichier en v1, avec une sauvegarde dans `backups/` ; les valeurs sont conservées et les droits rétablis. Les commentaires ajoutés à la main sont perdus, comme prévu (documenté). |
 | Mise à jour d'un service arrêté ou désactivé (Debian 12) | ✅ Un service activé mais arrêté est **redémarré** par la mise à jour (comportement standard de debhelper) ; un service désactivé reste arrêté. Comportement documenté dans INSTALLATION.md §2.4. |
 | Durcissement systemd (`ProtectSystem=strict`, `MemoryDenyWriteExecute`, `RestrictAddressFamilies`, `PrivateDevices`, aucune capacité…) | ✅ Aucun refus dans le journal. Base SQLite (WAL), journaux fichiers, PID et verrou fonctionnent dans `StateDirectory`, `LogsDirectory` et `RuntimeDirectory`. Avec simulation et mode sûr, l'automate Modbus embarqué écoute bien sur `127.0.0.1:5502`. `systemd-analyze security` : exposition 3.0 « OK ». |
@@ -339,10 +339,7 @@ La version est définie **une seule fois** (`[workspace.package] version`) et pr
 
 Plateformes compilées : Windows x86_64 (gnu) et Linux x86_64 (glibc ≥ 2.35, compilé sous Docker).
 
-Anomalies relevées, non corrigées :
-- à la purge sur Ubuntu 22.04, dpkg affiche `directory '/usr/lib/systemd/system' not empty so not removed`. L'avertissement est sans conséquence : cargo-deb installe l'unité dans `/usr/lib/systemd/system`, alors que le paquet systemd de cette version déclare `/lib/systemd/system` (fusion de `/usr`) ;
-- `crates/apex-config/build.rs` lit le commit avec `git` et surveille `../../.git/HEAD`. Dans un worktree Git (`.git` est alors un fichier), ou sans `git` installé, la version affiche `inconnu` et le script de build est relancé à chaque compilation ;
-- le texte de l'utilitaire « Les actions sur le service demandent une confirmation administrateur (UAC sous Windows) » s'affiche aussi sous Linux, même quand la règle polkit dispense de confirmation.
+Anomalie relevée, non corrigée : à la purge sur Ubuntu 22.04, dpkg affiche `directory '/usr/lib/systemd/system' not empty so not removed`. L'avertissement est sans conséquence. cargo-deb installe l'unité dans `/usr/lib/systemd/system`, alors que le paquet systemd de cette version déclare `/lib/systemd/system` (fusion de `/usr`). Les deux autres anomalies relevées ici (`build.rs` dans un worktree, texte UAC affiché sous Linux) sont corrigées (lot B, §12.5).
 
 ### 12.3 Écarts par rapport au plan
 
@@ -363,3 +360,49 @@ En plus des critères du §11 :
 - l'utilitaire lance des actions élevées par PowerShell (`Start-Process -Verb RunAs`) : seul le code de sortie est connu, pas le message détaillé ;
 - l'assistant permet d'ouvrir le serveur au réseau alors que les comptes d'usine (`admin/admin123`…) sont encore actifs : une étape « mot de passe administrateur » est à ajouter ;
 - tests automatisés de l'utilitaire desktop (les essais par UI Automation restent manuels) ; les tests d'intégration du serveur sont faits (`crates/apex-server/tests/`).
+
+### 12.5 Audits de contrôle et corrections
+
+Deux audits indépendants ont relu tout le code de la refonte. Chaque anomalie a été reproduite avant d'être retenue, puis chaque lot de corrections a été repris par un vérificateur adverse chargé de rejouer le scénario d'origine et de chercher les régressions.
+
+**Audit B : configuration, utilitaire, packaging (25 anomalies, toutes corrigées).** Points principaux :
+- ACL Windows de `C:ProgramDataApex Supervision` : héritage retiré et propriétaire forcé (`service permissions`) ;
+- écriture de la configuration : fichier temporaire imprévisible, verrou, droits et groupe conservés sous Linux, sauvegarde jamais supprimée par la rotation ;
+- refus d'un démarrage « système » sur un poste où le logiciel n'est pas installé (code 3) ;
+- utilitaire : cible réellement en marche, assistant aux étapes indépendantes, fermeture bloquée pendant une action ;
+- `sd_notify` (`Type=notify`) et droits des sauvegardes dans `postinst`.
+
+**Audit A : moteur, API, IHM (16 anomalies confirmées, dont 2 critiques, toutes corrigées).**
+
+| Id | Anomalie | Correction |
+|---|---|---|
+| A1 (critique) | XSS stockée par un SVG de symbole ou de synoptique | Analyse XML réelle (quick-xml) et reconstruction par liste blanche côté serveur. L'IHM reconstruit l'arbre par le DOM, sans `innerHTML`. |
+| A2 (critique) | `migrate-legacy --force` pouvait perdre la base en place (journal WAL) | Sauvegarde complète par `VACUUM INTO` avant tout remplacement ; checkpoint WAL à l'arrêt. |
+| A3 | Auto-Découverte inventant des variables fictives (dont une inscriptible) sur les drivers réels Modbus TCP et MQTT | Réservée aux protocoles simulés ; erreur 400 sinon. |
+| A4 | Écriture Modbus INT32 refusée, et une exception coupait la liaison | INT32 inscriptible ; un refus est tracé (`WRITE_REJECTED`) sans couper la liaison. |
+| A5 | Valeurs hors plage saturées en silence | Refus 400. |
+| A6 | Verrouillage de connexion non atomique, Argon2 sans borne | Réservation atomique, 4 vérifications simultanées, attente bornée (503). |
+| A7 | Le jeton de contrôle local ouvrait une session administrateur | Limité à l'arrêt propre et à l'état, sous l'acteur « Utilitaire local ». |
+| A8 | L'import de projet enregistrait des drivers simulés alors que la simulation est désactivée | Drivers simulés et leurs variables écartés (`ignored_drivers`, `ignored_tags`). |
+| A9 | Escalade HH/LL retardée par la bande morte | La bande morte ne retarde que la disparition. |
+| A10 | Énumération des comptes par le temps de réponse | Vérification à coût constant (hachage factice). |
+| A11 | Script Rhai invalide accepté, erreur journalisée à chaque cycle | Refus à l'enregistrement, avertissement unique. |
+| A12 | Sortie de flux réécrite en boucle sur l'équipement quand la bande morte du tag dépasse 0,08 | Réécriture seulement au-delà de la bande morte. |
+| A13 | Import de projet limité à 2 Mo alors que l'export n'a pas de limite | 64 Mo (projet) et 16 Mo (symboles), rôle contrôlé avant la lecture du corps. |
+| A14 | Messages et noms de l'ancien produit dans l'IHM | Textes et noms d'export alignés ; arrêt refusé correctement affiché. |
+| A15 | Détails d'exécution exposés via un proxy local | Réservés au porteur du jeton local, en connexion directe. |
+| A16 | Réinitialisation d'un mot de passe sans fermeture des sessions | Sessions fermées. Une connexion simultanée ne peut plus restaurer l'ancien mot de passe. |
+
+**Régressions trouvées par les vérificateurs, corrigées :**
+- écriture de flux perdue lors d'une coupure : la sortie est réécrite après un refus ou un changement d'état de la liaison ;
+- refus d'écriture effacé de la carte du driver dès la scrutation suivante ;
+- succès partiel présenté comme une erreur à la modification d'un driver simulé ;
+- dessins perdus pour des exports Illustrator (`<style>`), draw.io (`<switch>`, `<a>`) et pour certains filtres ;
+- course entre connexion et réinitialisation du mot de passe (A16).
+
+**Limites assumées :**
+- Pas de limitation par adresse IP. Un tiers peut verrouiller temporairement un identifiant (60 s).
+- La CSP garde `unsafe-inline` pour les scripts, et le jeton de session reste dans `localStorage`. Lever ces deux points demande une refonte de l'IHM (gestionnaires `onclick` en ligne).
+- Un symbole SVG peut encore modifier l'apparence d'autres éléments de la page par des animations sur `display` ou `fill`, sans exécuter de script.
+- MQTT : l'identifiant client devient `apex-scada-<id>` (au lieu de `rust-scada-flow-<id>`). Adaptez les ACL du broker si elles en dépendent.
+- Les écritures Modbus réelles (INT32, exception) ne sont couvertes que par des tests unitaires : le mode sûr bloque les consignes dans les tests d'intégration.

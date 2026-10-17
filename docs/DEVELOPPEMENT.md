@@ -51,10 +51,11 @@ cargo test --workspace
 
 | Crate | Tests | Couverture principale |
 |---|---|---|
-| `apex-config` | 18 | Valeurs par défaut sûres, validation par champ, migrations (v0 → v1, format trop récent), écriture atomique, sauvegarde et restauration, conflit, verrou, erreurs lisibles, chemins système et portables |
-| `apex-core` | 37 | Moteur : alarmes, bande morte, mise en sommeil, historique, sécurité, compatibilité des données |
-| `apex-server` | 5 + 9 | Unitaires : ligne de commande, instance unique. Intégration (boîte noire, tableau ci-dessous) |
-| `apex-admin` | 16 | Client HTTP (réponses simples et découpées, serveur injoignable), journaux, diagnostics, formulaires, verrou d'instance, libellés |
+| `apex-build` | 4 | Version de fichier Windows dérivée de la version du paquet |
+| `apex-config` | 23 | Valeurs par défaut sûres, validation par champ, migrations (v0 → v1, format trop récent), écriture atomique, sauvegarde et restauration, conflit, verrou, erreurs lisibles, chemins système et portables |
+| `apex-core` | 66 | Moteur : alarmes et escalade, bande morte, mise en sommeil, historique, sécurité (assainissement SVG, verrouillage et courses de connexion, sessions), drivers Modbus (encodage, plages), flux, compatibilité des données |
+| `apex-server` | 13 + 19 | Unitaires : ligne de commande, instance unique, reprise 1.x. Intégration : `boite_noire.rs` (12), `drivers_automatismes.rs` (4), `exploitation.rs` (3), tableau ci-dessous |
+| `apex-admin` | 17 | Client HTTP (réponses simples et découpées, serveur injoignable), journaux, diagnostics, formulaires, verrou d'instance, libellés |
 
 **Tests d'intégration du serveur** (`crates/apex-server/tests/boite_noire.rs`, outillage dans `tests/common/mod.rs`). Chaque test lance le binaire `apex-scada` compilé (`CARGO_BIN_EXE_apex-scada`) :
 - dans un dossier neuf et unique sous `target/tmp/apex-it/`, en mode portable, avec un fichier `--config` écrit par le test ;
@@ -64,7 +65,7 @@ Le dialogue passe uniquement par HTTP et WebSocket, avec un client minimal écri
 
 | Test | Vérifie |
 |---|---|
-| `health_est_public_et_detaille_en_boucle_locale` | `GET /api/health` sans jeton ; en boucle locale, `runtime` (PID, mode `manual`, mode sûr, simulation, fichier de configuration, empreinte), `started_at` et `total_drivers` ; en-têtes de sécurité et `Cache-Control: no-store` ; détails absents dès qu'un en-tête de proxy (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`) est présent |
+| `health_est_public_et_detaille_en_boucle_locale` | `GET /api/health` sans jeton : aucun détail d'exécution, même en boucle locale (ni avec un jeton inventé) ; avec le jeton de contrôle local, `runtime` (PID, mode `manual`, mode sûr, simulation, fichier de configuration, empreinte), `started_at` et `total_drivers` ; en-têtes de sécurité et `Cache-Control: no-store` ; détails absents dès qu'un en-tête de proxy (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`) est présent |
 | `authentification_jeton_obligatoire` | 401 sans jeton ou avec un jeton inconnu ; échec de connexion (même message pour un mot de passe faux et un compte inconnu) ; connexion `admin`/`admin123`, rôle `Admin`, hachage non publié ; `X-Scada-Token` et `Authorization: Bearer` ; jeton invalidé par la déconnexion |
 | `verrouillage_resiste_aux_tentatives_concurrentes` | 30 connexions simultanées avec un mot de passe faux : exactement 5 réponses 401, 25 réponses 403 ; le bon mot de passe est refusé pendant le verrouillage, les autres comptes restent utilisables |
 | `reinitialisation_du_mot_de_passe_ferme_les_sessions` | Nouveau mot de passe donné par l'administrateur : sessions du compte fermées ; sur son propre compte, l'administrateur garde sa session courante ; modification sans mot de passe : sessions conservées |
@@ -75,6 +76,13 @@ Le dialogue passe uniquement par HTTP et WebSocket, avec un client minimal écri
 | `code_4_deuxieme_instance_meme_dossier` | Deuxième processus sur le même dossier : code 4, et la première instance continue de répondre |
 | `code_5_port_occupe` | Port web tenu par le test : code 5, détecté avant l'ouverture de la base |
 | `jeton_de_controle_local_reserve_a_l_arret_propre` | Jeton `run/control.token` : `GET /api/system/status` accepté ; 403 sur les utilisateurs, les tags, l'export, le redémarrage et le WebSocket ; 401 dès qu'un en-tête de proxy est présent ; aucun compte créé |
+| `auto_decouverte_refusee_sur_un_driver_reel` (drivers_automatismes) | 400 pour Modbus TCP et MQTT, aucune variable créée |
+| `variable_modbus_inscriptible_en_lecture_seule_refusee` | Variable inscriptible sur `DI`/`IR` refusée à l'enregistrement |
+| `flux_avec_script_rhai_invalide_refuse` | Script Rhai vide ou invalide : 400, flux non enregistré |
+| `import_sans_simulation_ecarte_les_drivers_simules` | Import d'un projet sans simulation : drivers simulés et variables écartés (`ignored_drivers`, `ignored_tags`) |
+| `arret_propre_reporte_le_journal_wal_dans_la_base` (exploitation) | Après un arrêt propre, les données sont dans le fichier principal de la base |
+| `migrate_legacy_force_sauvegarde_une_base_restee_en_wal` | Base en place encore en WAL : refus sans `--force`, sauvegarde complète (`.bak-<date>`) avec `--force` |
+| `imports_volumineux_acceptes_jusqu_a_leur_limite` | 3 Mo acceptés, limite + 1 octet → 413 (projet 64 Mo, symboles 16 Mo, autres routes 2 Mo) ; compte Visualisation refusé (403) avant l'envoi du corps |
 | `arret_propre_par_jeton_de_controle_local` | `POST /api/system/shutdown` : 401 sans jeton ; avec `run/control.token`, processus terminé avec le code 0, « arrêté proprement » dans la sortie et dans le journal fichier, jeton supprimé, port libéré ; arrêt accepté avec le compte `admin` désactivé ; après relance, l'arrêt figure au journal d'audit sous l'acteur « Utilitaire local » |
 
 Ce que ces tests ne couvrent pas : l'absence des détails `runtime` pour un client distant (il faudrait une seconde interface réseau), le service Windows et l'unité systemd, ainsi que tout équipement réel.
