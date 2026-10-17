@@ -596,7 +596,12 @@ mod tests {
         {
             let result = std::process::Command::new("powershell")
                 .args(["-NoProfile", "-Command", "$allowed = @('S-1-5-18', 'S-1-5-32-544', [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value); $acl = Get-Acl -LiteralPath $env:APEX_TOKEN_TEST_PATH; if (!$acl.AreAccessRulesProtected) { exit 1 }; foreach ($ace in $acl.Access) { if ($ace.IsInherited -or $allowed -notcontains $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value) { exit 2 } }; exit 0"])
-                .env("APEX_TOKEN_TEST_PATH", &token_path).output().unwrap();
+                .env("APEX_TOKEN_TEST_PATH", &token_path)
+                // Lancé depuis PowerShell 7 (CI), Windows PowerShell 5.1 hériterait de son
+                // PSModulePath et ne pourrait plus charger Get-Acl.
+                .env_remove("PSModulePath")
+                .output()
+                .unwrap();
             assert!(
                 result.status.success(),
                 "ACL du jeton trop larges : {:?}",
