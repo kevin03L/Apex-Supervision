@@ -824,7 +824,11 @@ pub fn decode_registers_f32_be(regs: &[u16], word_swap: bool) -> Result<f64, Str
         BigEndian::write_u16(&mut buf[0..2], regs[0]);
         BigEndian::write_u16(&mut buf[2..4], regs[1]);
     }
-    Ok(round2(BigEndian::read_f32(&buf) as f64))
+    let f = BigEndian::read_f32(&buf);
+    if !f.is_finite() {
+        return Err("valeur Float32 non finie (NaN ou Infini)".to_string());
+    }
+    Ok(round2(f as f64))
 }
 
 pub fn encode_f32_to_registers_be(val: f32, word_swap: bool) -> [u16; 2] {
@@ -1761,6 +1765,17 @@ mod tests {
         assert_eq!(encode_f32_to_registers_be(7.5, false), [0x40F0, 0x0000]);
         assert_eq!(encode_f32_to_registers_be(7.5, true), [0x0000, 0x40F0]);
         assert!(decode_registers_f32_be(&[1], false).is_err());
+    }
+
+    #[test]
+    fn decode_registers_f32_be_rejects_nan_and_infinity() {
+        assert!(decode_registers_f32_be(&[0x7FFF, 0xFFFF], false).is_err());
+        assert!(decode_registers_f32_be(&[0xFFFF, 0xFFFF], false).is_err());
+        assert!(decode_registers_f32_be(&[0xFFFF, 0x7FFF], true).is_err());
+        assert!(decode_registers_f32_be(&[0x7F80, 0x0000], false).is_err());
+        assert!(decode_registers_f32_be(&[0x0000, 0x7F80], true).is_err());
+        assert!(decode_registers_f32_be(&[0xFF80, 0x0000], false).is_err());
+        assert!(decode_registers_f32_be(&[0x0000, 0xFF80], true).is_err());
     }
     fn specs(addrs: &[&str]) -> Vec<ModbusAddressSpec> {
         addrs
