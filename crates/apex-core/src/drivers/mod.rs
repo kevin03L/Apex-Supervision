@@ -1423,14 +1423,14 @@ pub fn check_modbus_write(protocol_address: &str, value: &TagValue) -> Result<()
     encode_modbus_write(spec, value).map(|_| ())
 }
 
-/// Contrôle à l'enregistrement qu'une variable Modbus déclarée inscriptible vise une zone
-/// écrivable (COIL ou HR) avec un type numérique ou booléen.
+/// Contrôle à l'enregistrement qu'une variable Modbus a une adresse syntaxiquement valide
+/// et, si déclarée inscriptible, qu'elle vise une zone écrivable (COIL ou HR) avec un type numérique ou booléen.
 pub fn validate_modbus_tag(tag: &RegisteredTag) -> Result<(), String> {
+    let spec = ModbusAddressSpec::parse(&tag.protocol_address)
+        .map_err(|e| format!("Variable '{}' : {}", tag.id, e))?;
     if !tag.writable {
         return Ok(());
     }
-    let spec = ModbusAddressSpec::parse(&tag.protocol_address)
-        .map_err(|e| format!("Variable inscriptible '{}' : {}", tag.id, e))?;
     if !spec.is_writable() {
         return Err(format!(
             "Variable '{}' : l'adresse '{}' est en lecture seule (entrées TOR « DI » et registres d'entrée « IR ») ; elle ne peut pas être déclarée inscriptible",
@@ -1899,6 +1899,11 @@ mod tests {
         t.writable = false;
         t.protocol_address = "IR:3:FLOAT32".to_string();
         assert!(validate_modbus_tag(&t).is_ok());
+        // Mais son adresse doit être syntaxiquement valide (S-33)
+        t.protocol_address = "HR:0:FLOAT".to_string();
+        assert!(validate_modbus_tag(&t).is_err());
+        t.protocol_address = "INVALIDE:0".to_string();
+        assert!(validate_modbus_tag(&t).is_err());
     }
 
     #[test]

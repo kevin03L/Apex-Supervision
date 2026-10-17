@@ -12,7 +12,7 @@
 //! L'arrêt (API, Ctrl+C, SIGTERM, gestionnaire de services Windows) suit le même chemin :
 //! arrêt des drivers, vidage du dernier lot d'historique, suppression du jeton, libération du verrou.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use apex_config::{has_errors, store, AppConfig, Layout, LayoutKind, Severity};
 use apex_core::{
@@ -342,6 +342,8 @@ pub async fn run(
     // sans quoi l'arrêt propre attendrait indéfiniment la fermeture des connexions.
     on_ready();
     let shutdown = Arc::clone(&core.shutdown_notify);
+    let core_shutdown = Arc::clone(&core);
+    let instance_name = cfg.instance.name.clone();
     let served = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -349,8 +351,26 @@ pub async fn run(
     .with_graceful_shutdown(async move {
         tokio::select! {
             _ = shutdown.notified() => info!("Arrêt demandé depuis l'IHM ou l'API"),
-            _ = wait_os_signal() => info!("Signal d'arrêt du système reçu"),
-            _ = stop.wait_for(|s| *s) => info!("Arrêt demandé par le gestionnaire de services"),
+            _ = wait_os_signal() => {
+                info!("Signal d'arrêt du système reçu");
+                core_shutdown.record_audit(
+                    "Système",
+                    "SERVEUR",
+                    "SHUTDOWN",
+                    &instance_name,
+                    "Signal d'arrêt du système reçu (SIGINT / SIGTERM)",
+                );
+            }
+            _ = stop.wait_for(|s| *s) => {
+                info!("Arrêt demandé par le gestionnaire de services");
+                core_shutdown.record_audit(
+                    "Système",
+                    "SERVEUR",
+                    "SHUTDOWN",
+                    &instance_name,
+                    "Arrêt demandé par le gestionnaire de services",
+                );
+            }
         }
         shutdown.notify_waiters();
         info!("Arrêt propre en cours : fermeture du serveur web...");
@@ -360,10 +380,10 @@ pub async fn run(
     // Arrêt propre
     core.shutdown();
     let _ = std::fs::remove_file(&token_file);
-    // Laisse aux écrivains (historique, alarmes, audit) le temps de vider leurs files
-    tokio::time::sleep(Duration::from_millis(1200)).await;
     // Dates d'activité des sessions à jour, pour leur reprise au prochain démarrage
     core.persist_sessions().await;
+    // Ferme formellement les canaux des écrivains SQLite et attend la fin de leur vidage (S-37)
+    core.drain_sqlite_writers().await;
     close_database(&pool).await;
     info!("{} arrêté proprement.", apex_config::version::PRODUCT_NAME);
 

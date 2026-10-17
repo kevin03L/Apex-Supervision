@@ -99,7 +99,15 @@ fn parse(raw: &str, path: &Path) -> Result<(AppConfig, Option<u32>), ConfigError
         path: path.to_path_buf(),
         message: e.message().to_string(),
     })?;
-    let (value, migrated_from) = crate::migrate::migrate(value)?;
+    let (value, migrated_from) = crate::migrate::migrate(value).map_err(|e| match e {
+        ConfigError::Schema { path: p, message } if p.as_os_str().is_empty() => {
+            ConfigError::Schema {
+                path: path.to_path_buf(),
+                message,
+            }
+        }
+        other => other,
+    })?;
     let config: AppConfig = value
         .try_into()
         .map_err(|e: toml::de::Error| ConfigError::Schema {

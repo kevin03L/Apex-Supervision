@@ -541,13 +541,27 @@ impl S7Client {
         p.extend_from_slice(params);
         p.extend_from_slice(data);
         let resp = self.exchange(&tpkt(&p)).await?;
+        Self::parse_s7_response(&resp, self.pdu_ref)
+    }
 
+    /// Analyse et valide une trame de réponse S7 brute (en-tête COTP DT + PDU S7 Ack_Data).
+    pub(crate) fn parse_s7_response(
+        resp: &[u8],
+        expected_pdu_ref: u16,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
         // COTP DT (3 octets) puis en-tête S7 de réponse (12 octets)
         if resp.len() < 15 || resp[1] != 0xF0 || resp[3] != 0x32 {
             return Err("Réponse S7 invalide".to_string());
         }
         let s7 = &resp[3..];
-        if u16::from_be_bytes([s7[4], s7[5]]) != self.pdu_ref {
+        // Contrôle du champ ROSCTR (S-34) : attendu 0x03 (Ack_Data)
+        if s7[1] != 0x03 {
+            return Err(format!(
+                "Réponse S7 invalide : type de message ROSCTR 0x{:02X} inattendu (attendu Ack_Data 0x03)",
+                s7[1]
+            ));
+        }
+        if u16::from_be_bytes([s7[4], s7[5]]) != expected_pdu_ref {
             return Err("Réponse S7 hors séquence".to_string());
         }
         let (err_class, err_code) = (s7[10], s7[11]);
@@ -970,5 +984,42 @@ mod tests {
         assert!(validate_s7_tag(&t).is_err(), "entrée inscriptible");
         t.writable = false;
         assert!(validate_s7_tag(&t).is_ok());
+    }
+
+    #[test]
+    fn s7_response_rosctr_and_sequence_validation() {
+        let pdu_ref = 0x1234u16;
+
+        // 1. Trame Ack_Data valide (ROSCTR = 0x03)
+        // COTP: 0x02, 0xF0, 0x80
+        // S7: 0x32, 0x03 (ROSCTR Ack_Data), 0x00, 0x00, 0x12, 0x34 (pdu_ref),
+        //     0x00, 0x02 (plen=2), 0x00, 0x01 (dlen=1), 0x00, 0x00 (err_class=0, err_code=0)
+        // params: [0xAA, 0xBB], data: [0xCC]
+        let mut valid_resp = vec![
+            0x02, 0xF0, 0x80, 0x32, 0x03, 0x00, 0x00, 0x12, 0x34, 0x00, 0x02, 0x00, 0x01, 0x00,
+            0x00, 0xAA, 0xBB, 0xCC,
+        ];
+        let (params, data) = S7Client::parse_s7_response(&valid_resp, pdu_ref).unwrap();
+        assert_eq!(params, vec![0xAA, 0xBB]);
+        assert_eq!(data, vec![0xCC]);
+
+        // 2. Trame avec ROSCTR invalide (ex: 0x01 Job au lieu de 0x03 Ack_Data) -> rejeté (S-34)
+        valid_resp[4] = 0x01;
+        let res = S7Client::parse_s7_response(&valid_resp, pdu_ref);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("ROSCTR 0x01 inattendu"));
+
+        // 3. Trame hors séquence (pdu_ref différent) -> rejeté
+        valid_resp[4] = 0x03;
+        let res = S7Client::parse_s7_response(&valid_resp, pdu_ref + 1);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("hors séquence"));
+
+        // 4. Trame avec erreur S7 renvoyée par l'automate (ex: 0x81, 0x04 PUT/GET)
+        valid_resp[13] = 0x81;
+        valid_resp[14] = 0x04;
+        let res = S7Client::parse_s7_response(&valid_resp, pdu_ref);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("PUT/GET"));
     }
 }

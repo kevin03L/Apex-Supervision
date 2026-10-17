@@ -95,7 +95,10 @@ fn health_est_public_et_detaille_en_boucle_locale() {
         let r = srv.call("GET", path, None, None);
         assert_eq!(r.status, 200, "{path}");
         assert_eq!(r.header("cache-control"), Some("no-cache"), "{path}");
-        assert!(r.header("content-security-policy").is_some(), "{path}");
+        let csp = r.header("content-security-policy").unwrap();
+        assert!(csp.contains("connect-src 'self'"), "{path}");
+        assert!(!csp.contains("ws:"), "{path}");
+        assert!(!csp.contains("wss:"), "{path}");
     }
 
     // Une route inconnue de l'API ne doit pas passer pour un succès
@@ -447,6 +450,36 @@ fn les_sessions_survivent_au_redemarrage_mais_pas_aux_revocations() {
         "session d'un compte désactivé reprise au redémarrage"
     );
 
+    // Tentative de connexion sur le compte désactivé : refus 403 et journalisation dans audit_logs (S-37)
+    let login_refused = srv.call(
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(&json!({
+            "username": VISU.0,
+            "password": VISU.1
+        })),
+    );
+    assert_eq!(login_refused.status, 403, "{}", login_refused.text());
+    let mut audit_items = serde_json::Value::Null;
+    for _ in 0..20 {
+        let audit_resp = srv.call("GET", "/api/audit?limit=20", Some(&admin), None);
+        assert_eq!(audit_resp.status, 200, "{}", audit_resp.text());
+        audit_items = audit_resp.json();
+        if audit_items.as_array().unwrap().iter().any(|e| {
+            e["category"] == "AUTH" && e["action"] == "LOGIN_REFUSED" && e["actor"] == "visu"
+        }) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        audit_items.as_array().unwrap().iter().any(|e| {
+            e["category"] == "AUTH" && e["action"] == "LOGIN_REFUSED" && e["actor"] == "visu"
+        }),
+        "refus sur compte désactivé non consigné dans audit_logs : {audit_items}"
+    );
+
     // Le jeton n'est jamais écrit en clair dans la base
     fn db_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -698,6 +731,9 @@ fn code_3_configuration_invalide() {
         ),
         // Format plus récent que le moteur
         ("version", "config_version = 99\n".to_string()),
+        // Numéro de version invalide (S-35)
+        ("version-negative", "config_version = -1\n".to_string()),
+        ("version-nulle", "config_version = 0\n".to_string()),
     ];
     for (name, content) in cases {
         let dir = TempDir::new(&format!("code3-{name}"));
