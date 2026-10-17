@@ -1,0 +1,103 @@
+/* ============================================================================
+   Apex Supervision — Synoptiques : fenêtre de l'écran cible, éléments, Studio
+   (bibliothèque, grille, poignées, inspecteur). Complète styles.css.
+   ============================================================================ */
+
+/* Écran Synoptiques : barre d'outils + zone de travail (bibliothèque | fenêtre | inspecteur) */
+#screen-synoptic.syn-screen { flex-direction: column; gap: .6em; min-height: 0; flex: 1; }
+#screen-synoptic.syn-screen:not(.on) { display: none; }
+#screen-synoptic.syn-screen.on { display: flex; }
+.syn-toolbar { display: flex; align-items: center; gap: .5em; flex-wrap: wrap; flex: none; }
+.syn-toolbar .studio-only { display: none; align-items: center; gap: .5em; }
+body.studio .syn-toolbar .studio-only { display: inline-flex; }
+.syn-zoom { display: inline-flex; align-items: center; gap: 2px; padding: 2px; border: 1px solid var(--line, rgba(120,160,220,.14));
+            border-radius: 8px; background: var(--glass, rgba(18,30,54,.78)); }
+.syn-zoom button { background: none; border: 0; color: var(--muted, #8ea2c0); padding: .2em .55em; border-radius: 6px; cursor: pointer; font: inherit; }
+.syn-zoom button:hover { color: var(--text, #e8eef8); background: rgba(56,189,248,.12); }
+.syn-zoom span { min-width: 3.8em; text-align: center; font-variant-numeric: tabular-nums; font-size: .9em; }
+
+.syn-work { flex: 1; min-height: 0; display: grid; grid-template-columns: 0 minmax(0, 1fr) 0; grid-template-rows: minmax(0, 1fr); }
+body.studio .syn-work { grid-template-columns: 15em minmax(0, 1fr) 16em; gap: .6em; }
+.syn-work > #leftTagPanel { grid-column: 1; }
+.syn-work > #synopticStage { grid-column: 2; grid-row: 1; }
+.syn-work > #rightStudioPanel { grid-column: 3; }
+/* Panneaux du Studio : masqués en exploitation (le synoptique occupe tout l'écran) */
+body:not(.studio) #screen-synoptic #leftTagPanel,
+body:not(.studio) #screen-synoptic #rightStudioPanel { display: none !important; }
+#screen-synoptic #leftTagPanel, #screen-synoptic #rightStudioPanel { min-height: 0; overflow: auto; overflow-x: hidden;
+  display: flex; flex-direction: column; background: var(--glass, rgba(18,30,54,.78)); border: 1px solid var(--line, rgba(120,160,220,.14));
+  border-radius: var(--r, 12px); }
+#rightStudioPanel .inspector-form { padding: .6em .7em; }
+/* Bibliothèque : titres de catégorie sur toute la largeur, symboles importés sans débordement */
+#leftTagPanel .palette-cat { grid-column: 1 / -1; font-size: .72em; text-transform: uppercase; letter-spacing: .6px;
+                             color: var(--muted, #8ea2c0); padding: .5em .1em .1em; }
+#leftTagPanel .palette-grid { flex: none; }
+#leftTagPanel .palette-item { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#customSymbolsPalette:empty { display: none; }
+#customSymbolsPalette { padding-top: 0; }
+
+/* Fenêtre : dimensions de l'écran cible, mise à l'échelle par fitSynopticToScreen() */
+#synopticStage { position: relative; min-width: 0; min-height: 0; overflow: hidden; border-radius: 12px; }
+body.studio #synopticStage { overflow: auto; background: rgba(4, 8, 16, .55); border: 1px solid var(--line, rgba(120,160,220,.14)); }
+#synopticSurface { position: absolute; left: 0; top: 0; transform-origin: 0 0; border-radius: 14px; overflow: visible;
+                   background: radial-gradient(circle at 30% 20%, #0f1d36, #091224 75%);
+                   box-shadow: 0 0 0 1px rgba(120,160,220,.22), 0 20px 50px rgba(0,0,0,.45); }
+body.studio #synopticSurface { background-image: radial-gradient(circle, rgba(120,160,220,.22) 1.2px, transparent 1.4px),
+                                                   radial-gradient(circle at 30% 20%, #0f1d36, #091224 75%);
+                                background-size: 20px 20px, auto; }
+#widgetsContainer { position: absolute; inset: 0; }
+#synFrameLabel { position: absolute; left: 0; top: -2.2em; font-size: 22px; color: var(--muted, #8ea2c0); white-space: nowrap; display: none; }
+body.studio #synFrameLabel { display: block; }
+
+/* Éléments : symbole et libellé, sans cadre ; le contenu suit la taille de l'élément */
+.syn-el { position: absolute; display: flex; flex-direction: column; align-items: center; justify-content: center;
+          background: none !important; border: 0 !important; box-shadow: none !important; padding: 0; overflow: visible; }
+.syn-el .widget-body { flex: 1; min-height: 0; width: 100%; display: flex; flex-direction: column; align-items: center;
+                       justify-content: center; gap: 4px; padding: 0; overflow: visible; }
+.syn-el .widget-body > svg { width: 100%; height: auto; max-height: 100%; flex: 1 1 auto; min-height: 0; }
+.syn-el .widget-body .custom-svg-wrapper { flex: 1; min-height: 0; width: 100%; display: flex; align-items: center; justify-content: center; }
+.syn-el .widget-body .custom-svg-wrapper svg { width: 100%; height: 100%; }
+.syn-el .widget-tag-sub { display: none; }
+body.studio .syn-el .widget-tag-sub { display: block; font-size: 11px; opacity: .7; }
+.syn-label { font-size: 13px; color: #cbd5e1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+             text-align: center; margin-top: 2px; flex: none; }
+.syn-label:empty { display: none; }
+body:not(.studio) .syn-el .btn { pointer-events: auto; }
+body:not(.studio) .syn-el:has(.btn):hover { filter: drop-shadow(0 0 6px rgba(56,189,248,.45)); }
+
+/* Studio : sélection, poignées, cotes */
+body.studio .syn-el { cursor: move; }
+body.studio .syn-el .btn, body.studio .syn-el input[type=range] { pointer-events: none; }
+body.studio .syn-el:hover { outline: 1px dashed rgba(120,160,220,.45); }
+.syn-el.selected { outline: 2px solid var(--accent, #38bdf8) !important; outline-offset: 2px; }
+.syn-el.drop-hover { outline: 2px dashed var(--accent, #38bdf8) !important; }
+.syn-handle { position: absolute; width: 12px; height: 12px; background: var(--accent, #38bdf8); border: 2px solid #061020;
+              border-radius: 3px; display: none; z-index: 2; }
+body.studio .syn-el.selected .syn-handle { display: block; }
+.syn-handle[data-h=nw] { left: -8px; top: -8px; cursor: nwse-resize; } .syn-handle[data-h=n] { left: calc(50% - 6px); top: -8px; cursor: ns-resize; }
+.syn-handle[data-h=ne] { right: -8px; top: -8px; cursor: nesw-resize; } .syn-handle[data-h=e] { right: -8px; top: calc(50% - 6px); cursor: ew-resize; }
+.syn-handle[data-h=se] { right: -8px; bottom: -8px; cursor: nwse-resize; } .syn-handle[data-h=s] { left: calc(50% - 6px); bottom: -8px; cursor: ns-resize; }
+.syn-handle[data-h=sw] { left: -8px; bottom: -8px; cursor: nesw-resize; } .syn-handle[data-h=w] { left: -8px; top: calc(50% - 6px); cursor: ew-resize; }
+.syn-dim { position: absolute; left: 50%; top: 100%; transform: translate(-50%, 12px); background: var(--accent, #38bdf8); color: #061020;
+           font: 700 13px Inter, system-ui, sans-serif; padding: 1px 8px; border-radius: 5px; white-space: nowrap; display: none; z-index: 3; }
+.syn-el.selected.moving .syn-dim { display: block; }
+
+/* Commande sélectionnée (exploitation) */
+.syn-el.cmd-armed { outline: 3px dashed var(--select, #fbbf24) !important; outline-offset: 6px; }
+
+/* Inspecteur */
+.insp { display: grid; gap: .55em; padding: .2em 0; }
+.insp label { display: flex; flex-direction: column; gap: .2em; font-size: .82em; color: var(--muted, #8ea2c0); min-width: 0; }
+.insp input:not([type=checkbox]), .insp select { width: 100%; min-width: 0; }
+.insp .insp-check { flex-direction: row; align-items: center; gap: .4em; }
+.insp-row { display: grid; grid-template-columns: 1fr 1fr; gap: .4em; }
+.insp-row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: .4em; }
+.insp-sec { font-size: .74em; text-transform: uppercase; letter-spacing: .8px; color: var(--muted, #8ea2c0);
+            padding-top: .5em; margin-top: .2em; border-top: 1px solid var(--line, rgba(120,160,220,.14)); }
+.insp-actions { display: flex; flex-wrap: wrap; gap: .3em; }
+.insp-actions .btn { padding: .3em .6em; font-size: .85em; }
+
+@media (max-width: 900px) {
+  body.studio .syn-work { grid-template-columns: 0 minmax(0, 1fr) 14em; }
+  body.studio #screen-synoptic #leftTagPanel { display: none !important; }
+}
