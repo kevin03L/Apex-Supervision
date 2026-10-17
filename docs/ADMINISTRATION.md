@@ -126,9 +126,17 @@ Les drivers **OPC-UA, BACnet/IP et Siemens S7 sont simulés** à ce stade : ils 
 ## 7. Sécurité
 
 - Changez les mots de passe des comptes d'usine (`admin`, `superviseur`, `visu`) dès la première connexion. Le moteur le rappelle dans ses journaux tant que ce n'est pas fait.
+- **Connexion** : après 5 tentatives sans succès, l'identifiant est verrouillé 60 secondes, y compris face à des tentatives simultanées. Un identifiant inconnu est traité comme un mot de passe faux, avec le même message et le même temps de réponse. Le moteur fait au plus 4 vérifications de mot de passe à la fois.
+- **Sessions** : changer le rôle d'un compte, le désactiver ou lui donner un nouveau mot de passe depuis l'écran Utilisateurs ferme toutes ses sessions ouvertes. Un administrateur qui change son propre mot de passe garde la session d'où il agit.
 - Le serveur parle **HTTP non chiffré**. Gardez `server.bind = 127.0.0.1` ou limitez l'accès par pare-feu. Pour un accès réseau, utilisez un proxy inverse HTTPS (nginx, Caddy, IIS).
-- Le jeton de contrôle local (arrêt propre par l'utilitaire) n'est accepté que depuis `127.0.0.1` et `::1`. Il est protégé par les permissions du système et régénéré à chaque démarrage.
+- **Jeton de contrôle local** (`run/control.token`, régénéré à chaque démarrage et protégé par les permissions du système). Il sert uniquement à l'utilitaire desktop et n'ouvre que deux routes : `POST /api/system/shutdown` (arrêt propre) et `GET /api/system/status`. Toute autre route répond 403 avec ce jeton : pas d'administration, pas de consigne, pas de WebSocket. Les actions faites avec ce jeton sont journalisées sous l'acteur interne **« Utilitaire local »**. Cet acteur ne correspond à aucun compte : l'arrêt propre fonctionne même si le compte `admin` est désactivé.
+- **Ce qui est réservé au poste local.** Le jeton de contrôle local et les détails d'exécution de `/api/health` (chemins de configuration, de données et de journaux, PID, mode) ne sont accordés qu'à une requête qui remplit deux conditions :
+  - elle vient de la boucle locale (`127.0.0.1` ou `::1`) ;
+  - elle ne porte **aucun** en-tête de proxy inverse : `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto` ou `X-Real-IP`.
+
+  Derrière un proxy inverse installé **sur le même poste**, toutes les requêtes arrivent de `127.0.0.1` : l'adresse seule ne permet pas de savoir qu'elles viennent du réseau. **Configurez donc le proxy pour qu'il ajoute `X-Forwarded-For`** (ou `Forwarded`) à chaque requête. Caddy le fait par défaut. Avec nginx, ajoutez `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`. Avec IIS/ARR, activez l'en-tête `X-Forwarded-For`. Un proxy qui n'ajoute aucun de ces en-têtes rend ce contrôle inopérant.
 - Aucune interface d'administration n'est exposée sur le réseau en dehors de l'IHM web authentifiée.
+- **Symboles SVG** (import de bibliothèque, symboles des synoptiques) : le serveur analyse le SVG comme du XML, puis le reconstruit à partir d'une liste blanche d'éléments et d'attributs de dessin. Il retire les scripts, les styles globaux, `foreignObject`, les gestionnaires `on*`, les liens externes (seules les références internes `#id` et les images PNG, JPEG, GIF ou WebP embarquées sont gardées), les commentaires, les instructions de traitement, les sections CDATA et le DOCTYPE. Un fichier qui n'est pas du XML bien formé est refusé avec un message explicite. Un symbole déjà enregistré qui ne passe plus ce contrôle est ignoré au chargement, avec un avertissement dans le journal. L'IHM refait le même filtrage et insère le dessin par le DOM, jamais sous forme de HTML.
 
 ---
 

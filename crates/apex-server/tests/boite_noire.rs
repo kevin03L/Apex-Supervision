@@ -60,6 +60,24 @@ fn health_est_public_et_detaille_en_boucle_locale() {
     assert!(body["started_at"].is_string());
     assert!(body["total_drivers"].as_u64().is_some_and(|n| n >= 2));
 
+    // Derrière un proxy inverse installé sur le poste, les requêtes arrivent aussi de la boucle
+    // locale : un en-tête de proxy suffit à retirer les détails d'exécution.
+    for header in [
+        ("X-Forwarded-For", "203.0.113.7"),
+        ("Forwarded", "for=203.0.113.7;proto=https"),
+        ("X-Real-IP", "203.0.113.7"),
+    ] {
+        let r = srv.call_with_headers("GET", "/api/health", None, &[header]);
+        assert_eq!(r.status, 200, "{}", r.text());
+        let body = r.json();
+        assert_eq!(body["status"], "ok");
+        assert!(
+            body.get("runtime").is_none() && body.get("started_at").is_none(),
+            "détails d'exécution publiés via le proxy ({}) : {body}",
+            header.0
+        );
+    }
+
     // Une route inconnue de l'API ne doit pas passer pour un succès
     let r = srv.call("GET", "/api/inexistant", None, None);
     assert_ne!(r.status, 200);
@@ -130,6 +148,125 @@ fn authentification_jeton_obligatoire() {
     assert_eq!(r.status, 200);
     let r = srv.call("GET", "/api/auth/me", Some(&token), None);
     assert_eq!(r.status, 401);
+}
+
+#[test]
+fn verrouillage_resiste_aux_tentatives_concurrentes() {
+    let srv = Server::start("verrouillage");
+    let port = srv.port();
+
+    // 30 tentatives réellement simultanées avec un mot de passe faux : au plus 5 vérifications
+    // (401), toutes les autres sont refusées par le verrouillage (403) avant Argon2.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(30));
+    let workers: Vec<_> = (0..30)
+        .map(|_| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                request(
+                    port,
+                    "POST",
+                    "/api/auth/login",
+                    None,
+                    Some(&json!({ "username": "visu", "password": "mauvais" })),
+                )
+                .expect("requête de connexion")
+                .status
+            })
+        })
+        .collect();
+    let statuses: Vec<u16> = workers
+        .into_iter()
+        .map(|w| w.join().expect("fil de test"))
+        .collect();
+    let unauthorized = statuses.iter().filter(|s| **s == 401).count();
+    let locked = statuses.iter().filter(|s| **s == 403).count();
+    assert_eq!(unauthorized, 5, "{statuses:?}");
+    assert_eq!(locked, 25, "{statuses:?}");
+
+    // Même le bon mot de passe est refusé pendant le verrouillage
+    let r = srv.call(
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(&json!({ "username": VISU.0, "password": VISU.1 })),
+    );
+    assert_eq!(r.status, 403, "{}", r.text());
+    // Les autres comptes ne sont pas touchés
+    srv.login(ADMIN);
+}
+
+#[test]
+fn reinitialisation_du_mot_de_passe_ferme_les_sessions() {
+    let srv = Server::start("reinit-mdp");
+    let admin = srv.login(ADMIN);
+    let other_admin_session = srv.login(ADMIN);
+    let visu = srv.login(VISU);
+    assert_eq!(
+        srv.call("GET", "/api/auth/me", Some(&visu), None).status,
+        200
+    );
+
+    // L'administrateur réinitialise le mot de passe de visu (compte supposé compromis)
+    let r = srv.call(
+        "POST",
+        "/api/users",
+        Some(&admin),
+        Some(&json!({
+            "username": "visu",
+            "display_name": "Poste Opérateur Visualisation",
+            "role": "Viewer",
+            "password": "Nouveau-visu-2026",
+        })),
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+    let r = srv.call("GET", "/api/auth/me", Some(&visu), None);
+    assert_eq!(
+        r.status,
+        401,
+        "session de visu toujours ouverte : {}",
+        r.text()
+    );
+    srv.login(("visu", "Nouveau-visu-2026"));
+
+    // Sur son propre compte, l'administrateur garde sa session courante, pas les autres
+    let r = srv.call(
+        "POST",
+        "/api/users",
+        Some(&admin),
+        Some(&json!({
+            "username": "admin",
+            "display_name": "Administrateur Système SCADA",
+            "role": "Admin",
+            "password": "Nouveau-admin-2026",
+        })),
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(
+        srv.call("GET", "/api/auth/me", Some(&admin), None).status,
+        200
+    );
+    let r = srv.call("GET", "/api/auth/me", Some(&other_admin_session), None);
+    assert_eq!(r.status, 401, "autre session admin toujours ouverte");
+
+    // Une modification sans nouveau mot de passe ne ferme aucune session
+    let visu = srv.login(("visu", "Nouveau-visu-2026"));
+    let r = srv.call(
+        "POST",
+        "/api/users",
+        Some(&admin),
+        Some(&json!({
+            "username": "visu",
+            "display_name": "Poste de garde",
+            "role": "Viewer",
+            "department": "Garde",
+        })),
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(
+        srv.call("GET", "/api/auth/me", Some(&visu), None).status,
+        200
+    );
 }
 
 // ============================================================================
@@ -229,7 +366,7 @@ fn mode_sur_refuse_les_consignes_vers_un_driver_reel() {
     let msg = r.json()["message"].as_str().unwrap_or_default().to_string();
     assert!(msg.contains("Mode sûr"), "{msg}");
 
-    // Le jeton de contrôle local (administrateur) n'y échappe pas non plus
+    // Le jeton de contrôle local ne permet aucune consigne (il ne sert qu'à l'arrêt propre)
     let r = srv.call(
         "POST",
         &format!("/api/tags/{MODBUS_SETPOINT}/write"),
@@ -237,6 +374,7 @@ fn mode_sur_refuse_les_consignes_vers_un_driver_reel() {
         Some(&json!({ "value": 9.0 })),
     );
     assert_eq!(r.status, 403, "{}", r.text());
+    assert!(r.text().contains("jeton de contrôle local"), "{}", r.text());
 
     // Un driver simulé reste pilotable : le refus est bien propre au mode sûr. Le simulateur
     // peut ne pas être encore connecté juste après le démarrage : on réessaie quelques secondes.
@@ -438,6 +576,80 @@ fn code_5_port_occupe() {
 // ============================================================================
 
 #[test]
+fn jeton_de_controle_local_reserve_a_l_arret_propre() {
+    let srv = Server::start("jeton-local");
+    let token = srv.control_token();
+
+    // Lecture de l'état : autorisée (utilitaire desktop)
+    let r = srv.call("GET", "/api/system/status", Some(&token), None);
+    assert_eq!(r.status, 200, "{}", r.text());
+
+    // Aucune autre route : ni administration, ni lecture des données, ni WebSocket
+    for (method, path, body) in [
+        ("GET", "/api/users", None),
+        ("GET", "/api/auth/me", None),
+        ("GET", "/api/tags", None),
+        ("GET", "/api/system/export", None),
+        (
+            "POST",
+            "/api/users",
+            Some(json!({
+                "username": "intrus",
+                "display_name": "Intrus",
+                "role": "Admin",
+                "password": "Intrus-2026-xyz",
+            })),
+        ),
+        ("POST", "/api/system/restart", Some(json!({}))),
+    ] {
+        let r = srv.call(method, path, Some(&token), body.as_ref());
+        assert_eq!(
+            r.status,
+            403,
+            "{method} {path} avec le jeton local : {}",
+            r.text()
+        );
+    }
+    match ws_connect(srv.port(), &format!("/ws/realtime?token={token}")).expect("connexion TCP") {
+        Ok(_) => panic!("WebSocket accepté avec le jeton de contrôle local"),
+        Err(r) => assert_eq!(r.status, 403, "{}", r.text()),
+    }
+
+    // Via un proxy inverse (en-tête de transfert) : le jeton n'est plus reconnu du tout
+    for header in [
+        ("X-Forwarded-For", "203.0.113.7"),
+        ("Forwarded", "for=203.0.113.7"),
+        ("X-Real-IP", "203.0.113.7"),
+    ] {
+        let r = srv.call_with_headers("GET", "/api/system/status", Some(&token), &[header]);
+        assert_eq!(
+            r.status,
+            401,
+            "jeton local accepté via {} : {}",
+            header.0,
+            r.text()
+        );
+        let r = srv.call_with_headers("POST", "/api/system/shutdown", Some(&token), &[header]);
+        assert_eq!(
+            r.status,
+            401,
+            "arrêt accepté via {} : {}",
+            header.0,
+            r.text()
+        );
+    }
+
+    // L'utilisateur n'a pas été créé et le moteur tourne toujours
+    let admin = srv.login(ADMIN);
+    let users = srv.call("GET", "/api/users", Some(&admin), None).json();
+    assert!(
+        !users.to_string().contains("intrus"),
+        "compte créé avec le jeton local : {users}"
+    );
+    assert_eq!(srv.call("GET", "/api/health", None, None).status, 200);
+}
+
+#[test]
 fn arret_propre_par_jeton_de_controle_local() {
     let mut srv = Server::start("arret");
     let token_file = srv.dir().join("run").join("control.token");
@@ -448,6 +660,34 @@ fn arret_propre_par_jeton_de_controle_local() {
     let r = srv.call("POST", "/api/system/shutdown", None, None);
     assert_eq!(r.status, 401);
     assert_eq!(srv.call("GET", "/api/health", None, None).status, 200);
+
+    // L'arrêt ne dépend pas du compte « admin » : un second administrateur le désactive
+    let admin = srv.login(ADMIN);
+    let r = srv.call(
+        "POST",
+        "/api/users",
+        Some(&admin),
+        Some(&json!({
+            "username": "admin2",
+            "display_name": "Second administrateur",
+            "role": "Admin",
+            "password": "Admin2-2026-xyz",
+        })),
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+    let admin2 = srv.login(("admin2", "Admin2-2026-xyz"));
+    let r = srv.call(
+        "POST",
+        "/api/users",
+        Some(&admin2),
+        Some(&json!({
+            "username": "admin",
+            "display_name": "Administrateur Système SCADA",
+            "role": "Admin",
+            "enabled": false,
+        })),
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
 
     // Jeton de contrôle local (boucle locale) : arrêt accepté
     let r = srv.call("POST", "/api/system/shutdown", Some(&token), None);
@@ -468,4 +708,18 @@ fn arret_propre_par_jeton_de_controle_local() {
     assert!(!token_file.exists(), "jeton de contrôle non supprimé");
     // Le port est libéré : plus aucune réponse
     assert!(request(srv.port(), "GET", "/api/health", None, None).is_err());
+
+    // Après relance, le journal d'audit attribue l'arrêt à l'acteur interne « Utilitaire local »
+    srv.restart();
+    let admin2 = srv.login(("admin2", "Admin2-2026-xyz"));
+    let audit = srv.call("GET", "/api/audit?limit=200", Some(&admin2), None);
+    assert_eq!(audit.status, 200, "{}", audit.text());
+    let audit = audit.json();
+    let shutdown = audit
+        .as_array()
+        .expect("journal d'audit")
+        .iter()
+        .find(|e| e["action"] == "SHUTDOWN")
+        .unwrap_or_else(|| panic!("arrêt absent du journal d'audit : {audit}"));
+    assert_eq!(shutdown["actor"], "Utilitaire local", "{shutdown}");
 }

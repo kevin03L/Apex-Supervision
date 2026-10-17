@@ -45,6 +45,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
+# Analyse XML (assainissement des symboles SVG par reconstruction sur liste blanche)
+quick-xml = "0.41"
+
 [profile.release]
 lto = "thin"
 strip = "symbols"
