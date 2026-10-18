@@ -9,6 +9,7 @@
 //! - Journal d'Audit Opérateur (`audit_logs`) et Export/Import complet du projet en JSON.
 
 use std::{
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -43,6 +44,24 @@ use crate::{
 
 /// Version unique de l'application (issue de `Cargo.toml`).
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InstalledSymbolPack {
+    pub id: String,
+    pub titre: String,
+    pub version: String,
+    pub nombre_symboles: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SymbolPackImportResult {
+    pub pack_id: String,
+    pub version: String,
+    pub added: usize,
+    pub updated: usize,
+    pub rejected: usize,
+    pub symbols: Vec<SymbolLibraryItem>,
+}
 
 /// Taille maximale d'un lot d'écriture de l'historique.
 const HISTORY_BATCH_MAX: usize = 500;
@@ -4736,6 +4755,189 @@ impl ScadaCore {
         list
     }
 
+    pub fn installed_symbol_packs(&self) -> Vec<InstalledSymbolPack> {
+        let mut packs: HashMap<String, InstalledSymbolPack> = HashMap::new();
+        for symbol in self.symbols_library.iter() {
+            let Some(id) = &symbol.pack_id else { continue };
+            let pack = packs
+                .entry(id.clone())
+                .or_insert_with(|| InstalledSymbolPack {
+                    id: id.clone(),
+                    titre: symbol.pack_title.clone().unwrap_or_else(|| id.clone()),
+                    version: symbol.pack_version.clone().unwrap_or_default(),
+                    nombre_symboles: 0,
+                });
+            pack.nombre_symboles += 1;
+        }
+        let mut result: Vec<_> = packs.into_values().collect();
+        result.sort_by(|a, b| a.id.cmp(&b.id));
+        result
+    }
+
+    pub async fn uninstall_symbol_pack(
+        &self,
+        actor: &str,
+        pack_id: &str,
+        force: bool,
+    ) -> Result<usize, ScadaError> {
+        let ids: HashSet<String> = self
+            .symbols_library
+            .iter()
+            .filter(|s| s.pack_id.as_deref() == Some(pack_id))
+            .map(|s| s.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return Err(ScadaError::BadRequest(format!(
+                "Module '{}' introuvable",
+                pack_id
+            )));
+        }
+        let mut dashboards: Vec<String> = self
+            .dashboards
+            .iter()
+            .filter(|d| {
+                d.widgets.iter().any(|w| {
+                    w.properties
+                        .get("symbol_id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|id| ids.contains(id))
+                })
+            })
+            .map(|d| d.name.clone())
+            .collect();
+        dashboards.sort();
+        if !force && !dashboards.is_empty() {
+            return Err(ScadaError::Conflict {
+                message: format!("Le module '{}' est utilisé par des synoptiques", pack_id),
+                dashboards,
+            });
+        }
+        for id in &ids {
+            self.symbols_library.remove(id);
+            if let Some(pool) = &self.db_pool {
+                sqlx::query("DELETE FROM symbol_libraries WHERE id = ?")
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+            }
+        }
+        self.record_audit(
+            actor,
+            "BIBLIOTHÈQUE",
+            "UNINSTALL_PACK",
+            pack_id,
+            &format!("Désinstallation de {} symboles (force={force})", ids.len()),
+        );
+        Ok(ids.len())
+    }
+
+    pub async fn import_symbol_pack(
+        &self,
+        actor: &str,
+        raw: &str,
+    ) -> Result<SymbolPackImportResult, ScadaError> {
+        let value: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|e| ScadaError::BadRequest(format!("JSON de module invalide : {e}")))?;
+        let field = |key: &str| -> Result<String, ScadaError> {
+            value
+                .get(key)
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.trim().is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| ScadaError::BadRequest(format!("Champ '{key}' du module manquant")))
+        };
+        if field("format")? != "apex-symboles" {
+            return Err(ScadaError::BadRequest(
+                "Format de module attendu : apex-symboles".into(),
+            ));
+        }
+        let pack_id = field("id")?;
+        security::validate_id("module", &pack_id)?;
+        let title = field("titre")?;
+        let version = field("version")?;
+        let entries = value
+            .get("symbols")
+            .and_then(|v| v.as_array())
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| ScadaError::BadRequest("Le module doit contenir des symboles".into()))?;
+        let mut seen = HashSet::new();
+        let mut pending = Vec::with_capacity(entries.len());
+        let mut rejected = 0;
+        for entry in entries {
+            let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if !id.starts_with(&format!("{pack_id}-")) || id.len() <= pack_id.len() + 1 {
+                return Err(ScadaError::BadRequest(format!(
+                    "L'identifiant de symbole '{id}' doit commencer par '{pack_id}-'"
+                )));
+            }
+            security::validate_id("symbole", id)?;
+            if !seen.insert(id.to_string()) {
+                return Err(ScadaError::BadRequest(format!(
+                    "Identifiant de symbole en double : '{id}'"
+                )));
+            }
+            if self
+                .symbols_library
+                .get(id)
+                .is_some_and(|s| s.pack_id.as_deref() != Some(&pack_id))
+            {
+                return Err(ScadaError::BadRequest(format!(
+                    "Identifiant de symbole déjà utilisé : '{id}'"
+                )));
+            }
+            let mut symbol: SymbolLibraryItem = serde_json::from_value({
+                let mut item = entry.clone();
+                if item.get("created_at").is_none() {
+                    item["created_at"] = serde_json::json!(Utc::now());
+                }
+                item
+            })
+            .map_err(|e| ScadaError::BadRequest(format!("Symbole '{id}' invalide : {e}")))?;
+            match security::sanitize_svg(&symbol.svg_content) {
+                Ok(clean) => symbol.svg_content = clean,
+                Err(_) => {
+                    rejected += 1;
+                    continue;
+                }
+            }
+            symbol.pack_id = Some(pack_id.clone());
+            symbol.pack_title = Some(title.clone());
+            symbol.pack_version = Some(version.clone());
+            pending.push(symbol);
+        }
+        let mut result = SymbolPackImportResult {
+            pack_id: pack_id.clone(),
+            version: version.clone(),
+            added: 0,
+            updated: 0,
+            rejected,
+            symbols: Vec::new(),
+        };
+        for symbol in pending {
+            if self.symbols_library.contains_key(&symbol.id) {
+                result.updated += 1;
+            } else {
+                result.added += 1;
+            }
+            self.symbols_library
+                .insert(symbol.id.clone(), symbol.clone());
+            self.persist_symbol(&symbol).await;
+            result.symbols.push(symbol);
+        }
+        self.record_audit(
+            actor,
+            "BIBLIOTHÈQUE",
+            "INSTALL_PACK",
+            &pack_id,
+            &format!(
+                "Module {pack_id} version {version} : {} ajoutés, {} mis à jour, {} refusés",
+                result.added, result.updated, result.rejected
+            ),
+        );
+        Ok(result)
+    }
+
     pub async fn persist_symbol(&self, sym: &SymbolLibraryItem) {
         if let Some(pool) = &self.db_pool {
             if let Ok(js) = serde_json::to_string(sym) {
@@ -4850,6 +5052,17 @@ impl ScadaCore {
             ));
         }
 
+        if req.format == "apex_pack"
+            || (req.format == "auto" || req.format.is_empty())
+                && serde_json::from_str::<serde_json::Value>(raw)
+                    .ok()
+                    .and_then(|v| v.get("format").and_then(|f| f.as_str()).map(str::to_string))
+                    .as_deref()
+                    == Some("apex-symboles")
+        {
+            return Ok(self.import_symbol_pack(actor, raw).await?.symbols);
+        }
+
         let default_cat = if req.category.trim().is_empty() {
             "Bibliothèque Importée".to_string()
         } else {
@@ -4905,6 +5118,9 @@ impl ScadaCore {
                         default_height: 185.0,
                         animate_rotation: req.animate_rotation,
                         colorize_on_state: true,
+                        pack_id: None,
+                        pack_title: None,
+                        pack_version: None,
                         created_at: Utc::now(),
                     };
                     self.store_symbol(item, &mut imported, &mut rejected).await;
@@ -4968,10 +5184,19 @@ impl ScadaCore {
                     category: cat.to_string(),
                     standard: std_name.to_string(),
                     svg_content: svg.to_string(),
-                    default_width: 210.0,
-                    default_height: 185.0,
+                    default_width: entry
+                        .get("default_width")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(210.0),
+                    default_height: entry
+                        .get("default_height")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(185.0),
                     animate_rotation: anim,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: Utc::now(),
                 };
                 self.store_symbol(item, &mut imported, &mut rejected).await;
@@ -5013,6 +5238,9 @@ impl ScadaCore {
                         default_height: 185.0,
                         animate_rotation: req.animate_rotation,
                         colorize_on_state: true,
+                        pack_id: None,
+                        pack_title: None,
+                        pack_version: None,
                         created_at: Utc::now(),
                     };
                     self.store_symbol(item, &mut imported, &mut rejected).await;
@@ -5033,6 +5261,9 @@ impl ScadaCore {
                 default_height: 185.0,
                 animate_rotation: req.animate_rotation,
                 colorize_on_state: true,
+                pack_id: None,
+                pack_title: None,
+                pack_version: None,
                 created_at: Utc::now(),
             };
             self.store_symbol(item, &mut imported, &mut rejected).await;
@@ -5091,6 +5322,9 @@ impl ScadaCore {
                     default_height: 190.0,
                     animate_rotation: true,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
                 SymbolLibraryItem {
@@ -5103,6 +5337,9 @@ impl ScadaCore {
                     default_height: 190.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
                 SymbolLibraryItem {
@@ -5115,6 +5352,9 @@ impl ScadaCore {
                     default_height: 185.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
                 SymbolLibraryItem {
@@ -5127,6 +5367,9 @@ impl ScadaCore {
                     default_height: 190.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
             ],
@@ -5141,6 +5384,9 @@ impl ScadaCore {
                     default_height: 185.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
                 SymbolLibraryItem {
@@ -5153,6 +5399,9 @@ impl ScadaCore {
                     default_height: 185.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
                 SymbolLibraryItem {
@@ -5165,6 +5414,9 @@ impl ScadaCore {
                     default_height: 185.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
             ],
@@ -5179,6 +5431,9 @@ impl ScadaCore {
                     default_height: 190.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
                 SymbolLibraryItem {
@@ -5191,6 +5446,9 @@ impl ScadaCore {
                     default_height: 185.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
                 SymbolLibraryItem {
@@ -5203,6 +5461,9 @@ impl ScadaCore {
                     default_height: 185.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
             ],
@@ -5671,6 +5932,13 @@ mod tests {
         let svg = d.widgets[0].properties["svg_content"].as_str().unwrap();
         assert!(!svg.contains("onload") && !svg.contains("script"));
         assert!(d.widgets[0].bound_tag_id.is_none());
+        d.widgets[0].properties["defaut_tag_id"] = "DEFAUT_MOTEUR".into();
+        d.widgets[0].properties["min"] = 10.into();
+        d.widgets[0].properties["max"] = 90.into();
+        sanitize_dashboard(&mut d).unwrap();
+        assert_eq!(d.widgets[0].properties["defaut_tag_id"], "DEFAUT_MOTEUR");
+        assert_eq!(d.widgets[0].properties["min"], 10);
+        assert_eq!(d.widgets[0].properties["max"], 90);
 
         d.widgets[0].bound_tag_id = Some("x');alert(1)//".into());
         assert!(sanitize_dashboard(&mut d).is_err());
@@ -5706,6 +5974,154 @@ mod tests {
                     sym.svg_content.matches('=').count() + 1,
                     "attribut perdu dans {}",
                     sym.id
+                );
+            }
+        }
+    }
+
+    fn test_module(id: &str) -> String {
+        serde_json::json!({
+            "format": "apex-symboles", "version": "1.0.0", "id": "test_pack",
+            "titre": "Module de test", "symbols": [{
+                "id": id, "name": "Cercle", "category": "Essai", "standard": "Essai",
+                "default_width": 120.0, "default_height": 75.0,
+                "animate_rotation": true, "colorize_on_state": false,
+                "svg_content": "<svg viewBox=\"0 0 100 100\"><circle cx=\"50\" cy=\"50\" r=\"20\"/></svg>"
+            }]
+        }).to_string()
+    }
+
+    #[tokio::test]
+    async fn module_installation_reinstallation_et_desinstallation() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        let raw = test_module("test_pack-cercle");
+        let first = core.import_symbol_pack("admin", &raw).await.unwrap();
+        assert_eq!((first.added, first.updated, first.rejected), (1, 0, 0));
+        let sym = &first.symbols[0];
+        assert_eq!(sym.id, "test_pack-cercle");
+        assert_eq!(sym.pack_id.as_deref(), Some("test_pack"));
+        assert_eq!((sym.default_width, sym.default_height), (120.0, 75.0));
+        assert!(sym.animate_rotation);
+        assert!(!sym.colorize_on_state);
+        let saved = serde_json::to_string(sym).unwrap();
+        let restored: SymbolLibraryItem = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.pack_id.as_deref(), Some("test_pack"));
+        let mut legacy: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        legacy.as_object_mut().unwrap().remove("pack_id");
+        legacy.as_object_mut().unwrap().remove("pack_title");
+        legacy.as_object_mut().unwrap().remove("pack_version");
+        let restored_legacy: SymbolLibraryItem = serde_json::from_value(legacy).unwrap();
+        assert!(restored_legacy.pack_id.is_none());
+        let second = core.import_symbol_pack("admin", &raw).await.unwrap();
+        assert_eq!((second.added, second.updated), (0, 1));
+        assert_eq!(core.installed_symbol_packs()[0].nombre_symboles, 1);
+        assert_eq!(
+            core.uninstall_symbol_pack("admin", "test_pack", false)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(core.installed_symbol_packs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn module_refuse_identifiant_et_synoptique_utilisateur() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        let bad = core
+            .import_symbol_pack("admin", &test_module("cercle"))
+            .await
+            .unwrap_err();
+        assert_eq!(bad.http_status(), 400);
+        assert!(bad.to_string().contains("test_pack-"));
+        core.import_symbol_pack("admin", &test_module("test_pack-cercle"))
+            .await
+            .unwrap();
+        core.dashboards.insert(
+            "syn-test".into(),
+            DashboardLayout {
+                id: "syn-test".into(),
+                name: "Synoptique de test".into(),
+                category: "Essai".into(),
+                description: String::new(),
+                grid_size: 10,
+                widgets: vec![DashboardWidget {
+                    id: "widget-test".into(),
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                    widget_type: WidgetType::CustomSvgSymbol,
+                    bound_tag_id: None,
+                    title: "Cercle".into(),
+                    properties: serde_json::json!({"symbol_id":"test_pack-cercle"}),
+                }],
+                canvas_width: None,
+                canvas_height: None,
+                updated_at: Utc::now(),
+            },
+        );
+        let conflict = core
+            .uninstall_symbol_pack("admin", "test_pack", false)
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.http_status(), 409);
+        assert!(
+            matches!(conflict, ScadaError::Conflict { dashboards, .. } if dashboards == ["Synoptique de test"])
+        );
+        assert_eq!(
+            core.uninstall_symbol_pack("admin", "test_pack", true)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn modules_du_depot_survivent_assainissement() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        assert!(dir.is_dir(), "dossier packs/ absent : {}", dir.display());
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        assert!(
+            !files.is_empty(),
+            "aucun fichier packs/*.json dans {}",
+            dir.display()
+        );
+        let mut ids = std::collections::HashSet::new();
+        for file in files {
+            let raw = std::fs::read_to_string(file.path()).unwrap();
+            let pack: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(pack["format"], "apex-symboles", "{}", file.path().display());
+            // Version du module au format MAJEUR.MINEUR.CORRECTIF
+            let version = pack["version"].as_str().unwrap_or_default();
+            assert!(
+                version.split('.').count() == 3
+                    && version.split('.').all(|n| n.parse::<u32>().is_ok()),
+                "{} : version « {version} » invalide",
+                file.path().display()
+            );
+            let prefix = format!("{}-", pack["id"].as_str().unwrap());
+            let symbols = pack["symbols"].as_array().unwrap();
+            assert!(!symbols.is_empty(), "{} est vide", file.path().display());
+            for sym in symbols {
+                let id = sym["id"].as_str().unwrap();
+                assert!(id.starts_with(&prefix), "id mal préfixé : {id}");
+                assert!(ids.insert(id.to_string()), "id en double : {id}");
+                let svg = sym["svg_content"].as_str().unwrap();
+                let clean = security::sanitize_svg(svg).unwrap_or_else(|e| panic!("{id} : {e}"));
+                assert_eq!(
+                    clean.matches('<').count(),
+                    svg.matches('<').count(),
+                    "élément perdu : {id}"
+                );
+                let added_xmlns = usize::from(!svg.contains("xmlns="));
+                assert_eq!(
+                    clean.matches('=').count(),
+                    svg.matches('=').count() + added_xmlns,
+                    "attribut perdu : {id}"
                 );
             }
         }
@@ -6543,6 +6959,9 @@ mod tests {
             default_height: 50.0,
             animate_rotation: false,
             colorize_on_state: true,
+            pack_id: None,
+            pack_title: None,
+            pack_version: None,
             created_at: Utc::now(),
         };
         let mut imp = Vec::new();

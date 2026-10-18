@@ -266,6 +266,11 @@ jobs:
         with:
           name: linux-amd64-deb
           path: dist
+      - name: Archive des modules complémentaires
+        run: |
+          test -n "$(find packs -maxdepth 1 -name '*.json' -print -quit)"
+          zip -r "dist/apex-symboles-${GITHUB_REF_NAME}.zip" packs -i 'packs/*.json' 'packs/README.md'
+          cd dist && sha256sum "apex-symboles-${GITHUB_REF_NAME}.zip" > "apex-symboles-${GITHUB_REF_NAME}.zip.sha256"
       - name: Publication de la release
         uses: softprops/action-gh-release@v2
         with:
@@ -273,5 +278,6 @@ jobs:
             dist/*.exe
             dist/*.deb
             dist/*.sha256
+            dist/apex-symboles-*.zip
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true

@@ -14,6 +14,8 @@ Ce guide s'adresse à la personne chargée d'installer et d'exploiter le moteur.
 | Mise en sommeil des alarmes (activation, durée maximale) | IHM web, onglet « Système » | Immédiate |
 | Drivers, variables, synoptiques, flux, plannings | IHM web | Immédiate |
 
+Les états animés des symboles de synoptique se règlent dans le Studio avec la variable liée, la variable de défaut facultative et, pour un niveau, les bornes minimum et maximum (voir [`packs/README.md`](../packs/README.md)).
+
 Le fichier de configuration a **un seul rédacteur à la fois**. Le moteur le lit sans jamais le réécrire. L'utilitaire et la CLI l'écrivent sous verrou, en écriture atomique (fichier temporaire, puis renommage), après une sauvegarde horodatée.
 
 ---
@@ -261,6 +263,7 @@ Les cinq protocoles industriels réels (Modbus TCP, MQTT, Siemens S7, OPC-UA, BA
 
   Derrière un proxy inverse installé **sur le même poste**, toutes les requêtes arrivent de `127.0.0.1` : l'adresse seule ne permet pas de savoir qu'elles viennent du réseau. **Configurez donc le proxy pour qu'il ajoute `X-Forwarded-For`** (ou `Forwarded`) à chaque requête. Caddy le fait par défaut. Avec nginx, ajoutez `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`. Avec IIS/ARR, activez l'en-tête `X-Forwarded-For`. Un proxy qui n'ajoute aucun de ces en-têtes rend ce contrôle inopérant.
 - Aucune interface d'administration n'est exposée sur le réseau en dehors de l'IHM web authentifiée.
+- **Modules complémentaires de symboles** : téléchargez l'archive `apex-symboles-<version>.zip` et son empreinte `.sha256` depuis les Releases, puis installez les fichiers JSON dans la fenêtre Bibliothèque. La liste indique la version et le nombre de symboles installés. Seul un administrateur peut désinstaller un module ; si un synoptique utilise un de ses symboles, l'API répond 409 et demande une désinstallation forcée explicite. Les modules ne font partie ni du binaire ni des installateurs. Les trois petits packs historiques restent disponibles. Voir [le format des modules](../packs/README.md).
 - **Symboles SVG** (import de bibliothèque, symboles des synoptiques) : le serveur analyse le SVG comme du XML, puis le reconstruit à partir d'une liste blanche d'éléments et d'attributs de dessin. Il retire les scripts, les styles globaux, `foreignObject`, les gestionnaires `on*`, les liens externes (seules les références internes `#id` et les images PNG, JPEG, GIF ou WebP embarquées sont gardées), les commentaires, les instructions de traitement, les sections CDATA et le DOCTYPE. Un fichier qui n'est pas du XML bien formé est refusé avec un message explicite. Un symbole déjà enregistré qui ne passe plus ce contrôle est ignoré au chargement, avec un avertissement dans le journal. Les règles de classe simples d'une feuille `<style>` (`.st0 { fill: … }`, exports Illustrator) sont reportées dans l'attribut `style` des éléments concernés. Les autres sélecteurs sont ignorés. L'IHM refait le même filtrage et insère le dessin par le DOM, jamais sous forme de HTML.
 
 ---

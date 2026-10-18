@@ -795,6 +795,7 @@ function connectRealtimeSocket() {
       scheduleRender();
     } else if (msg.event === 'AlarmUpdate') {
       state.alarms = msg.data;
+      updateAlarmWidgetsInPlace();
       renderAlarmBanner();
       renderAlarmsTable();
     } else if (msg.event === 'DriverListUpdate') {
@@ -2979,13 +2980,71 @@ function renderCustomSymbolsPalette() {
          title="${esc(sym.name)} (${esc(sym.standard)})"
          style="display:flex;align-items:center;justify-content:space-between;gap:4px;">
       <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(sym.name)}</span>
-      <span style="font-size:9px;color:#38bdf8;cursor:pointer;" onclick="event.stopPropagation();deleteCustomSymbol(${jsArg(sym.id)})" title="Supprimer">×</span>
+      ${!sym.pack_id ? `<span style="font-size:9px;color:#38bdf8;cursor:pointer;" onclick="event.stopPropagation();deleteCustomSymbol(${jsArg(sym.id)})" title="Supprimer">×</span>` : ''}
     </div>
   `).join('');
 }
 
 function openSymbolLibraryModal() {
   document.getElementById('symbolLibraryModal').style.display = 'flex';
+  refreshInstalledSymbolPacks();
+}
+
+async function refreshInstalledSymbolPacks() {
+  const container = document.getElementById('installedSymbolPacks');
+  const packs = await getJson('/api/symbols/packs', []);
+  container.innerHTML = packs.length ? packs.map(pack => `
+    <div class="symbol-module-row">
+      <span><strong>${esc(pack.titre)}</strong> · ${esc(pack.version)} · ${esc(pack.nombre_symboles)} symbole(s)</span>
+      ${isAdmin() ? `<button class="btn" onclick="uninstallSymbolModule(${jsArg(pack.id)})">Désinstaller</button>` : ''}
+    </div>`).join('') : '<p>Aucun module complémentaire installé.</p>';
+}
+
+async function installSymbolModule(event) {
+  const file = event.target.files[0];
+  event.target.value = '';
+  if (!file) return;
+  if (file.size > SYMBOL_IMPORT_MAX_BYTES / 2) {
+    notify('Fichier de module trop volumineux.', 'error');
+    return;
+  }
+  const raw_content = await file.text();
+  const body = JSON.stringify({ format: 'apex_pack', raw_content });
+  if (new Blob([body]).size > SYMBOL_IMPORT_MAX_BYTES) {
+    notify('Fichier de module trop volumineux.', 'error');
+    return;
+  }
+  const res = await fetch('/api/symbols/import', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body
+  });
+  if (!res.ok) {
+    notify(await apiError(res), 'error');
+    return;
+  }
+  const result = await res.json();
+  state.symbols = await getJson('/api/symbols', state.symbols);
+  renderCustomSymbolsPalette();
+  await refreshInstalledSymbolPacks();
+  notify(`Module installé : ${result.added} ajouté(s), ${result.updated} mis à jour, ${result.rejected} refusé(s).`);
+}
+
+async function uninstallSymbolModule(id) {
+  if (!isAdmin()) return;
+  const confirmed = await confirmDialog('Désinstaller le module ?', `Supprimer les symboles du module ${id} ?`, 'Désinstaller');
+  if (!confirmed) return;
+  let res = await fetch(`/api/symbols/packs/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  if (res.status === 409) {
+    const conflict = await res.json();
+    const names = (conflict.dashboards || []).join(', ');
+    const force = await confirmDialog('Module utilisé', `Synoptiques concernés : ${names}. Forcer la désinstallation ?`, 'Forcer');
+    if (!force) return;
+    res = await fetch(`/api/symbols/packs/${encodeURIComponent(id)}?force=true`, { method: 'DELETE' });
+  }
+  if (!res.ok) { notify(await apiError(res), 'error'); return; }
+  state.symbols = await getJson('/api/symbols', state.symbols);
+  renderCustomSymbolsPalette();
+  await refreshInstalledSymbolPacks();
+  notify('Module désinstallé.');
 }
 
 function closeSymbolLibraryModal() {
@@ -3042,7 +3101,11 @@ async function submitSymbolImport() {
     state.symbols = await getJson('/api/symbols', state.symbols);
     renderCustomSymbolsPalette();
     closeSymbolLibraryModal();
-    notify(`${imported.length} symbole(s) industriel(s) importé(s) dans la palette Studio`);
+    if (Array.isArray(imported)) notify(`${imported.length} symbole(s) industriel(s) importé(s) dans la palette Studio`);
+    else {
+      await refreshInstalledSymbolPacks();
+      notify(`Module installé : ${imported.added} ajouté(s), ${imported.updated} mis à jour, ${imported.rejected} refusé(s).`);
+    }
   } else {
     notify(`Erreur d'import : ${await apiError(res, SYMBOL_IMPORT_MAX_BYTES)}`, 'error');
   }

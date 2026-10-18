@@ -595,6 +595,12 @@ function renderWidgetInspector(w) {
     `<option value="${esc(t.id)}" ${w.bound_tag_id === t.id ? 'selected' : ''}>${esc(t.id)} — ${esc(t.label)}</option>`
   ).join('');
   const props = w.properties || {};
+  const sym = w.widget_type === 'CustomSvgSymbol' && state.symbols.find(s => s.id === props.symbol_id);
+  const svgContent = sym ? sym.svg_content : props.svg_content || '';
+  const hasLevel = /class\s*=\s*["'][^"']*\bsym-niveau\b/.test(svgContent);
+  const defectOpts = Object.values(state.tags).filter(t => t.data_type === 'Bool').map(t =>
+    `<option value="${esc(t.id)}" ${props.defaut_tag_id === t.id ? 'selected' : ''}>${esc(t.id)} — ${esc(t.label)}</option>`
+  ).join('');
   box.dataset.widgetId = w.id;
   box.innerHTML = `
     <div class="insp">
@@ -609,6 +615,16 @@ function renderWidgetInspector(w) {
           <option value="">— Non liée —</option>${tagOpts}
         </select>
       </label>
+      ${w.widget_type === 'CustomSvgSymbol' ? `
+      <label>Variable de défaut
+        <select onchange="updateWidgetProp('defaut_tag_id', this.value || null)">
+          <option value="">— Aucune —</option>${defectOpts}
+        </select>
+      </label>
+      ${hasLevel ? `<div class="insp-row">
+        <label>Minimum<input type="number" value="${esc(Number(props.min ?? 0))}" onchange="updateWidgetProp('min', parseFloat(this.value))" /></label>
+        <label>Maximum<input type="number" value="${esc(Number(props.max ?? 100))}" onchange="updateWidgetProp('max', parseFloat(this.value))" /></label>
+      </div>` : ''}` : ''}
       <div class="insp-sec">Position et taille (px de l'écran)</div>
       <div class="insp-row">
         <label>X<input type="number" data-geo="x" value="${Math.round(w.x)}" oninput="setWidgetGeometry('x', this.value)" /></label>
@@ -626,12 +642,12 @@ function renderWidgetInspector(w) {
         <button class="btn" title="Aligner en haut" onclick="alignWidget('top')">Haut</button>
         <button class="btn" title="Centrer verticalement" onclick="alignWidget('middle')">Milieu</button>
       </div>
-      <div class="insp-sec">Échelle et consigne</div>
+      ${w.widget_type !== 'CustomSvgSymbol' ? `<div class="insp-sec">Échelle et consigne</div>
       <div class="insp-row3">
-        <label>Min<input type="number" value="${Number(props.min ?? 0)}" onchange="updateWidgetProp('min', parseFloat(this.value))" /></label>
-        <label>Max<input type="number" value="${Number(props.max ?? 100)}" onchange="updateWidgetProp('max', parseFloat(this.value))" /></label>
+        <label>Min<input type="number" value="${esc(Number(props.min ?? 0))}" onchange="updateWidgetProp('min', parseFloat(this.value))" /></label>
+        <label>Max<input type="number" value="${esc(Number(props.max ?? 100))}" onchange="updateWidgetProp('max', parseFloat(this.value))" /></label>
         <label>Pas<input type="number" step="0.1" min="0.01" value="${Number(props.step ?? 0.5)}" onchange="updateWidgetProp('step', parseFloat(this.value))" /></label>
-      </div>
+      </div>` : ''}
       <div class="insp-sec">Élément</div>
       <div class="insp-actions">
         <button class="btn" onclick="duplicateSelectedWidget()">Dupliquer</button>
@@ -1165,15 +1181,10 @@ function buildWidgetBodyHtml(w) {
   if (w.widget_type === 'CustomSvgSymbol') {
     const symId = w.properties && w.properties.symbol_id;
     const sym = state.symbols.find(s => s.id === symId);
-    const isActive = boolVal || numVal > 0.1;
-    const dynColor = qual !== 'Good' ? '#f59e0b' : (isActive ? '#10b981' : '#38bdf8');
-    const spin = isActive && ((sym && sym.animate_rotation) || (w.properties && w.properties.animate_rotation));
     // Emplacement vide : le SVG assaini y est inséré par le DOM (mountCustomSvg), jamais en HTML
     return `
-      <div class="custom-svg-wrapper" data-spin="${spin ? '1' : '0'}" style="color:${dynColor};"></div>
-      <div style="font-weight:800;font-size:13.5px;color:${dynColor};font-family:Consolas;margin-top:4px;">
-        ${typeof val === 'boolean' ? (val ? 'MARCHE (1)' : 'ARRÊT (0)') : `${numVal.toFixed(1)} ${unit}`}
-      </div>
+      <div class="custom-svg-wrapper"></div>
+      <div class="custom-svg-value" style="font-weight:800;font-size:13.5px;font-family:Consolas;margin-top:4px;"></div>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || (sym ? esc(sym.standard) : 'Symbole SVG')}</div>
     `;
   }
@@ -1196,23 +1207,59 @@ function mountCustomSvg(container, w) {
     slot.replaceChildren();
     return;
   }
-  if (slot.dataset.spin === '1') {
-    svg.querySelectorAll('.sym-rotatable').forEach(part => part.classList.add('spin-active'));
-  }
   slot.replaceChildren(svg);
+}
+
+/** Met à jour uniquement les attributs variables, sans recréer le SVG ni ses animations. */
+function updateCustomSvgState(container, w) {
+  const slot = container.querySelector('.custom-svg-wrapper');
+  if (!slot) return;
+  const tag = w.bound_tag_id && state.tags[w.bound_tag_id];
+  const value = tag && tag.state && tag.state.value;
+  const quality = tag && tag.state && tag.state.quality;
+  const props = w.properties || {};
+  const defect = props.defaut_tag_id && state.tags[props.defaut_tag_id];
+  const hasAlarm = (state.alarms || []).some(a => a.tag_id === w.bound_tag_id &&
+    (a.state === 'ActiveUnack' || a.state === 'ActiveAck'));
+  const active = typeof value === 'boolean' ? value : typeof value === 'number' && value > 0.1;
+  const stateName = !tag || quality !== 'Good' ? 'etat-inconnu'
+    : (defect && defect.state && defect.state.quality === 'Good' && defect.state.value === true) || hasAlarm
+      ? 'etat-defaut' : active ? 'etat-marche' : 'etat-arret';
+  if (slot.dataset.state !== stateName) {
+    if (slot.dataset.state) slot.classList.remove(slot.dataset.state);
+    slot.classList.add(stateName);
+    slot.dataset.state = stateName;
+  }
+  const color = { 'etat-marche': '#10b981', 'etat-arret': '#38bdf8',
+    'etat-defaut': '#ef4444', 'etat-inconnu': '#f59e0b' }[stateName];
+  if (slot.style.color !== color) slot.style.color = color;
+  const min = Number(props.min ?? 0), max = Number(props.max ?? 100);
+  const level = typeof value === 'number' && Number.isFinite(value) && Number.isFinite(min) &&
+    Number.isFinite(max) && max > min ? Math.max(0, Math.min(1, (value - min) / (max - min))) : 0;
+  const levelText = String(level);
+  if (slot.style.getPropertyValue('--apex-niveau') !== levelText) slot.style.setProperty('--apex-niveau', levelText);
+  const display = container.querySelector('.custom-svg-value');
+  if (display) {
+    const unit = tag && tag.unit ? ` ${tag.unit}` : '';
+    const label = typeof value === 'boolean' ? (value ? 'MARCHE (1)' : 'ARRÊT (0)')
+      : typeof value === 'number' ? `${value.toFixed(1)}${unit}` : '--';
+    if (display.textContent !== label) display.textContent = label;
+    if (display.style.color !== color) display.style.color = color;
+  }
 }
 
 /** (Re)dessine le corps d'un widget : gabarit HTML échappé, puis SVG inséré par le DOM. */
 function renderWidgetBody(el, w) {
   el.innerHTML = buildWidgetBodyHtml(w);
   mountCustomSvg(el, w);
+  if (w.widget_type === 'CustomSvgSymbol') updateCustomSvgState(el, w);
 }
 
 function updateBoundWidgetsInPlace(tagId) {
   const dash = getActiveDashboard();
   if (!dash || state.activeTab !== 'synoptic') return;
   dash.widgets.forEach(w => {
-    if (w.bound_tag_id === tagId) {
+    if (w.bound_tag_id === tagId || (w.widget_type === 'CustomSvgSymbol' && w.properties && w.properties.defaut_tag_id === tagId)) {
       // Ne pas écraser une saisie de consigne en cours
       if (w.widget_type === 'SetpointButton' && document.activeElement && document.activeElement.id === `sp-in-${cssSafe(w.id)}`) {
         return;
@@ -1222,8 +1269,20 @@ function updateBoundWidgetsInPlace(tagId) {
         return;
       }
       const el = document.getElementById(`widget-body-${cssSafe(w.id)}`);
-      if (el) renderWidgetBody(el, w);
+      if (el) {
+        if (w.widget_type === 'CustomSvgSymbol') updateCustomSvgState(el, w);
+        else renderWidgetBody(el, w);
+      }
     }
+  });
+}
+
+function updateAlarmWidgetsInPlace() {
+  const dash = getActiveDashboard();
+  if (!dash || state.activeTab !== 'synoptic') return;
+  dash.widgets.filter(w => w.widget_type === 'CustomSvgSymbol').forEach(w => {
+    const el = document.getElementById(`widget-body-${cssSafe(w.id)}`);
+    if (el) updateCustomSvgState(el, w);
   });
 }
 

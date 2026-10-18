@@ -1168,6 +1168,17 @@ mod tests {
         assert_eq!(sanitize_svg(&clean).unwrap(), clean);
     }
 
+    #[test]
+    fn svg_sanitizer_keeps_animated_state_convention() {
+        let svg = r##"<svg viewBox="0 0 100 100"><defs><linearGradient id="demo-metal"><stop offset="0" stop-color="#e2e8f0"/><stop offset="1" stop-color="#334155"/></linearGradient></defs><rect class="sym-arret" width="90" height="90" fill="url(#demo-metal)"/><g class="sym-marche"><g class="sym-rotatable" style="transform-origin:50px 50px;"><circle cx="50" cy="50" r="8" fill="currentColor"/></g></g><path class="sym-defaut" d="M 5 5 L 15 15" stroke="currentColor"/><line class="sym-flux" x1="0" y1="30" x2="90" y2="30" stroke="currentColor" stroke-dasharray="4 2"/><rect class="sym-niveau" style="transform-origin:50px 90px;" x="40" y="40" width="20" height="50" fill="currentColor"/><g class="sym-vibre"><ellipse cx="50" cy="60" rx="10" ry="4" fill="currentColor"/></g></svg>"##;
+        let clean = sanitize_svg(svg).unwrap();
+        assert_eq!(
+            clean,
+            svg.replacen("<svg ", "<svg xmlns=\"http://www.w3.org/2000/svg\" ", 1)
+        );
+        assert_eq!(sanitize_svg(&clean).unwrap(), clean);
+    }
+
     /// Les symboles de la bibliothèque d'exemple livrée restent affichables sans perte.
     #[test]
     fn svg_sanitizer_keeps_example_library() {

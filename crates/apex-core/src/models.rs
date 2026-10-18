@@ -49,6 +49,12 @@ pub enum ScadaError {
     #[error("Requête invalide : {0}")]
     BadRequest(String),
 
+    #[error("Conflit : {message}")]
+    Conflict {
+        message: String,
+        dashboards: Vec<String>,
+    },
+
     #[error("{0}")]
     Unauthorized(String),
 
@@ -70,6 +76,7 @@ impl ScadaError {
             ScadaError::TagNotWritable(_) | ScadaError::Forbidden(_) => 403,
             ScadaError::Unauthorized(_) => 401,
             ScadaError::TypeMismatch { .. } | ScadaError::BadRequest(_) => 400,
+            ScadaError::Conflict { .. } => 409,
             ScadaError::DriverError(_) | ScadaError::FlowError(_) => 502,
             ScadaError::DatabaseError(_) => 500,
             ScadaError::Busy(_) => 503,
@@ -1025,6 +1032,12 @@ pub struct UpsertUserRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolLibraryItem {
     pub id: String,
+    #[serde(default)]
+    pub pack_id: Option<String>,
+    #[serde(default)]
+    pub pack_title: Option<String>,
+    #[serde(default)]
+    pub pack_version: Option<String>,
     pub name: String,
     pub category: String,
     pub standard: String,

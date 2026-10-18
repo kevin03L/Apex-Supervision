@@ -104,6 +104,17 @@
         <button class="btn" onclick="closeSymbolLibraryModal()">Fermer</button>
       </div>
 
+      <section class="symbol-modules">
+        <h4>Modules complémentaires</h4>
+        <div id="installedSymbolPacks" aria-live="polite"></div>
+        <div class="symbol-modules-actions">
+          <label class="btn btn-primary">Installer un module (.json)
+            <input type="file" accept=".json,application/json" onchange="installSymbolModule(event)" hidden />
+          </label>
+          <a href="https://github.com/kevin03L/Apex-Supervision/releases" target="_blank" rel="noopener noreferrer">Télécharger des modules</a>
+        </div>
+      </section>
+
       <!-- 1. PACKS OPEN-SOURCE GRATUITS PRÉ-INTÉGRÉS -->
       <div style="background:#080f1e;border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:14px;">
         <div style="font-weight:700;font-size:12.5px;color:#38bdf8;margin-bottom:6px;">

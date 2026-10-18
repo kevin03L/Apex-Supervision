@@ -21,6 +21,57 @@ const MODBUS_SETPOINT: &str = "MODBUS.GF01.Consigne_Eau_Glacee";
 /// Tag inscriptible du simulateur GTB (driver simulé, pilotable en mode sûr).
 const SIMULATED_SETPOINT: &str = "GTB.CTA01.Consigne_Temp";
 
+#[test]
+fn module_symboles_installation_liste_et_desinstallation() {
+    let mut srv = Server::start("module-symboles");
+    let token = srv.login(ADMIN);
+    let module = json!({
+        "format": "apex-symboles", "version": "1.0.0", "id": "test_pack",
+        "titre": "Module de test", "symbols": [{
+            "id": "test_pack-cercle", "name": "Cercle", "category": "Essai",
+            "standard": "Essai", "default_width": 100, "default_height": 100,
+            "svg_content": "<svg viewBox=\"0 0 100 100\"><circle cx=\"50\" cy=\"50\" r=\"20\"/></svg>"
+        }]
+    });
+    let r = srv.call(
+        "POST",
+        "/api/symbols/import",
+        Some(&token),
+        Some(&json!({
+            "format": "auto", "raw_content": module.to_string()
+        })),
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json()["added"], 1);
+    let r = srv.call("GET", "/api/symbols/packs", Some(&token), None);
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(r
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["id"] == "test_pack" && p["nombre_symboles"] == 1));
+    srv.restart();
+    let token = srv.login(ADMIN);
+    let r = srv.call("GET", "/api/symbols/packs", Some(&token), None);
+    assert!(r
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["id"] == "test_pack" && p["version"] == "1.0.0" && p["nombre_symboles"] == 1));
+    let r = srv.call("DELETE", "/api/symbols/packs/test_pack", Some(&token), None);
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json()["deleted"], 1);
+    let r = srv.call("GET", "/api/symbols/packs", Some(&token), None);
+    assert!(!r
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["id"] == "test_pack"));
+}
+
 // ============================================================================
 // SANTÉ
 // ============================================================================

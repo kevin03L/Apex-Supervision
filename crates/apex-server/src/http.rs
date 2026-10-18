@@ -82,6 +82,10 @@ impl IntoResponse for ApiError {
         let body = serde_json::json!({
             "error": true,
             "message": self.0.to_string(),
+            "dashboards": match &self.0 {
+                ScadaError::Conflict { dashboards, .. } => dashboards.clone(),
+                _ => Vec::new(),
+            },
         });
         (status, Json(body)).into_response()
     }
@@ -115,6 +119,11 @@ pub fn router(state: AppState, web_dir: &FsPath) -> Router {
         .route("/api/users/:username", delete(api_delete_user))
         // --- BIBLIOTHÈQUES DE SYMBOLES ---
         .route("/api/symbols", get(api_get_symbols))
+        .route("/api/symbols/packs", get(api_get_symbol_packs))
+        .route(
+            "/api/symbols/packs/:pack_id",
+            delete(api_delete_symbol_pack),
+        )
         .route(
             "/api/symbols/import",
             post(api_import_symbols)
@@ -484,17 +493,54 @@ async fn api_get_symbols(State(state): State<AppState>) -> Json<Vec<SymbolLibrar
     Json(state.core.get_all_symbols())
 }
 
+async fn api_get_symbol_packs(
+    State(state): State<AppState>,
+) -> Json<Vec<apex_core::core::InstalledSymbolPack>> {
+    Json(state.core.installed_symbol_packs())
+}
+
+async fn api_delete_symbol_pack(
+    Path(pack_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&user)?;
+    let force = params.get("force").is_some_and(|v| v == "true");
+    let deleted = state
+        .core
+        .uninstall_symbol_pack(&user.0.username, &pack_id, force)
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "deleted": deleted, "pack_id": pack_id }),
+    ))
+}
+
 async fn api_import_symbols(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
     Json(req): Json<ImportSymbolLibraryRequest>,
-) -> Result<Json<Vec<SymbolLibraryItem>>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     require_supervisor(&user)?;
+    let is_pack = req.format == "apex_pack"
+        || (req.format == "auto" || req.format.is_empty())
+            && serde_json::from_str::<serde_json::Value>(&req.raw_content)
+                .ok()
+                .and_then(|v| v.get("format").and_then(|f| f.as_str()).map(str::to_string))
+                .as_deref()
+                == Some("apex-symboles");
+    if is_pack {
+        let result = state
+            .core
+            .import_symbol_pack(&user.0.username, &req.raw_content)
+            .await?;
+        return Ok(Json(serde_json::to_value(result).unwrap_or_default()));
+    }
     let imported = state
         .core
         .import_symbol_library(&user.0.username, req)
         .await?;
-    Ok(Json(imported))
+    Ok(Json(serde_json::json!(imported)))
 }
 
 async fn api_install_symbol_pack(
@@ -516,6 +562,17 @@ async fn api_delete_symbol(
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_supervisor(&user)?;
+    if state
+        .core
+        .symbols_library
+        .get(&id)
+        .is_some_and(|s| s.pack_id.is_some())
+    {
+        return Err(ScadaError::BadRequest(
+            "Ce symbole appartient à un module : désinstallez le module entier".into(),
+        )
+        .into());
+    }
     state.core.delete_symbol(&user.0.username, &id).await?;
     Ok(Json(serde_json::json!({ "deleted": id })))
 }
