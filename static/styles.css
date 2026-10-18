@@ -803,6 +803,9 @@ body.run-mode .resize-handle {
 .custom-svg-wrapper.etat-inconnu .sym-niveau {
   transform: scaleY(var(--apex-niveau, 1));
 }
+.custom-svg-wrapper.etat-inconnu .sym-niveau {
+  opacity: .5;
+}
 
 @keyframes symDefautClignote { 50% { opacity: 0; } }
 @keyframes symFluxCoule { to { stroke-dashoffset: -12; } }

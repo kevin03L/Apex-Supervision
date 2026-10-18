@@ -249,6 +249,14 @@ pub struct RegisteredTag {
     pub data_type: TagDataType,
     pub unit: Option<String>,
     pub writable: bool,
+    #[serde(default)]
+    pub consigne_min: Option<f64>,
+    #[serde(default)]
+    pub consigne_max: Option<f64>,
+    #[serde(default)]
+    pub fraicheur_max_s: Option<u32>,
+    #[serde(default)]
+    pub ecriture_sans_retour: bool,
     #[serde(default = "default_deadband")]
     pub deadband: f64,
     #[serde(default = "default_scale_factor")]
@@ -448,11 +456,29 @@ pub struct DriverUpdateRequest {
     pub poll_interval_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct WriteCommand {
     pub tag_id: String,
     pub protocol_address: String,
     pub value: TagValue,
+    /// Accusé interne utilisé par la remise à zéro des impulsions.
+    pub ack: Option<tokio::sync::oneshot::Sender<bool>>,
+}
+
+impl WriteCommand {
+    pub fn confirm(&mut self) {
+        if let Some(tx) = self.ack.take() {
+            let _ = tx.send(true);
+        }
+    }
+}
+
+impl Drop for WriteCommand {
+    fn drop(&mut self) {
+        if let Some(tx) = self.ack.take() {
+            let _ = tx.send(false);
+        }
+    }
 }
 
 // ============================================================================
@@ -858,6 +884,10 @@ pub enum WsServerMessage {
     TagUpdateBatch(Vec<TagState>),
     AlarmUpdate(Vec<AlarmInstance>),
     DriverListUpdate(Vec<DriverConfig>),
+    WriteRejected {
+        tag_id: String,
+        reason: String,
+    },
     FlowTrace(FlowExecutionTrace),
     /// Réglages système modifiés par un administrateur.
     SettingsUpdate(SystemSettings),

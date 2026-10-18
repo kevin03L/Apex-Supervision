@@ -747,9 +747,12 @@ function updateWidgetProp(prop, val) {
 function buildWidgetBodyHtml(w) {
   const tag = w.bound_tag_id ? state.tags[w.bound_tag_id] : null;
   const val = tag && tag.state ? tag.state.value : null;
-  const qual = esc(tag && tag.state ? tag.state.quality : 'Uncertain');
+  const rawQual = tag && tag.state ? tag.state.quality : 'Uncertain';
+  const isGood = Boolean(tag && tag.state && tag.state.quality === 'Good');
+  const qual = esc(rawQual);
   const unit = tag && tag.unit ? esc(tag.unit) : '';
-  const numVal = typeof val === 'number' ? val : 0;
+  const numVal = typeof val === 'number' && Number.isFinite(val) ? val : 0;
+  const hasNum = typeof val === 'number' && Number.isFinite(val);
   const boolVal = Boolean(val);
   const allowWrite = Boolean(canWrite() && tag && tag.writable);
 
@@ -758,14 +761,14 @@ function buildWidgetBodyHtml(w) {
     const max = Number((w.properties && w.properties.max) ?? 100);
     const pct = Math.max(0, Math.min(1, (numVal - min) / ((max - min) || 1)));
     const dash = (pct * 126).toFixed(1);
-    const strokeCol = pct > 0.85 ? '#ef4444' : pct > 0.7 ? '#f59e0b' : '#38bdf8';
+    const strokeCol = !isGood ? '#f59e0b' : pct > 0.85 ? '#ef4444' : pct > 0.7 ? '#f59e0b' : '#38bdf8';
     return `
       <svg width="150" height="90" viewBox="0 0 120 72">
         <path d="M 15 60 A 45 45 0 0 1 105 60" fill="none" stroke="#1e293b" stroke-width="10" stroke-linecap="round"/>
         <path d="M 15 60 A 45 45 0 0 1 105 60" fill="none" stroke="${strokeCol}" stroke-width="10"
-              stroke-dasharray="${dash} 150" stroke-linecap="round"/>
-        <text x="60" y="53" text-anchor="middle" fill="#f8fafc" font-size="15.5" font-weight="bold" font-family="Consolas">
-          ${numVal.toFixed(1)}${unit}
+              stroke-dasharray="${dash} 150" stroke-linecap="round"${!isGood ? ' opacity="0.6"' : ''}/>
+        <text x="60" y="53" text-anchor="middle" fill="${!isGood ? '#f59e0b' : '#f8fafc'}" font-size="${!isGood ? '13' : '15.5'}" font-weight="bold" font-family="Consolas">
+          ${!isGood ? (hasNum ? `<tspan fill="#94a3b8">${numVal.toFixed(1)}${unit}</tspan> ` : '') + `-- (${qual})` : `${numVal.toFixed(1)}${unit}`}
         </text>
       </svg>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'} (${qual})</div>
@@ -773,22 +776,30 @@ function buildWidgetBodyHtml(w) {
   }
 
   if (w.widget_type === 'Pump') {
-    const color = boolVal ? '#10b981' : '#475569';
+    const color = !isGood ? '#f59e0b' : boolVal ? '#10b981' : '#475569';
     return `
       <svg width="76" height="76" viewBox="0 0 100 100">
         <rect x="48" y="10" width="38" height="16" fill="#1e293b" stroke="${color}" stroke-width="3"/>
         <circle cx="50" cy="54" r="34" fill="#0b101b" stroke="${color}" stroke-width="4"/>
-        <g class="${boolVal ? 'spin-active' : ''}" style="transform-origin:50px 54px;">
+        <g class="${isGood && boolVal ? 'spin-active' : ''}" style="transform-origin:50px 54px;">
           <line x1="50" y1="26" x2="50" y2="82" stroke="${color}" stroke-width="5"/>
           <line x1="22" y1="54" x2="78" y2="54" stroke="${color}" stroke-width="5"/>
           <circle cx="50" cy="54" r="8" fill="${color}"/>
         </g>
       </svg>
+      ${!isGood ? `
+      <div class="badge-qual q-Uncertain" style="margin-top:6px;color:#f59e0b;">
+        INCONNU (${qual})${val != null ? ` <span style="color:#94a3b8;">(${boolVal ? '1' : '0'})</span>` : ''}
+      </div>
       ${allowWrite ? `
+      <button class="btn" style="margin-top:4px;" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!boolVal})">
+        Commande (${boolVal ? '0' : '1'})
+      </button>` : ''}
+      ` : allowWrite ? `
       <button class="btn" style="margin-top:6px;" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!boolVal})">
         ${boolVal ? 'MARCHE (Arrêter)' : 'ARRÊT (Démarrer)'}
       </button>` : `
-      <div class="badge-qual q-${boolVal ? 'Good' : 'Uncertain'}" style="margin-top:6px;">
+      <div class="badge-qual ${boolVal ? 'q-Good' : 'q-Uncertain'}" style="margin-top:6px;">
         ${boolVal ? 'MARCHE' : 'ARRÊT'}
       </div>`}
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
@@ -796,11 +807,11 @@ function buildWidgetBodyHtml(w) {
   }
 
   if (w.widget_type === 'Fan') {
-    const color = boolVal ? '#38bdf8' : '#475569';
+    const color = !isGood ? '#f59e0b' : boolVal ? '#38bdf8' : '#475569';
     return `
       <svg width="78" height="78" viewBox="0 0 100 100">
         <rect x="10" y="10" width="80" height="80" rx="12" fill="#0b101b" stroke="${color}" stroke-width="3"/>
-        <g class="${boolVal ? 'spin-active' : ''}">
+        <g class="${isGood && boolVal ? 'spin-active' : ''}">
           <ellipse cx="50" cy="28" rx="9" ry="18" fill="${color}"/>
           <ellipse cx="50" cy="72" rx="9" ry="18" fill="${color}"/>
           <ellipse cx="28" cy="50" rx="18" ry="9" fill="${color}"/>
@@ -808,11 +819,19 @@ function buildWidgetBodyHtml(w) {
           <circle cx="50" cy="50" r="8" fill="#fff"/>
         </g>
       </svg>
+      ${!isGood ? `
+      <div class="badge-qual q-Uncertain" style="margin-top:6px;color:#f59e0b;">
+        INCONNU (${qual})${val != null ? ` <span style="color:#94a3b8;">(${boolVal ? '1' : '0'})</span>` : ''}
+      </div>
       ${allowWrite ? `
+      <button class="btn" style="margin-top:4px;" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!boolVal})">
+        Commande (${boolVal ? '0' : '1'})
+      </button>` : ''}
+      ` : allowWrite ? `
       <button class="btn" style="margin-top:6px;" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!boolVal})">
         ${boolVal ? 'SOUFFLAGE ACTIF' : 'VENTILATEUR ARRÊTÉ'}
       </button>` : `
-      <div class="badge-qual q-${boolVal ? 'Good' : 'Uncertain'}" style="margin-top:6px;">
+      <div class="badge-qual ${boolVal ? 'q-Good' : 'q-Uncertain'}" style="margin-top:6px;">
         ${boolVal ? 'SOUFFLAGE ACTIF' : 'VENTILATEUR ARRÊTÉ'}
       </div>`}
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
@@ -822,14 +841,17 @@ function buildWidgetBodyHtml(w) {
   if (w.widget_type === 'Damper') {
     const pct = Math.max(0, Math.min(100, numVal));
     const angle = -45 + (pct / 100) * 45;
+    const strokeCol = !isGood ? '#f59e0b' : '#38bdf8';
     return `
       <svg width="110" height="62" viewBox="0 0 120 66">
         <rect x="15" y="8" width="90" height="50" fill="#0b101b" stroke="#475569" stroke-width="3"/>
-        <line x1="35" y1="12" x2="35" y2="54" stroke="#38bdf8" stroke-width="4" transform="rotate(${angle} 35 33)"/>
-        <line x1="60" y1="12" x2="60" y2="54" stroke="#38bdf8" stroke-width="4" transform="rotate(${angle} 60 33)"/>
-        <line x1="85" y1="12" x2="85" y2="54" stroke="#38bdf8" stroke-width="4" transform="rotate(${angle} 85 33)"/>
+        <line x1="35" y1="12" x2="35" y2="54" stroke="${strokeCol}" stroke-width="4" transform="rotate(${angle} 35 33)"/>
+        <line x1="60" y1="12" x2="60" y2="54" stroke="${strokeCol}" stroke-width="4" transform="rotate(${angle} 60 33)"/>
+        <line x1="85" y1="12" x2="85" y2="54" stroke="${strokeCol}" stroke-width="4" transform="rotate(${angle} 85 33)"/>
       </svg>
-      <div style="font-weight:800;color:#38bdf8;font-size:14px;">Ouverture : ${pct.toFixed(0)} %</div>
+      <div style="font-weight:800;color:${!isGood ? '#f59e0b' : '#38bdf8'};font-size:14px;">
+        Ouverture : ${!isGood ? (hasNum ? `<span style="color:#94a3b8;">${pct.toFixed(0)} %</span> -- (${qual})` : `-- (${qual})`) : `${pct.toFixed(0)} %`}
+      </div>
       <input type="range" min="0" max="100" value="${pct}" ${allowWrite ? '' : 'disabled'} aria-label="${esc(w.title || w.bound_tag_id || 'Commande')}" onchange="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, parseFloat(this.value))" />
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
@@ -839,50 +861,58 @@ function buildWidgetBodyHtml(w) {
     return `
       <svg width="90" height="84" viewBox="0 0 100 95">
         <rect x="20" y="12" width="60" height="72" rx="10" fill="#131c31" stroke="#f59e0b" stroke-width="3"/>
-        <path d="M 50 32 C 36 50, 40 68, 50 72 C 60 68, 64 50, 50 32 Z" fill="#f97316"/>
-        <path d="M 50 45 C 43 55, 45 66, 50 70 C 55 66, 57 55, 50 45 Z" fill="#fde047"/>
+        <path d="M 50 32 C 36 50, 40 68, 50 72 C 60 68, 64 50, 50 32 Z" fill="${!isGood ? '#475569' : '#f97316'}" opacity="${!isGood ? '0.4' : '1'}"/>
+        <path d="M 50 45 C 43 55, 45 66, 50 70 C 55 66, 57 55, 50 45 Z" fill="${!isGood ? '#64748b' : '#fde047'}" opacity="${!isGood ? '0.4' : '1'}"/>
       </svg>
-      <div style="font-weight:800;font-size:17px;color:#fbbf24;font-family:Consolas;">${numVal.toFixed(1)} ${unit}</div>
+      <div style="font-weight:800;font-size:17px;color:${!isGood ? '#f59e0b' : '#fbbf24'};font-family:Consolas;">
+        ${!isGood ? (hasNum ? `<span style="color:#94a3b8;">${numVal.toFixed(1)} ${unit}</span> ` : '') + `-- (${qual})` : `${numVal.toFixed(1)} ${unit}`}
+      </div>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
   }
 
   if (w.widget_type === 'Chiller') {
+    const col = !isGood ? '#f59e0b' : '#38bdf8';
     return `
       <svg width="105" height="78" viewBox="0 0 120 88">
-        <rect x="12" y="12" width="96" height="64" rx="8" fill="#0c192c" stroke="#38bdf8" stroke-width="3"/>
-        <circle cx="40" cy="44" r="18" fill="#070b14" stroke="#38bdf8" stroke-width="2.5"/>
-        <circle cx="80" cy="44" r="18" fill="#070b14" stroke="#38bdf8" stroke-width="2.5"/>
-        <text x="40" y="49" text-anchor="middle" fill="#38bdf8" font-size="16">❄</text>
-        <text x="80" y="49" text-anchor="middle" fill="#38bdf8" font-size="16">❄</text>
+        <rect x="12" y="12" width="96" height="64" rx="8" fill="#0c192c" stroke="${col}" stroke-width="3"/>
+        <circle cx="40" cy="44" r="18" fill="#070b14" stroke="${col}" stroke-width="2.5"/>
+        <circle cx="80" cy="44" r="18" fill="#070b14" stroke="${col}" stroke-width="2.5"/>
+        <text x="40" y="49" text-anchor="middle" fill="${col}" font-size="16">❄</text>
+        <text x="80" y="49" text-anchor="middle" fill="${col}" font-size="16">❄</text>
       </svg>
-      <div style="font-weight:800;font-size:17px;color:#38bdf8;font-family:Consolas;">Eau Glacée : ${numVal.toFixed(2)} ${unit}</div>
+      <div style="font-weight:800;font-size:15px;color:${col};font-family:Consolas;">
+        Eau Glacée : ${!isGood ? (hasNum ? `<span style="color:#94a3b8;">${numVal.toFixed(2)} ${unit}</span> ` : '') + `-- (${qual})` : `${numVal.toFixed(2)} ${unit}`}
+      </div>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'} (${qual})</div>
     `;
   }
 
   if (w.widget_type === 'PipeSegment') {
-    const active = numVal > 0.1 || boolVal;
-    const strokeCol = active ? '#38bdf8' : '#334155';
+    const active = isGood && (numVal > 0.1 || boolVal);
+    const strokeCol = !isGood ? '#f59e0b' : active ? '#38bdf8' : '#334155';
     return `
       <svg width="100%" height="44" viewBox="0 0 200 44">
         <rect x="4" y="14" width="192" height="16" rx="4" fill="#0f172a" stroke="${strokeCol}" stroke-width="3"/>
         ${active ? `<line x1="12" y1="22" x2="188" y2="22" stroke="#38bdf8" stroke-width="4" stroke-dasharray="10 8"/>` : ''}
       </svg>
-      <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Tuyauterie'}</div>
+      <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Tuyauterie'}${!isGood ? ` (${qual})` : ''}</div>
     `;
   }
 
   if (w.widget_type === 'Valve') {
     const pct = Math.max(0, Math.min(100, numVal));
+    const strokeCol = !isGood ? '#f59e0b' : '#38bdf8';
     return `
       <svg width="110" height="58" viewBox="0 0 120 62">
-        <polygon points="20,15 60,38 20,58" fill="#1e293b" stroke="#38bdf8" stroke-width="2.5"/>
-        <polygon points="100,15 60,38 100,58" fill="#1e293b" stroke="#38bdf8" stroke-width="2.5"/>
+        <polygon points="20,15 60,38 20,58" fill="#1e293b" stroke="${strokeCol}" stroke-width="2.5"/>
+        <polygon points="100,15 60,38 100,58" fill="#1e293b" stroke="${strokeCol}" stroke-width="2.5"/>
         <line x1="60" y1="38" x2="60" y2="10" stroke="#f59e0b" stroke-width="4"/>
         <rect x="44" y="3" width="32" height="10" rx="3" fill="#f59e0b"/>
       </svg>
-      <div style="font-weight:800;font-size:15px;color:#38bdf8;">${pct.toFixed(1)} %</div>
+      <div style="font-weight:800;font-size:15px;color:${strokeCol};">
+        ${!isGood ? (hasNum ? `<span style="color:#94a3b8;">${pct.toFixed(1)} %</span> -- (${qual})` : `-- (${qual})`) : `${pct.toFixed(1)} %`}
+      </div>
       <input type="range" min="0" max="100" value="${pct}" ${allowWrite ? '' : 'disabled'} aria-label="${esc(w.title || w.bound_tag_id || 'Commande')}" onchange="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, parseFloat(this.value))" />
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
@@ -895,7 +925,9 @@ function buildWidgetBodyHtml(w) {
     const nextDown = Math.max(min, Math.min(max, numVal - step));
     const nextUp = Math.max(min, Math.min(max, numVal + step));
     return `
-      <div class="big-num" style="color:#38bdf8;">${numVal.toFixed(1)} ${unit}</div>
+      <div class="big-num" style="color:${!isGood ? '#f59e0b' : '#38bdf8'};">
+        ${!isGood ? (hasNum ? `<span style="color:#94a3b8;font-size:0.85em;">${numVal.toFixed(1)} ${unit}</span> ` : '') + `-- (${qual})` : `${numVal.toFixed(1)} ${unit}`}
+      </div>
       ${allowWrite ? `
       <div class="setpoint-controls">
         <button class="btn" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${nextDown.toFixed(2)})">-${step}</button>
@@ -903,7 +935,9 @@ function buildWidgetBodyHtml(w) {
         <button class="btn" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${nextUp.toFixed(2)})">+${step}</button>
         <button class="btn btn-primary" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, parseFloat(document.getElementById(${jsArg('sp-in-' + cssSafe(w.id))}).value))">OK</button>
       </div>` : `
-      <div class="badge-qual q-Good" style="margin-top:6px;">Consigne : ${numVal.toFixed(1)} ${unit} (lecture seule)</div>`}
+      <div class="badge-qual ${isGood ? 'q-Good' : 'q-Uncertain'}" style="margin-top:6px;${isGood ? '' : 'color:#f59e0b;'}">
+        Consigne : ${!isGood ? (hasNum ? `<span style="color:#94a3b8;">${numVal.toFixed(1)} ${unit}</span> -- (${qual})` : `-- (${qual})`) : `${numVal.toFixed(1)} ${unit}`} (lecture seule)
+      </div>`}
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
   }
@@ -911,12 +945,22 @@ function buildWidgetBodyHtml(w) {
   if (w.widget_type === 'SwitchButton') {
     return `
       <div style="margin:8px 0;">
+        ${!isGood ? `
+        <div class="badge-qual q-Uncertain" style="padding:8px 16px;color:#f59e0b;">
+          COMMUTATEUR : INCONNU (${qual})${val != null ? ` <span style="color:#94a3b8;">(${boolVal ? '1' : '0'})</span>` : ''}
+        </div>
         ${allowWrite ? `
+        <div style="margin-top:6px;">
+          <button class="btn" style="padding:6px 14px;font-size:12px;" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!boolVal})">
+            Basculer vers ${boolVal ? '0' : '1'}
+          </button>
+        </div>` : ''}
+        ` : allowWrite ? `
         <button class="btn ${boolVal ? 'btn-primary' : ''}" style="padding:10px 18px;font-size:13px;"
                 onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!boolVal})">
           ${boolVal ? 'COMMUTATEUR : ON (1)' : 'COMMUTATEUR : OFF (0)'}
         </button>` : `
-        <div class="badge-qual q-${boolVal ? 'Good' : 'Uncertain'}" style="padding:8px 16px;">
+        <div class="badge-qual ${boolVal ? 'q-Good' : 'q-Uncertain'}" style="padding:8px 16px;">
           ${boolVal ? 'COMMUTATEUR : ON (1)' : 'COMMUTATEUR : OFF (0)'}
         </div>`}
       </div>
@@ -937,11 +981,13 @@ function buildWidgetBodyHtml(w) {
     }).join(' ');
     return `
       <svg width="${wSvg}" height="${hSvg}" style="background:#050911;border-radius:6px;border:1px solid #1e293b;">
-        <polyline fill="none" stroke="#38bdf8" stroke-width="2.5" points="${poly}" />
+        <polyline fill="none" stroke="${!isGood ? '#f59e0b' : '#38bdf8'}" stroke-width="2.5" points="${poly}" />
       </svg>
       <div style="display:flex;justify-content:space-between;width:100%;margin-top:5px;font-size:11px;">
         <span class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}${tag && !tag.historize ? ' · non historisée (courbe depuis l\'ouverture de la page)' : ''}</span>
-        <b style="color:#38bdf8;font-family:Consolas;">${numVal.toFixed(2)} ${unit}</b>
+        <b style="color:${!isGood ? '#f59e0b' : '#38bdf8'};font-family:Consolas;">
+          ${!isGood ? (hasNum ? `<span style="color:#94a3b8;">${numVal.toFixed(2)} ${unit}</span> ` : '') + `-- (${qual})` : `${numVal.toFixed(2)} ${unit}`}
+        </b>
       </div>
     `;
   }
@@ -949,24 +995,28 @@ function buildWidgetBodyHtml(w) {
   if (w.widget_type === 'TankLevel') {
     const pct = Math.max(0, Math.min(100, numVal));
     const hFill = (pct / 100) * 90;
+    const strokeCol = !isGood ? '#f59e0b' : '#475569';
+    const fillCol = !isGood ? 'rgba(148, 163, 184, 0.35)' : 'rgba(56, 189, 248, 0.65)';
     return `
       <svg width="92" height="114" viewBox="0 0 92 114">
-        <rect x="16" y="10" width="60" height="92" rx="8" fill="#070b14" stroke="#475569" stroke-width="3"/>
-        <rect x="19" y="${100 - hFill}" width="54" height="${hFill}" rx="5" fill="rgba(56, 189, 248, 0.65)"/>
-        <text x="46" y="60" text-anchor="middle" fill="#fff" font-weight="bold" font-size="14">${pct.toFixed(0)}%</text>
+        <rect x="16" y="10" width="60" height="92" rx="8" fill="#070b14" stroke="${strokeCol}" stroke-width="3"/>
+        <rect x="19" y="${100 - hFill}" width="54" height="${hFill}" rx="5" fill="${fillCol}"/>
+        <text x="46" y="60" text-anchor="middle" fill="${!isGood ? '#f59e0b' : '#fff'}" font-weight="bold" font-size="${!isGood ? '11' : '14'}">
+          ${!isGood ? (hasNum ? `<tspan fill="#94a3b8">${pct.toFixed(0)}% </tspan>` : '') + `-- (${qual})` : `${pct.toFixed(0)}%`}
+        </text>
       </svg>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
   }
 
   if (w.widget_type === 'IndicatorLed') {
-    const ledColor = boolVal ? '#ef4444' : '#10b981';
+    const ledColor = !isGood ? '#f59e0b' : boolVal ? '#ef4444' : '#10b981';
     return `
       <div style="display:flex;align-items:center;gap:10px;">
         <div style="width:22px;height:22px;border-radius:50%;background:${ledColor};box-shadow:0 0 14px ${ledColor};"></div>
         <div>
           <div style="font-weight:700;font-size:12.5px;color:${ledColor};">
-            ${boolVal ? 'DÉFAUT / ALARME' : 'ÉTAT NORMAL'}
+            ${!isGood ? `INCONNU (${qual})${val != null ? ` <span style="color:#94a3b8;">(${boolVal ? '1' : '0'})</span>` : ''}` : (boolVal ? 'DÉFAUT / ALARME' : 'ÉTAT NORMAL')}
           </div>
           <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
         </div>
@@ -979,20 +1029,29 @@ function buildWidgetBodyHtml(w) {
 
   if (w.widget_type === 'MotorValve2Way') {
     const open = boolVal || numVal > 5;
-    const col = open ? '#10b981' : '#ef4444';
+    const col = !isGood ? '#f59e0b' : open ? '#10b981' : '#ef4444';
+    const fillCol = !isGood ? '#1e293b' : open ? '#064e3b' : '#450a0a';
     return `
       <svg width="105" height="62" viewBox="0 0 120 68">
-        <polygon points="18,18 60,42 18,62" fill="${open ? '#064e3b' : '#450a0a'}" stroke="${col}" stroke-width="3"/>
-        <polygon points="102,18 60,42 102,62" fill="${open ? '#064e3b' : '#450a0a'}" stroke="${col}" stroke-width="3"/>
+        <polygon points="18,18 60,42 18,62" fill="${fillCol}" stroke="${col}" stroke-width="3"/>
+        <polygon points="102,18 60,42 102,62" fill="${fillCol}" stroke="${col}" stroke-width="3"/>
         <line x1="60" y1="42" x2="60" y2="14" stroke="#f59e0b" stroke-width="3.5"/>
         <circle cx="60" cy="11" r="9" fill="#0b1120" stroke="#f59e0b" stroke-width="2.5"/>
         <text x="60" y="15" text-anchor="middle" fill="#f59e0b" font-size="10" font-weight="bold">M</text>
       </svg>
+      ${!isGood ? `
+      <div class="badge-qual q-Uncertain" style="margin-top:4px;color:#f59e0b;">
+        INCONNU (${qual})${val != null ? ` <span style="color:#94a3b8;">(${open ? '1' : '0'})</span>` : ''}
+      </div>
       ${allowWrite ? `
+      <button class="btn" style="margin-top:4px;" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!open})">
+        Commande (${open ? '0' : '1'})
+      </button>` : ''}
+      ` : allowWrite ? `
       <button class="btn" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!open})">
         ${open ? 'VANNE OUVERTE' : 'VANNE FERMÉE'}
       </button>` : `
-      <div class="badge-qual q-${open ? 'Good' : 'Uncertain'}" style="margin-top:4px;">
+      <div class="badge-qual ${open ? 'q-Good' : 'q-Uncertain'}" style="margin-top:4px;">
         ${open ? 'VANNE OUVERTE' : 'VANNE FERMÉE'}
       </div>`}
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
@@ -1001,89 +1060,113 @@ function buildWidgetBodyHtml(w) {
 
   if (w.widget_type === 'Compressor') {
     const active = boolVal || numVal > 0.5;
-    const col = active ? '#10b981' : '#8b9bb4';
+    const col = !isGood ? '#f59e0b' : active ? '#10b981' : '#8b9bb4';
     return `
       <svg width="88" height="82" viewBox="0 0 100 94">
         <circle cx="50" cy="48" r="35" fill="#0b1120" stroke="${col}" stroke-width="3.5"/>
         <polygon points="24,26 80,36 80,60 24,70" fill="none" stroke="${col}" stroke-width="2.5"/>
-        <g class="${active ? 'spin-active' : ''}" style="transform-origin:50px 48px;">
+        <g class="${isGood && active ? 'spin-active' : ''}" style="transform-origin:50px 48px;">
           <circle cx="50" cy="48" r="8" fill="${col}"/>
           <line x1="36" y1="48" x2="64" y2="48" stroke="#fff" stroke-width="3"/>
         </g>
       </svg>
-      <div style="font-weight:700;font-size:12px;color:${col};">${active ? 'COMPRESSEUR EN CHARGE' : 'ARRÊT'}</div>
+      <div style="font-weight:700;font-size:12px;color:${col};">
+        ${!isGood ? `INCONNU (${qual})${val != null ? ` <span style="color:#94a3b8;">(${active ? '1' : '0'})</span>` : ''}` : (active ? 'COMPRESSEUR EN CHARGE' : 'ARRÊT')}
+      </div>
+      ${!isGood && allowWrite ? `
+      <button class="btn" style="margin-top:4px;" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!active})">
+        Commande (${active ? '0' : '1'})
+      </button>` : ''}
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
   }
 
   if (w.widget_type === 'HeatExchanger') {
+    const col = !isGood ? '#f59e0b' : '#fb923c';
     return `
       <svg width="110" height="74" viewBox="0 0 120 80">
-        <rect x="16" y="10" width="88" height="60" rx="6" fill="#0b1120" stroke="#f97316" stroke-width="3"/>
+        <rect x="16" y="10" width="88" height="60" rx="6" fill="#0b101b" stroke="${col}" stroke-width="3"/>
         <polyline points="26,20 42,60 58,20 74,60 90,20" fill="none" stroke="#38bdf8" stroke-width="3"/>
         <line x1="6" y1="25" x2="16" y2="25" stroke="#ef4444" stroke-width="4"/>
         <line x1="104" y1="55" x2="114" y2="55" stroke="#38bdf8" stroke-width="4"/>
       </svg>
-      <div style="font-weight:800;font-size:15px;color:#fb923c;font-family:Consolas;">ΔT / Échangeur : ${numVal.toFixed(1)} ${unit}</div>
+      <div style="font-weight:800;font-size:15px;color:${col};font-family:Consolas;">
+        ΔT / Échangeur : ${!isGood ? (hasNum ? `<span style="color:#94a3b8;">${numVal.toFixed(1)} ${unit}</span> ` : '') + `-- (${qual})` : `${numVal.toFixed(1)} ${unit}`}
+      </div>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'}</div>
     `;
   }
 
   if (w.widget_type === 'CoolingTower') {
-    const active = boolVal || numVal > 0;
+    const active = isGood && (boolVal || numVal > 0);
+    const col = !isGood ? '#f59e0b' : '#38bdf8';
     return `
       <svg width="92" height="86" viewBox="0 0 100 94">
-        <polygon points="28,18 72,18 84,82 16,82" fill="#0b1120" stroke="#38bdf8" stroke-width="3"/>
-        <ellipse cx="50" cy="18" rx="22" ry="6" fill="#0f172a" stroke="#38bdf8" stroke-width="2.5"/>
-        <path d="M 30 58 Q 50 48 70 58" fill="none" stroke="#38bdf8" stroke-width="2.5" stroke-dasharray="4 3"/>
-        <path d="M 24 72 Q 50 62 76 72" fill="none" stroke="#38bdf8" stroke-width="2.5"/>
+        <polygon points="28,18 72,18 84,82 16,82" fill="#0b101b" stroke="${col}" stroke-width="3"/>
+        <ellipse cx="50" cy="18" rx="22" ry="6" fill="#0f172a" stroke="${col}" stroke-width="2.5"/>
+        <path d="M 30 58 Q 50 48 70 58" fill="none" stroke="${col}" stroke-width="2.5" stroke-dasharray="4 3"/>
+        <path d="M 24 72 Q 50 62 76 72" fill="none" stroke="${col}" stroke-width="2.5"/>
       </svg>
-      <div style="font-weight:800;font-size:14px;color:#38bdf8;">${numVal.toFixed(1)} ${unit}</div>
-      <div class="widget-tag-sub">${esc(w.bound_tag_id) || (active ? 'Tour Active' : 'Tour')}</div>
+      <div style="font-weight:800;font-size:14px;color:${col};">
+        ${!isGood ? (hasNum ? `<span style="color:#94a3b8;">${numVal.toFixed(1)} ${unit}</span> ` : '') + `-- (${qual})` : `${numVal.toFixed(1)} ${unit}`}
+      </div>
+      <div class="widget-tag-sub">${esc(w.bound_tag_id) || (!isGood ? `Tour (${qual})` : active ? 'Tour Active' : 'Tour')}</div>
     `;
   }
 
   if (w.widget_type === 'HeaterBattery') {
-    const col = numVal > 20 ? '#ef4444' : '#38bdf8';
+    const col = !isGood ? '#f59e0b' : numVal > 20 ? '#ef4444' : '#38bdf8';
     return `
       <svg width="96" height="76" viewBox="0 0 100 80">
-        <rect x="18" y="10" width="64" height="60" rx="5" fill="#0b1120" stroke="${col}" stroke-width="3"/>
+        <rect x="18" y="10" width="64" height="60" rx="5" fill="#0b101b" stroke="${col}" stroke-width="3"/>
         <polyline points="28,22 72,22 28,38 72,38 28,54 72,54" fill="none" stroke="${col}" stroke-width="3"/>
       </svg>
-      <div style="font-weight:800;font-size:15px;color:${col};font-family:Consolas;">${numVal.toFixed(1)} ${unit}</div>
+      <div style="font-weight:800;font-size:15px;color:${col};font-family:Consolas;">
+        ${!isGood ? (hasNum ? `<span style="color:#94a3b8;">${numVal.toFixed(1)} ${unit}</span> ` : '') + `-- (${qual})` : `${numVal.toFixed(1)} ${unit}`}
+      </div>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Batterie Thermique'}</div>
     `;
   }
 
   if (w.widget_type === 'FilterUnit') {
     const clogged = boolVal || numVal > 200;
-    const col = clogged ? '#ef4444' : '#10b981';
+    const col = !isGood ? '#f59e0b' : clogged ? '#ef4444' : '#10b981';
     return `
       <svg width="92" height="74" viewBox="0 0 100 80">
-        <rect x="18" y="10" width="64" height="60" fill="#0b1120" stroke="${col}" stroke-width="3"/>
+        <rect x="18" y="10" width="64" height="60" fill="#0b101b" stroke="${col}" stroke-width="3"/>
         <polyline points="30,12 70,26 30,40 70,54 30,68" fill="none" stroke="${col}" stroke-width="2.5" stroke-dasharray="4 2"/>
       </svg>
-      <div style="font-weight:700;font-size:12px;color:${col};">${clogged ? 'COLMATAGE FILTRE ΔP' : 'FILTRE PROPRE'}</div>
+      <div style="font-weight:700;font-size:12px;color:${col};">
+        ${!isGood ? `INCONNU (${qual})${val != null ? ` <span style="color:#94a3b8;">(${clogged ? '1' : '0'})</span>` : ''}` : (clogged ? 'COLMATAGE FILTRE ΔP' : 'FILTRE PROPRE')}
+      </div>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Filtre F7'}</div>
     `;
   }
 
   if (w.widget_type === 'CircuitBreaker') {
     const closed = boolVal || numVal > 0;
-    const col = closed ? '#ef4444' : '#10b981';
+    const col = !isGood ? '#f59e0b' : closed ? '#ef4444' : '#10b981';
     return `
       <svg width="86" height="82" viewBox="0 0 100 94">
         <line x1="50" y1="6" x2="50" y2="30" stroke="#94a3b8" stroke-width="4"/>
         <circle cx="50" cy="30" r="4" fill="#fff"/>
         <line x1="50" y1="66" x2="50" y2="90" stroke="#94a3b8" stroke-width="4"/>
         <circle cx="50" cy="66" r="4" fill="#fff"/>
-        <line x1="50" y1="66" x2="${closed ? 50 : 28}" y2="${closed ? 30 : 34}" stroke="${col}" stroke-width="5"/>
+        <line x1="50" y1="66" x2="${!isGood ? 39 : closed ? 50 : 28}" y2="${!isGood ? 32 : closed ? 30 : 34}" stroke="${col}" stroke-width="5"/>
       </svg>
+      ${!isGood ? `
+      <div class="badge-qual q-Uncertain" style="margin-top:4px;color:#f59e0b;">
+        INCONNU (${qual})${val != null ? ` <span style="color:#94a3b8;">(${closed ? '1' : '0'})</span>` : ''}
+      </div>
       ${allowWrite ? `
+      <button class="btn" style="margin-top:4px;" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!closed})">
+        Commande (${closed ? '0' : '1'})
+      </button>` : ''}
+      ` : allowWrite ? `
       <button class="btn" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!closed})">
         ${closed ? 'ENCLENCHÉ (FERMÉ)' : 'OUVERT (ISOLÉ)'}
       </button>` : `
-      <div class="badge-qual q-${closed ? 'Good' : 'Uncertain'}" style="margin-top:4px;">
+      <div class="badge-qual ${closed ? 'q-Good' : 'q-Uncertain'}" style="margin-top:4px;">
         ${closed ? 'ENCLENCHÉ (FERMÉ)' : 'OUVERT (ISOLÉ)'}
       </div>`}
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Disjoncteur'}</div>
@@ -1091,39 +1174,53 @@ function buildWidgetBodyHtml(w) {
   }
 
   if (w.widget_type === 'Transformer') {
+    const col = !isGood ? '#f59e0b' : '#fbbf24';
     return `
       <svg width="96" height="80" viewBox="0 0 100 84">
-        <circle cx="50" cy="30" r="20" fill="none" stroke="#f59e0b" stroke-width="3.5"/>
-        <circle cx="50" cy="54" r="20" fill="none" stroke="#38bdf8" stroke-width="3.5"/>
+        <circle cx="50" cy="30" r="20" fill="none" stroke="${col}" stroke-width="3.5"/>
+        <circle cx="50" cy="54" r="20" fill="none" stroke="${!isGood ? '#94a3b8' : '#38bdf8'}" stroke-width="3.5"/>
       </svg>
-      <div style="font-weight:800;font-size:15px;color:#fbbf24;font-family:Consolas;">${numVal.toFixed(1)} ${unit}</div>
+      <div style="font-weight:800;font-size:15px;color:${col};font-family:Consolas;">
+        ${!isGood ? (hasNum ? `<span style="color:#94a3b8;">${numVal.toFixed(1)} ${unit}</span> ` : '') + `-- (${qual})` : `${numVal.toFixed(1)} ${unit}`}
+      </div>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Transfo HTA/BT'}</div>
     `;
   }
 
   if (w.widget_type === 'ElectricMotor') {
     const run = boolVal || numVal > 0;
-    const col = run ? '#10b981' : '#8b9bb4';
+    const col = !isGood ? '#f59e0b' : run ? '#10b981' : '#8b9bb4';
     return `
       <svg width="86" height="82" viewBox="0 0 100 94">
         <circle cx="50" cy="48" r="34" fill="#0b1120" stroke="${col}" stroke-width="3.5"/>
         <text x="50" y="46" text-anchor="middle" fill="${col}" font-size="18" font-weight="bold">M</text>
         <text x="50" y="64" text-anchor="middle" fill="#94a3b8" font-size="13">3~</text>
       </svg>
-      <div style="font-weight:700;font-size:12px;color:${col};">${run ? 'MOTEUR 3~ ACTIF' : 'ARRÊTÉ'}</div>
+      <div style="font-weight:700;font-size:12px;color:${col};">
+        ${!isGood ? `INCONNU (${qual})${val != null ? ` <span style="color:#94a3b8;">(${run ? '1' : '0'})</span>` : ''}` : (run ? 'MOTEUR 3~ ACTIF' : 'ARRÊTÉ')}
+      </div>
+      ${!isGood && allowWrite ? `
+      <button class="btn" style="margin-top:4px;" onclick="selectCommand(${jsArg(w.id)}, ${jsArg(w.bound_tag_id)}, ${!run})">
+        Commande (${run ? '0' : '1'})
+      </button>` : ''}
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Moteur Asynchrone'}</div>
     `;
   }
 
   if (w.widget_type === 'FlowMeter') {
+    const col = !isGood ? '#f59e0b' : '#38bdf8';
     return `
       <svg width="96" height="76" viewBox="0 0 100 80">
-        <line x1="6" y1="45" x2="94" y2="45" stroke="#38bdf8" stroke-width="4"/>
-        <circle cx="50" cy="45" r="24" fill="#0b1120" stroke="#38bdf8" stroke-width="3.5"/>
-        <text x="50" y="42" text-anchor="middle" fill="#38bdf8" font-size="12" font-weight="bold">FIT</text>
-        <text x="50" y="56" text-anchor="middle" fill="#f8fafc" font-size="10">${numVal.toFixed(1)}</text>
+        <line x1="6" y1="45" x2="94" y2="45" stroke="${col}" stroke-width="4"/>
+        <circle cx="50" cy="45" r="24" fill="#0b101b" stroke="${col}" stroke-width="3.5"/>
+        <text x="50" y="42" text-anchor="middle" fill="${col}" font-size="12" font-weight="bold">FIT</text>
+        <text x="50" y="56" text-anchor="middle" fill="${!isGood ? '#94a3b8' : '#f8fafc'}" font-size="10">
+          ${!isGood ? '--' : numVal.toFixed(1)}
+        </text>
       </svg>
-      <div style="font-weight:800;font-size:15px;color:#38bdf8;font-family:Consolas;">${numVal.toFixed(2)} ${unit || 'm³/h'}</div>
+      <div style="font-weight:800;font-size:15px;color:${col};font-family:Consolas;">
+        ${!isGood ? (hasNum ? `<span style="color:#94a3b8;">${numVal.toFixed(2)} ${unit || 'm³/h'}</span> ` : '') + `-- (${qual})` : `${numVal.toFixed(2)} ${unit || 'm³/h'}`}
+      </div>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Débitmètre ISA'}</div>
     `;
   }
@@ -1133,12 +1230,15 @@ function buildWidgetBodyHtml(w) {
     const max = Number((w.properties && w.properties.max) ?? 10);
     const pct = Math.max(0, Math.min(1, (numVal - min) / ((max - min) || 1)));
     const deg = -120 + pct * 240;
+    const col = !isGood ? '#f59e0b' : '#38bdf8';
     return `
       <svg width="90" height="86" viewBox="0 0 100 94">
-        <circle cx="50" cy="48" r="36" fill="#0b1120" stroke="#38bdf8" stroke-width="3.5"/>
-        <line x1="50" y1="48" x2="50" y2="20" stroke="#ef4444" stroke-width="3" transform="rotate(${deg} 50 48)"/>
+        <circle cx="50" cy="48" r="36" fill="#0b101b" stroke="${col}" stroke-width="3.5"/>
+        <line x1="50" y1="48" x2="50" y2="20" stroke="${!isGood ? '#94a3b8' : '#ef4444'}" stroke-width="3" transform="rotate(${deg} 50 48)"/>
         <circle cx="50" cy="48" r="4" fill="#fff"/>
-        <text x="50" y="72" text-anchor="middle" fill="#38bdf8" font-size="11" font-weight="bold">${numVal.toFixed(2)} ${unit || 'bar'}</text>
+        <text x="50" y="72" text-anchor="middle" fill="${col}" font-size="11" font-weight="bold">
+          ${!isGood ? (hasNum ? `<tspan fill="#94a3b8">${numVal.toFixed(2)} </tspan>` : '') + `-- (${qual})` : `${numVal.toFixed(2)} ${unit || 'bar'}`}
+        </text>
       </svg>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Manomètre'}</div>
     `;
@@ -1147,14 +1247,16 @@ function buildWidgetBodyHtml(w) {
   if (w.widget_type === 'Thermometer') {
     const pct = Math.max(5, Math.min(100, ((numVal + 10) / 110) * 100));
     const hCol = (pct / 100) * 56;
-    const col = numVal > 60 ? '#ef4444' : numVal > 30 ? '#f59e0b' : '#38bdf8';
+    const col = !isGood ? '#f59e0b' : numVal > 60 ? '#ef4444' : numVal > 30 ? '#f59e0b' : '#38bdf8';
     return `
       <svg width="70" height="96" viewBox="0 0 70 100">
-        <rect x="27" y="10" width="16" height="64" rx="8" fill="#0b1120" stroke="#475569" stroke-width="2.5"/>
-        <rect x="30" y="${70 - hCol}" width="10" height="${hCol}" fill="${col}"/>
-        <circle cx="35" cy="78" r="13" fill="${col}" stroke="#475569" stroke-width="2.5"/>
+        <rect x="27" y="10" width="16" height="64" rx="8" fill="#0b101b" stroke="#475569" stroke-width="2.5"/>
+        <rect x="30" y="${70 - hCol}" width="10" height="${hCol}" fill="${col}" opacity="${!isGood ? '0.45' : '1'}"/>
+        <circle cx="35" cy="78" r="13" fill="${col}" stroke="#475569" stroke-width="2.5" opacity="${!isGood ? '0.45' : '1'}"/>
       </svg>
-      <div style="font-weight:800;font-size:15px;color:${col};font-family:Consolas;">${numVal.toFixed(1)} ${unit || '°C'}</div>
+      <div style="font-weight:800;font-size:15px;color:${col};font-family:Consolas;">
+        ${!isGood ? (hasNum ? `<span style="color:#94a3b8;">${numVal.toFixed(1)} ${unit || '°C'}</span> ` : '') + `-- (${qual})` : `${numVal.toFixed(1)} ${unit || '°C'}`}
+      </div>
       <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Thermomètre'}</div>
     `;
   }
@@ -1190,7 +1292,9 @@ function buildWidgetBodyHtml(w) {
   }
 
   return `
-    <div class="big-num">${numVal.toFixed(2)} <span style="font-size:14px;color:#38bdf8;">${unit}</span></div>
+    <div class="big-num" style="${!isGood ? 'color:#f59e0b;' : ''}">
+      ${!isGood ? (hasNum ? `<span style="color:#94a3b8;font-size:0.85em;">${numVal.toFixed(2)}</span> ` : '') + `-- (${qual})` : `${numVal.toFixed(2)} <span style="font-size:14px;color:#38bdf8;">${unit}</span>`}
+    </div>
     <div class="widget-tag-sub">${esc(w.bound_tag_id) || 'Non lié'} (${qual})</div>
   `;
 }
@@ -1235,13 +1339,15 @@ function updateCustomSvgState(container, w) {
   if (slot.style.color !== color) slot.style.color = color;
   const min = Number(props.min ?? 0), max = Number(props.max ?? 100);
   const level = typeof value === 'number' && Number.isFinite(value) && Number.isFinite(min) &&
-    Number.isFinite(max) && max > min ? Math.max(0, Math.min(1, (value - min) / (max - min))) : 0;
+    Number.isFinite(max) && max > min ? Math.max(0, Math.min(1, (value - min) / (max - min))) : 1;
   const levelText = String(level);
   if (slot.style.getPropertyValue('--apex-niveau') !== levelText) slot.style.setProperty('--apex-niveau', levelText);
   const display = container.querySelector('.custom-svg-value');
   if (display) {
     const unit = tag && tag.unit ? ` ${tag.unit}` : '';
-    const label = typeof value === 'boolean' ? (value ? 'MARCHE (1)' : 'ARRÊT (0)')
+    const label = !tag || quality !== 'Good'
+      ? (value != null ? `INCONNU (${quality || 'Inconnu'}) (${typeof value === 'boolean' ? (value ? '1' : '0') : typeof value === 'number' ? value.toFixed(1) : value}${unit})` : `INCONNU (${quality || 'Inconnu'})`)
+      : typeof value === 'boolean' ? (value ? 'MARCHE (1)' : 'ARRÊT (0)')
       : typeof value === 'number' ? `${value.toFixed(1)}${unit}` : '--';
     if (display.textContent !== label) display.textContent = label;
     if (display.style.color !== color) display.style.color = color;
@@ -1402,8 +1508,8 @@ async function executeArmedCommand() {
   const c = state.armedCommand;
   if (!c || c.momentary) return;
   cancelCommand(false);
-  if (await sendWriteTag(c.tagId, c.value)) {
-    notify(`Commande envoyée : ${c.title} → ${describeCommandValue(c.tagId, c.value)}`);
+  if (await sendWriteTag(c.tagId, c.value, false)) {
+    notify(`Commande transmise : ${c.title} → ${describeCommandValue(c.tagId, c.value)}`);
   }
 }
 
@@ -1422,7 +1528,7 @@ async function pulseCommand(widgetId, tagId, down) {
     try {
       const response = await fetch(`/api/tags/${encodeURIComponent(tagId)}/pulse`, { method: 'POST' });
       if (!response.ok) throw new Error('Impulsion refusée par le serveur');
-      notify('Impulsion de 1 seconde envoyée, remise à zéro gérée par le serveur');
+      notify('Impulsion transmise, remise à zéro gérée par le serveur');
     } catch (e) { notify(e.message, 'error'); }
   }
 }

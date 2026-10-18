@@ -38,12 +38,56 @@ Un module personnel est un fichier JSON UTF-8 de cette forme :
 
 Chaque identifiant de symbole doit commencer par l'identifiant du module suivi d'un tiret. Les SVG sont assainis à l'import. Une réinstallation met à jour les symboles portant les mêmes identifiants.
 
-## États animés des symboles
+## Convention des états animés des symboles
 
-L'IHM pose sur le conteneur du symbole `etat-marche` (vert `#10b981`), `etat-arret` (bleu `#38bdf8`), `etat-defaut` (rouge `#ef4444`) ou `etat-inconnu` (orange `#f59e0b`). Le défaut provient d'une variable booléenne choisie dans le Studio (`defaut_tag_id`) ou d'une alarme active sur la variable principale. Une qualité différente de `Good` ou une variable non liée donne l'état inconnu. Utilisez `currentColor` pour les parties actives.
+Elle est partagée entre les dessins (`packs/*.json`) et l'IHM (`static/synoptic.js`, `static/styles.css`).
+Toutes les règles passent par des **classes** et des **variables CSS** : aucun script dans les SVG.
 
-Dans le SVG, `sym-marche` apparaît en marche, `sym-arret` à l'arrêt ou en état inconnu, et `sym-defaut` apparaît en défaut avec un clignotement à 1 Hz. `sym-flux` anime le trait pointillé (`stroke-dasharray`) en marche, `sym-vibre` vibre légèrement et `sym-rotatable` tourne. `sym-niveau` reçoit un remplissage vertical compris entre 0 et 100 % par `--apex-niveau` ; les propriétés `min` et `max` du widget règlent l'échelle (0 et 100 par défaut). Placez `style="transform-origin:Xpx Ypx;"` sur `sym-niveau` et `sym-rotatable`, au bas de la zone remplie pour le niveau.
+### États fournis par l'IHM
+L'IHM pose sur l'enveloppe du symbole (`.custom-svg-wrapper`) **une** classe d'état et la couleur
+(`color`), que le dessin reprend par `currentColor` :
 
-Un élément porte au plus une de ces classes, sans imbrication entre elles, sauf `sym-rotatable` dans `sym-marche`. Sans état fourni par l'IHM, tous les éléments restent visibles, sans animation, et le niveau est à 100 %. La préférence de réduction du mouvement arrête les animations et laisse visibles les éléments d'état. Pour le corps métallique, utilisez des dégradés `linearGradient` ou `radialGradient` avec les couleurs `#0b1120`, `#111827`, `#1e293b`, `#273449`, `#334155`, `#475569`, `#64748b`, `#94a3b8`, `#cbd5e1`, `#e2e8f0`, `#ffffff`. Les identifiants internes commencent par l'identifiant du symbole suivi d'un tiret ; référencez un dégradé par `fill="url(#identifiant)"`. Évitez les filtres SVG, coûteux sur un synoptique chargé. Le détail de la convention est dans [`dist/CONVENTION-ETATS.md`](../dist/CONVENTION-ETATS.md).
+| Classe sur l'enveloppe | Condition | Couleur (`currentColor`) |
+|---|---|---|
+| `etat-marche` | variable principale vraie, ou numérique au-dessus du seuil | vert `#10b981` |
+| `etat-arret` | variable principale fausse, ou à zéro | bleu `#38bdf8` |
+| `etat-defaut` | variable de défaut liée vraie (propriété `defaut_tag_id`), ou alarme active sur la variable principale | rouge `#ef4444` |
+| `etat-inconnu` | qualité différente de `Good`, ou variable non liée | orange `#f59e0b` |
+
+Elle pose aussi la variable CSS **`--apex-niveau`**, nombre de 0 à 1, calculée à partir de la valeur
+numérique et des propriétés `min` et `max` du widget (0 et 100 par défaut, valeur bornée).
+
+### Classes utilisables dans les dessins
+
+| Classe | Effet piloté par l'IHM |
+|---|---|
+| `sym-rotatable` | (existant) tourne en `etat-marche` ; `style="transform-origin:CXpx CYpx;"` obligatoire |
+| `sym-marche` | visible seulement en `etat-marche` (flamme, flèches de débit, voyant vert, vanne ouverte) |
+| `sym-arret` | visible seulement en `etat-arret` ou `etat-inconnu` (vanne fermée, opercule baissé) |
+| `sym-defaut` | visible seulement en `etat-defaut`, clignote (1 Hz) |
+| `sym-flux` | trait en pointillés animés (écoulement) en `etat-marche`, fixe sinon ; à poser sur un `path` ou une `line` avec `stroke-dasharray` |
+| `sym-niveau` | remplissage vertical proportionnel à `--apex-niveau` (`transform: scaleY(...)`) ; `style="transform-origin:Xpx BASpx;"` obligatoire, BAS étant le bas de la zone remplie |
+| `sym-vibre` | légère vibration en `etat-marche` (compresseur, crible vibrant) |
+
+Règles :
+- un élément porte au plus **une** de ces classes, et les classes ne s'imbriquent pas entre elles, sauf
+  `sym-rotatable` à l'intérieur d'un `sym-marche` ;
+- un symbole sans état particulier n'en utilise aucune et reste valable (couleur seule) ;
+- en l'absence de l'IHM (aperçu, export), le dessin reste lisible : par défaut, toutes les parties sont
+  visibles et le niveau est à 100 % ;
+- avec la préférence système « réduire les animations » (`prefers-reduced-motion: reduce`), les animations
+  s'arrêtent, mais seules les parties de l'état courant restent visibles (une vanne ne doit pas paraître
+  à la fois ouverte et fermée).
+
+### Rendu 2,5D
+- Corps d'équipement : dégradés métalliques neutres (`linearGradient` ou `radialGradient`), avec les
+  couleurs autorisées : `#0b1120`, `#111827`, `#1e293b`, `#273449`, `#334155`, `#475569`, `#64748b`,
+  `#94a3b8`, `#cbd5e1`, `#e2e8f0`, `#ffffff` (opacité libre).
+- Parties actives (moteur, liquide, flamme, voyant, contour d'état) en `currentColor`, avec
+  `fill-opacity` et `stroke-opacity` libres.
+- Ombre légère possible (ellipse sombre sous l'équipement) ; pas de `filter`, trop coûteux sur un
+  synoptique de 200 symboles.
+- Les `id` internes (dégradés, `clipPath`) commencent par l'id du symbole suivi d'un tiret, et sont
+  référencés par `fill="url(#…)"` (référence interne uniquement).
 
 Les modules du projet sont diffusés sous licence **GPL-3.0**.

@@ -523,13 +523,13 @@ async fn api_import_symbols(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_supervisor(&user)?;
     let is_pack = req.format == "apex_pack"
-        || (req.format == "auto" || req.format.is_empty())
-            && serde_json::from_str::<serde_json::Value>(&req.raw_content)
-                .ok()
-                .and_then(|v| v.get("format").and_then(|f| f.as_str()).map(str::to_string))
-                .as_deref()
-                == Some("apex-symboles");
+        || serde_json::from_str::<serde_json::Value>(&req.raw_content)
+            .ok()
+            .and_then(|v| v.get("format").and_then(|f| f.as_str()).map(str::to_string))
+            .as_deref()
+            == Some("apex-symboles");
     if is_pack {
+        require_admin(&user)?;
         let result = state
             .core
             .import_symbol_pack(&user.0.username, &req.raw_content)
@@ -548,7 +548,7 @@ async fn api_install_symbol_pack(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<Vec<SymbolLibraryItem>>, ApiError> {
-    require_supervisor(&user)?;
+    require_admin(&user)?;
     let items = state
         .core
         .install_builtin_symbol_pack(&user.0.username, &pack_id)
@@ -743,7 +743,7 @@ async fn api_pulse_tag(
     Path(tag_id): Path<String>,
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
-) -> Result<Json<TagState>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     require_supervisor(&user)?;
     let updated = state.core.pulse_tag(&tag_id).await?;
     state.core.record_audit(
@@ -753,7 +753,9 @@ async fn api_pulse_tag(
         &tag_id,
         "Impulsion de 1 seconde, extinction côté serveur",
     );
-    Ok(Json(updated))
+    let mut reply = serde_json::to_value(updated).unwrap_or_default();
+    reply["statut"] = serde_json::json!("transmise");
+    Ok(Json(reply))
 }
 
 async fn api_write_tag(
@@ -761,7 +763,7 @@ async fn api_write_tag(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
     Json(payload): Json<WriteTagRequest>,
-) -> Result<Json<TagState>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     require_supervisor(&user)?;
     let val_str = serde_json::to_string(&payload.value).unwrap_or_default();
     let updated = state.core.write_tag(&tag_id, payload.value).await?;
@@ -778,7 +780,9 @@ async fn api_write_tag(
         &tag_id,
         &format!("Nouvelle valeur commandée : {}{}", val_str, note),
     );
-    Ok(Json(updated))
+    let mut reply = serde_json::to_value(updated).unwrap_or_default();
+    reply["statut"] = serde_json::json!("transmise");
+    Ok(Json(reply))
 }
 
 async fn api_get_drivers(
@@ -1259,6 +1263,7 @@ async fn handle_realtime_socket(
     let mut cov_rx = state.core.subscribe_cov();
     let mut alarm_rx = state.core.subscribe_alarms();
     let mut drv_rx = state.core.subscribe_drivers();
+    let mut rejected_rx = state.core.subscribe_write_rejected();
     let mut trace_rx = state.core.subscribe_flow_traces();
     let mut settings_rx = state.core.subscribe_settings();
     let mut revoke_rx = state.core.subscribe_session_revocation();
@@ -1331,6 +1336,17 @@ async fn handle_realtime_socket(
                             break;
                         }
                     }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            rejected = rejected_rx.recv() => {
+                match rejected {
+                    Ok((tag_id, reason)) => {
+                        if !send_ws(&mut socket, &WsServerMessage::WriteRejected { tag_id, reason }).await {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {}
                     Err(RecvError::Closed) => break,
                 }
             }

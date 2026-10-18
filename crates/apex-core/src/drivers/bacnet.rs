@@ -850,7 +850,7 @@ impl BacnetDriver {
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tokio::select! {
-                        Some(cmd) = write_rx.recv() => {
+                        Some(mut cmd) = write_rx.recv() => {
                         if core_ref.safe_mode {
                             core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, "Mode sûr actif côté driver");
                             continue;
@@ -869,6 +869,7 @@ impl BacnetDriver {
                                 Ok(()) => {
                                     core_ref.record_driver_poll(&config.id, true, started.elapsed().as_millis() as u64, None);
                                     core_ref.record_driver_write_accepted(&config.id);
+                                    cmd.confirm();
                                 }
                                 Err(RequestError::Device(e)) => {
                                     warn!("Driver BACnet '{}' : écriture de '{}' ({}) refusée : {}", config.id, cmd.tag_id, cmd.protocol_address, e);
@@ -1081,6 +1082,10 @@ pub async fn discover(driver_id: &str, endpoint: &str) -> Result<Vec<RegisteredT
             data_type,
             unit,
             writable: !addr.is_input(),
+            consigne_min: None,
+            consigne_max: None,
+            fraicheur_max_s: None,
+            ecriture_sans_retour: false,
             deadband: if data_type == TagDataType::Float {
                 0.05
             } else {

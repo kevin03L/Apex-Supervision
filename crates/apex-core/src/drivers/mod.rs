@@ -54,6 +54,10 @@ pub fn build_local_modbus_plc_config(port: u16) -> DriverConfig {
             data_type: TagDataType::Bool,
             unit: None,
             writable: true,
+            consigne_min: None,
+            consigne_max: None,
+            fraicheur_max_s: None,
+            ecriture_sans_retour: false,
             deadband: 0.0,
             scale_factor: 1.0,
             scale_offset: 0.0,
@@ -68,6 +72,10 @@ pub fn build_local_modbus_plc_config(port: u16) -> DriverConfig {
             data_type: TagDataType::Bool,
             unit: None,
             writable: true,
+            consigne_min: None,
+            consigne_max: None,
+            fraicheur_max_s: None,
+            ecriture_sans_retour: false,
             deadband: 0.0,
             scale_factor: 1.0,
             scale_offset: 0.0,
@@ -82,6 +90,10 @@ pub fn build_local_modbus_plc_config(port: u16) -> DriverConfig {
             data_type: TagDataType::Float,
             unit: Some("°C".to_string()),
             writable: false,
+            consigne_min: None,
+            consigne_max: None,
+            fraicheur_max_s: None,
+            ecriture_sans_retour: false,
             deadband: 0.05,
             scale_factor: 1.0,
             scale_offset: 0.0,
@@ -104,6 +116,10 @@ pub fn build_local_modbus_plc_config(port: u16) -> DriverConfig {
             data_type: TagDataType::Float,
             unit: Some("°C".to_string()),
             writable: true,
+            consigne_min: None,
+            consigne_max: None,
+            fraicheur_max_s: None,
+            ecriture_sans_retour: false,
             deadband: 0.02,
             scale_factor: 1.0,
             scale_offset: 0.0,
@@ -118,6 +134,10 @@ pub fn build_local_modbus_plc_config(port: u16) -> DriverConfig {
             data_type: TagDataType::Float,
             unit: Some("bar".to_string()),
             writable: false,
+            consigne_min: None,
+            consigne_max: None,
+            fraicheur_max_s: None,
+            ecriture_sans_retour: false,
             deadband: 0.05,
             scale_factor: 1.0,
             scale_offset: 0.0,
@@ -137,6 +157,10 @@ pub fn build_local_modbus_plc_config(port: u16) -> DriverConfig {
             data_type: TagDataType::Int,
             unit: Some("A".to_string()),
             writable: false,
+            consigne_min: None,
+            consigne_max: None,
+            fraicheur_max_s: None,
+            ecriture_sans_retour: false,
             deadband: 1.0,
             scale_factor: 1.0,
             scale_offset: 0.0,
@@ -229,6 +253,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Float,
                 unit: Some("°C".to_string()),
                 writable: false,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.05,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -249,6 +277,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Float,
                 unit: Some("°C".to_string()),
                 writable: false,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.05,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -272,6 +304,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Float,
                 unit: Some("°C".to_string()),
                 writable: true,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.01,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -286,6 +322,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Float,
                 unit: Some("%".to_string()),
                 writable: true,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.1,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -300,6 +340,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Float,
                 unit: Some("%".to_string()),
                 writable: true,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.1,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -314,6 +358,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Float,
                 unit: Some("%HR".to_string()),
                 writable: false,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.2,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -334,6 +382,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Bool,
                 unit: None,
                 writable: true,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.0,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -348,6 +400,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Bool,
                 unit: None,
                 writable: true,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.0,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -370,6 +426,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Float,
                 unit: Some("°C".to_string()),
                 writable: true,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.1,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -391,6 +451,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Bool,
                 unit: None,
                 writable: true,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.0,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -405,6 +469,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Bool,
                 unit: None,
                 writable: true,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.0,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -419,6 +487,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Float,
                 unit: Some("bar".to_string()),
                 writable: false,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.02,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -442,6 +514,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Float,
                 unit: Some("m³/h".to_string()),
                 writable: false,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.1,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -456,6 +532,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Float,
                 unit: Some("%".to_string()),
                 writable: false,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.2,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -476,6 +556,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Float,
                 unit: Some("kW".to_string()),
                 writable: false,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.3,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -496,6 +580,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Float,
                 unit: Some("V".to_string()),
                 writable: false,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.4,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -510,6 +598,10 @@ impl GtbSimulatorDriver {
                 data_type: TagDataType::Float,
                 unit: Some("".to_string()),
                 writable: false,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.01,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -650,15 +742,16 @@ impl IndustrialDriver for GtbSimulatorDriver {
 
             loop {
                 tokio::select! {
-                    Some(cmd) = write_rx.recv() => {
+                    Some(mut cmd) = write_rx.recv() => {
                         values.insert(cmd.tag_id.clone(), cmd.value.clone());
                         let _ = core_tx.send(TagState {
-                            tag_id: cmd.tag_id,
-                            value: cmd.value,
+                            tag_id: cmd.tag_id.clone(),
+                            value: cmd.value.clone(),
                             quality: Quality::Good,
                             timestamp: Utc::now(),
                         }).await;
                         core_ref.record_driver_poll(&driver_id, true, 1, None);
+                        cmd.confirm();
                     }
                     _ = ticker.tick() => {
                         if core_ref.is_acquisition_paused() {
@@ -755,6 +848,7 @@ impl IndustrialDriver for GtbSimulatorDriver {
                 tag_id: address.to_string(),
                 protocol_address: address.to_string(),
                 value,
+                ack: None,
             })
             .await
             .map_err(|e| e.to_string())
@@ -954,7 +1048,7 @@ impl IndustrialDriver for ModbusTcpDriver {
 
                 loop {
                     tokio::select! {
-                        Some(cmd) = write_rx.recv() => {
+                        Some(mut cmd) = write_rx.recv() => {
                         if core_ref.safe_mode {
                             core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, "Mode sûr actif côté driver");
                             continue;
@@ -965,6 +1059,7 @@ impl IndustrialDriver for ModbusTcpDriver {
                                     let lat = start_w.elapsed().as_millis() as u64;
                                     core_ref.record_driver_poll(&config.id, true, lat, None);
                                     core_ref.record_driver_write_accepted(&config.id);
+                                    cmd.confirm();
                                 }
                                 // Commande refusée (exception Modbus, adresse ou valeur invalide) :
                                 // la liaison reste saine, ni coupure ni alarme de communication.
@@ -1031,6 +1126,7 @@ impl IndustrialDriver for ModbusTcpDriver {
                 tag_id: address.to_string(),
                 protocol_address: address.to_string(),
                 value,
+                ack: None,
             })
             .await
             .map_err(|e| e.to_string())
@@ -1713,7 +1809,7 @@ impl IndustrialDriver for MqttDriver {
             let mut retry_at = tokio::time::Instant::now();
             loop {
                 tokio::select! {
-                    Some(cmd) = write_rx.recv() => {
+                    Some(mut cmd) = write_rx.recv() => {
                         if core_ref.safe_mode {
                             core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, "Mode sûr actif côté driver");
                             continue;
@@ -1733,7 +1829,10 @@ impl IndustrialDriver for MqttDriver {
                         }
                         match encode_mqtt_write_payload(&cmd.protocol_address, &cmd.value) {
                             Ok(payload) => match client.try_publish(topic, QoS::AtLeastOnce, false, payload) {
-                                Ok(()) => core_ref.record_driver_write_accepted(&config.id),
+                                Ok(()) => {
+                                    core_ref.record_driver_write_accepted(&config.id);
+                                    cmd.confirm();
+                                }
                                 Err(e) => core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, &e.to_string()),
                             },
                             Err(e) => core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, &e.to_string()),
@@ -1814,6 +1913,7 @@ impl IndustrialDriver for MqttDriver {
                 tag_id: address.to_string(),
                 protocol_address: address.to_string(),
                 value,
+                ack: None,
             })
             .await
             .map_err(|e| e.to_string())
@@ -2222,6 +2322,10 @@ mod tests {
                 data_type: TagDataType::Int,
                 unit: None,
                 writable: false,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.0,
                 scale_factor: 1.0,
                 scale_offset: 0.0,
@@ -2236,6 +2340,10 @@ mod tests {
                 data_type: TagDataType::Int,
                 unit: None,
                 writable: false,
+                consigne_min: None,
+                consigne_max: None,
+                fraicheur_max_s: None,
+                ecriture_sans_retour: false,
                 deadband: 0.0,
                 scale_factor: 1.0,
                 scale_offset: 0.0,

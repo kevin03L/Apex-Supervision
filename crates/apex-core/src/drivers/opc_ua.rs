@@ -460,7 +460,7 @@ impl OpcUaDriver {
                         break;
                     }
                     tokio::select! {
-                        Some(cmd) = write_rx.recv() => {
+                        Some(mut cmd) = write_rx.recv() => {
                         if core_ref.safe_mode {
                             core_ref.record_driver_write_rejected(&config.id, &cmd.tag_id, "Mode sûr actif côté driver");
                             continue;
@@ -501,6 +501,7 @@ impl OpcUaDriver {
                                 Ok(Ok(())) => {
                                     core_ref.record_driver_poll(&config.id, true, started.elapsed().as_millis() as u64, None);
                                     core_ref.record_driver_write_accepted(&config.id);
+                                    cmd.confirm();
                                 }
                                 Ok(Err(e)) => {
                                     warn!("Driver OPC-UA '{}' : écriture de '{}' ({}) {}", config.id, cmd.tag_id, cmd.protocol_address, e);
