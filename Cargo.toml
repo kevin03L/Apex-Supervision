@@ -12,7 +12,7 @@ default-members = ["crates/apex-server", "crates/apex-admin"]
 # Version unique du produit : moteur, utilitaire desktop, installateurs et artefacts.
 # Convention : SemVer avec suffixe de phase (0.4.0-alpha.N → 0.5.0-beta.N → 1.0.0).
 [workspace.package]
-version = "0.4.0-alpha.1"
+version = "0.4.0-alpha.2"
 edition = "2021"
 rust-version = "1.89"
 authors = ["kevin03L"]

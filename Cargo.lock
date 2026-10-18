@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "apex-admin"
-version = "0.4.0-alpha.1"
+version = "0.4.0-alpha.2"
 dependencies = [
  "apex-build",
  "apex-config",
@@ -204,14 +204,14 @@ dependencies = [
 
 [[package]]
 name = "apex-build"
-version = "0.4.0-alpha.1"
+version = "0.4.0-alpha.2"
 dependencies = [
  "embed-resource",
 ]
 
 [[package]]
 name = "apex-config"
-version = "0.4.0-alpha.1"
+version = "0.4.0-alpha.2"
 dependencies = [
  "chrono",
  "serde",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "apex-core"
-version = "0.4.0-alpha.1"
+version = "0.4.0-alpha.2"
 dependencies = [
  "argon2",
  "async-opcua",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "apex-server"
-version = "0.4.0-alpha.1"
+version = "0.4.0-alpha.2"
 dependencies = [
  "apex-build",
  "apex-config",
