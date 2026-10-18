@@ -49,6 +49,12 @@ pub enum ScadaError {
     #[error("Requête invalide : {0}")]
     BadRequest(String),
 
+    #[error("Conflit : {message}")]
+    Conflict {
+        message: String,
+        dashboards: Vec<String>,
+    },
+
     #[error("{0}")]
     Unauthorized(String),
 
@@ -70,6 +76,7 @@ impl ScadaError {
             ScadaError::TagNotWritable(_) | ScadaError::Forbidden(_) => 403,
             ScadaError::Unauthorized(_) => 401,
             ScadaError::TypeMismatch { .. } | ScadaError::BadRequest(_) => 400,
+            ScadaError::Conflict { .. } => 409,
             ScadaError::DriverError(_) | ScadaError::FlowError(_) => 502,
             ScadaError::DatabaseError(_) => 500,
             ScadaError::Busy(_) => 503,
@@ -242,6 +249,14 @@ pub struct RegisteredTag {
     pub data_type: TagDataType,
     pub unit: Option<String>,
     pub writable: bool,
+    #[serde(default)]
+    pub consigne_min: Option<f64>,
+    #[serde(default)]
+    pub consigne_max: Option<f64>,
+    #[serde(default)]
+    pub fraicheur_max_s: Option<u32>,
+    #[serde(default)]
+    pub ecriture_sans_retour: bool,
     #[serde(default = "default_deadband")]
     pub deadband: f64,
     #[serde(default = "default_scale_factor")]
@@ -441,11 +456,29 @@ pub struct DriverUpdateRequest {
     pub poll_interval_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct WriteCommand {
     pub tag_id: String,
     pub protocol_address: String,
     pub value: TagValue,
+    /// Accusé interne utilisé par la remise à zéro des impulsions.
+    pub ack: Option<tokio::sync::oneshot::Sender<bool>>,
+}
+
+impl WriteCommand {
+    pub fn confirm(&mut self) {
+        if let Some(tx) = self.ack.take() {
+            let _ = tx.send(true);
+        }
+    }
+}
+
+impl Drop for WriteCommand {
+    fn drop(&mut self) {
+        if let Some(tx) = self.ack.take() {
+            let _ = tx.send(false);
+        }
+    }
 }
 
 // ============================================================================
@@ -851,6 +884,10 @@ pub enum WsServerMessage {
     TagUpdateBatch(Vec<TagState>),
     AlarmUpdate(Vec<AlarmInstance>),
     DriverListUpdate(Vec<DriverConfig>),
+    WriteRejected {
+        tag_id: String,
+        reason: String,
+    },
     FlowTrace(FlowExecutionTrace),
     /// Réglages système modifiés par un administrateur.
     SettingsUpdate(SystemSettings),
@@ -1025,6 +1062,12 @@ pub struct UpsertUserRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolLibraryItem {
     pub id: String,
+    #[serde(default)]
+    pub pack_id: Option<String>,
+    #[serde(default)]
+    pub pack_title: Option<String>,
+    #[serde(default)]
+    pub pack_version: Option<String>,
     pub name: String,
     pub category: String,
     pub standard: String,

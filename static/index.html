@@ -104,8 +104,19 @@
         <button class="btn" onclick="closeSymbolLibraryModal()">Fermer</button>
       </div>
 
+      <section class="symbol-modules">
+        <h4>Modules complémentaires</h4>
+        <div id="installedSymbolPacks" aria-live="polite"></div>
+        <div class="symbol-modules-actions">
+          <label class="btn btn-primary" id="installSymbolModuleButton">Installer un module (.json)
+            <input type="file" accept=".json,application/json" onchange="installSymbolModule(event)" hidden />
+          </label>
+          <a href="https://github.com/kevin03L/Apex-Supervision/releases" target="_blank" rel="noopener noreferrer">Télécharger des modules</a>
+        </div>
+      </section>
+
       <!-- 1. PACKS OPEN-SOURCE GRATUITS PRÉ-INTÉGRÉS -->
-      <div style="background:#080f1e;border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:14px;">
+      <div id="builtinSymbolPacks" style="background:#080f1e;border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:14px;">
         <div style="font-weight:700;font-size:12.5px;color:#38bdf8;margin-bottom:6px;">
           1. Installer un Pack Standard Gratuit Pré-intégré (1 Clic)
         </div>
@@ -285,6 +296,21 @@
         </label>
         <label class="field">Facteur d'échelle (×)
           <input type="number" step="0.1" id="tagFormScale" value="1.0" />
+        </label>
+        <label class="field">Consigne minimale
+          <input type="number" step="any" id="tagFormConsigneMin" placeholder="Optionnel" />
+        </label>
+        <label class="field">Consigne maximale
+          <input type="number" step="any" id="tagFormConsigneMax" placeholder="Optionnel" />
+        </label>
+        <label class="field">Fraîcheur maximale (secondes)
+          <input type="number" min="1" step="1" id="tagFormFreshness" placeholder="Optionnel" />
+        </label>
+        <label class="field">Écriture sans retour
+          <select id="tagFormWriteWithoutFeedback">
+            <option value="false">Non</option>
+            <option value="true">Oui</option>
+          </select>
         </label>
         <label class="field">Seuil d'alarme bas
           <input type="number" step="0.5" id="tagFormLow" placeholder="Optionnel" />

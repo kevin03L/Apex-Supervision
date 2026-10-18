@@ -21,9 +21,10 @@ jobs:
     name: Formatage
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all --check
 
@@ -35,11 +36,12 @@ jobs:
         os: [windows-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Dépendances Linux
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y $LINUX_GUI_DEPS
@@ -57,9 +59,11 @@ jobs:
       SIGNPATH_ACTIF: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' && secrets.SIGNPATH_API_TOKEN != '' }}
       PFX_ACTIF: ${{ secrets.APEX_SIGN_PFX_BASE64 != '' && secrets.APEX_SIGN_PFX_PASSWORD != '' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Inno Setup
         shell: pwsh
         run: |
@@ -73,7 +77,7 @@ jobs:
       - name: Téléversement des binaires non signés (SignPath)
         if: env.SIGNPATH_ACTIF == 'true'
         id: binaires
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: binaires-unsigned
           path: |
@@ -82,7 +86,7 @@ jobs:
 
       - name: Requête de signature SignPath (binaires)
         if: env.SIGNPATH_ACTIF == 'true'
-        uses: signpath/github-action-submit-signing-request@v1
+        uses: signpath/github-action-submit-signing-request@ced31329c0317e779dad2eec2a7c3bb46ea1343e # v1.3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
@@ -113,14 +117,14 @@ jobs:
       - name: Téléversement de l'installateur non signé (SignPath)
         if: env.SIGNPATH_ACTIF == 'true'
         id: installateur
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: installateur-unsigned
           path: dist/apex-supervision-*-windows-x64-setup.exe
 
       - name: Requête de signature SignPath (installateur)
         if: env.SIGNPATH_ACTIF == 'true'
-        uses: signpath/github-action-submit-signing-request@v1
+        uses: signpath/github-action-submit-signing-request@ced31329c0317e779dad2eec2a7c3bb46ea1343e # v1.3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
@@ -175,7 +179,7 @@ jobs:
           ./packaging/windows/build-installer.ps1 -SkipBuild -SansSignature
 
       - name: Publication de l'artefact Windows
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-x64
           path: |
@@ -188,9 +192,11 @@ jobs:
     needs: [fmt, check]
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sudo apt-get update && sudo apt-get install -y $LINUX_GUI_DEPS
       - run: cargo install cargo-deb --locked
       - run: cargo build --release --locked -p apex-server -p apex-admin
@@ -240,7 +246,7 @@ jobs:
           test ! -e /var/lib/apex-supervision
           test ! -e /var/log/apex-supervision
           test -z "$(getent passwd apex-scada)"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-amd64-deb
           path: |
@@ -255,23 +261,29 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Téléchargement des artefacts Windows
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: windows-x64
           path: dist
       - name: Téléchargement des artefacts Linux
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: linux-amd64-deb
           path: dist
+      - name: Archive des modules complémentaires
+        run: |
+          test -n "$(find packs -maxdepth 1 -name '*.json' -print -quit)"
+          zip -r "dist/apex-symboles-${GITHUB_REF_NAME}.zip" packs -i 'packs/*.json' 'packs/README.md'
+          cd dist && sha256sum "apex-symboles-${GITHUB_REF_NAME}.zip" > "apex-symboles-${GITHUB_REF_NAME}.zip.sha256"
       - name: Publication de la release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             dist/*.exe
             dist/*.deb
             dist/*.sha256
+            dist/apex-symboles-*.zip
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true

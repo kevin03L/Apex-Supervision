@@ -784,8 +784,45 @@ body.run-mode .resize-handle {
   animation: spinAnim 1.1s linear infinite;
 }
 
-.sym-rotatable.spin-active {
-  animation: spinAnim 1.6s linear infinite;
+/* États animés des symboles */
+.custom-svg-wrapper.etat-marche .sym-arret,
+.custom-svg-wrapper.etat-marche .sym-defaut,
+.custom-svg-wrapper.etat-arret .sym-marche,
+.custom-svg-wrapper.etat-arret .sym-defaut,
+.custom-svg-wrapper.etat-defaut .sym-marche,
+.custom-svg-wrapper.etat-defaut .sym-arret,
+.custom-svg-wrapper.etat-inconnu .sym-marche,
+.custom-svg-wrapper.etat-inconnu .sym-defaut {
+  opacity: 0;
+}
+
+.custom-svg-wrapper .sym-niveau { transform-box: view-box; }
+.custom-svg-wrapper.etat-marche .sym-niveau,
+.custom-svg-wrapper.etat-arret .sym-niveau,
+.custom-svg-wrapper.etat-defaut .sym-niveau,
+.custom-svg-wrapper.etat-inconnu .sym-niveau {
+  transform: scaleY(var(--apex-niveau, 1));
+}
+.custom-svg-wrapper.etat-inconnu .sym-niveau {
+  opacity: .5;
+}
+
+@keyframes symDefautClignote { 50% { opacity: 0; } }
+@keyframes symFluxCoule { to { stroke-dashoffset: -12; } }
+@keyframes symVibre { 25% { transform: translateX(1px); } 75% { transform: translateX(-1px); } }
+
+.custom-svg-wrapper.etat-defaut .sym-defaut { animation: symDefautClignote 1s steps(1, end) infinite; }
+.custom-svg-wrapper.etat-marche .sym-flux { animation: symFluxCoule 1s linear infinite; }
+.custom-svg-wrapper.etat-marche .sym-vibre { animation: symVibre .16s linear infinite; }
+.custom-svg-wrapper.etat-marche .sym-rotatable { animation: spinAnim 1.6s linear infinite; }
+
+/* Mouvements réduits : les animations s'arrêtent, mais seules les parties de l'état courant restent
+   affichées (une vanne ne doit pas paraître à la fois ouverte et fermée). */
+@media (prefers-reduced-motion: reduce) {
+  .custom-svg-wrapper .sym-defaut,
+  .custom-svg-wrapper .sym-flux,
+  .custom-svg-wrapper .sym-vibre,
+  .custom-svg-wrapper .sym-rotatable { animation: none !important; }
 }
 
 .custom-svg-wrapper svg {
@@ -1582,3 +1619,9 @@ footer.alarm .msg {
     grid-template-columns: 1fr;
   }
 }
+.symbol-modules { background:#080f1e; border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:14px; }
+.symbol-modules h4 { margin:0 0 10px; color:#38bdf8; }
+.symbol-module-row, .symbol-modules-actions { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin:8px 0; }
+.symbol-module-row { padding:8px; border:1px solid var(--border); border-radius:6px; }
+.symbol-modules-actions a { color:#38bdf8; }
+@media (max-width:600px) { .symbol-module-row, .symbol-modules-actions { align-items:stretch; flex-direction:column; } }

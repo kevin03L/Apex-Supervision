@@ -9,6 +9,7 @@
 //! - Journal d'Audit Opérateur (`audit_logs`) et Export/Import complet du projet en JSON.
 
 use std::{
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -43,6 +44,26 @@ use crate::{
 
 /// Version unique de l'application (issue de `Cargo.toml`).
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InstalledSymbolPack {
+    pub id: String,
+    pub titre: String,
+    pub version: String,
+    pub nombre_symboles: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SymbolPackImportResult {
+    pub pack_id: String,
+    pub version: String,
+    pub added: usize,
+    pub updated: usize,
+    pub rejected: usize,
+    pub removed: usize,
+    pub conserves: Vec<String>,
+    pub symbols: Vec<SymbolLibraryItem>,
+}
 
 /// Taille maximale d'un lot d'écriture de l'historique.
 const HISTORY_BATCH_MAX: usize = 500;
@@ -134,6 +155,7 @@ pub struct ScadaCore {
     history_dropped: AtomicU64,
     pub tags_registry: DashMap<String, RegisteredTag>,
     pub tags_state: DashMap<String, TagState>,
+    freshness_seen: DashMap<String, DateTime<Utc>>,
     /// Dernière valeur de qualité `Good` de chaque tag (sert à restaurer les consignes du simulateur).
     pub last_good_values: DashMap<String, TagValue>,
     driver_writers: DashMap<String, mpsc::Sender<WriteCommand>>,
@@ -164,6 +186,7 @@ pub struct ScadaCore {
     alarm_tx: broadcast::Sender<Vec<AlarmInstance>>,
     driver_tx: broadcast::Sender<Vec<DriverConfig>>,
     flow_trace_tx: broadcast::Sender<FlowExecutionTrace>,
+    write_rejected_tx: broadcast::Sender<(String, String)>,
     ingest_tx: mpsc::Sender<TagState>,
     ingestion_stop: Notify,
     ingestion_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -201,6 +224,7 @@ impl ScadaCore {
         let (alarm_tx, _) = broadcast::channel::<Vec<AlarmInstance>>(512);
         let (driver_tx, _) = broadcast::channel::<Vec<DriverConfig>>(256);
         let (flow_trace_tx, _) = broadcast::channel::<FlowExecutionTrace>(1024);
+        let (write_rejected_tx, _) = broadcast::channel(256);
         let (ingest_tx, ingest_rx) = mpsc::channel::<TagState>(4096);
         let (history_tx, history_rx) = mpsc::channel::<TagState>(HISTORY_QUEUE_CAPACITY);
         let (alarm_persist_tx, alarm_persist_rx) = mpsc::unbounded_channel::<AlarmPersistOp>();
@@ -223,6 +247,7 @@ impl ScadaCore {
             history_dropped: AtomicU64::new(0),
             tags_registry: DashMap::new(),
             tags_state: DashMap::new(),
+            freshness_seen: DashMap::new(),
             last_good_values: DashMap::new(),
             driver_writers: DashMap::new(),
             driver_handles: DashMap::new(),
@@ -245,6 +270,7 @@ impl ScadaCore {
             alarm_tx,
             driver_tx,
             flow_trace_tx,
+            write_rejected_tx,
             ingest_tx,
             ingestion_stop: Notify::new(),
             ingestion_handle: tokio::sync::Mutex::new(None),
@@ -288,6 +314,7 @@ impl ScadaCore {
         Self::spawn_session_cleanup_worker(Arc::clone(&core));
         Self::spawn_driver_stats_broadcaster(Arc::clone(&core));
         Self::spawn_shelve_expiry_worker(Arc::clone(&core));
+        Self::spawn_freshness_worker(Arc::clone(&core));
 
         core
     }
@@ -919,6 +946,9 @@ impl ScadaCore {
     /// liaison reste saine, donc ni alarme de communication ni passage des variables en défaut.
     /// L'erreur est visible sur la carte du driver et tracée dans le journal d'audit.
     pub fn record_driver_write_rejected(&self, driver_id: &str, tag_id: &str, err: &str) {
+        let _ = self
+            .write_rejected_tx
+            .send((tag_id.to_string(), err.to_string()));
         let msg = format!("Écriture refusée sur '{}' : {}", tag_id, err);
         if let Some(mut drv) = self.drivers_config.get_mut(driver_id) {
             drv.stats.frames_err += 1;
@@ -937,6 +967,60 @@ impl ScadaCore {
             tag_id,
             &format!("Commande refusée par l'équipement : {}", err),
         );
+    }
+
+    pub fn subscribe_write_rejected(&self) -> broadcast::Receiver<(String, String)> {
+        self.write_rejected_tx.subscribe()
+    }
+
+    fn spawn_freshness_worker(core: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                let now = Utc::now();
+                let expired: Vec<String> = core
+                    .tags_registry
+                    .iter()
+                    .filter_map(|tag| {
+                        let max = tag.fraicheur_max_s?;
+                        let state = core.tags_state.get(tag.key())?;
+                        if state.quality != Quality::Good {
+                            return None;
+                        }
+                        let seen = core
+                            .freshness_seen
+                            .get(tag.key())
+                            .map(|t| *t)
+                            .unwrap_or(state.timestamp);
+                        (now.signed_duration_since(seen).num_milliseconds() > i64::from(max) * 1000)
+                            .then(|| tag.key().clone())
+                    })
+                    .collect();
+                for id in expired {
+                    if let Some(state) = core.tags_state.get(&id).map(|s| s.clone()) {
+                        if state.quality != Quality::Good {
+                            continue;
+                        }
+                        core.ingest_state(
+                            TagState {
+                                quality: Quality::Uncertain,
+                                timestamp: now,
+                                ..state
+                            },
+                            false,
+                        );
+                        core.record_audit(
+                            "Serveur",
+                            "QUALITÉ",
+                            "STALE_VALUE",
+                            &id,
+                            "Valeur périmée : délai de fraîcheur dépassé",
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// Écriture acceptée par l'équipement : le dernier refus affiché sur la carte est levé.
@@ -1107,6 +1191,26 @@ impl ScadaCore {
             .map(|d| d.protocol.clone());
         if let Some(protocol) = protocol {
             validate_tag_for_protocol(&protocol, &tag)?;
+        } else if !tag.module_source.eq_ignore_ascii_case("internal")
+            && !tag.module_source.eq_ignore_ascii_case("interne")
+        {
+            return Err(ScadaError::BadRequest(format!(
+                "Source de variable inconnue : '{}'",
+                tag.module_source
+            )));
+        }
+        if tag.consigne_min.is_some_and(|v| !v.is_finite())
+            || tag.consigne_max.is_some_and(|v| !v.is_finite())
+            || matches!((tag.consigne_min, tag.consigne_max), (Some(min), Some(max)) if min > max)
+        {
+            return Err(ScadaError::BadRequest(
+                "Bornes de consigne invalides : min et max doivent être finis et min ≤ max".into(),
+            ));
+        }
+        if tag.fraicheur_max_s == Some(0) {
+            return Err(ScadaError::BadRequest(
+                "La fraîcheur maximale doit être supérieure à zéro seconde".into(),
+            ));
         }
 
         // Un changement de driver retire le tag de l'ancienne configuration
@@ -1172,6 +1276,7 @@ impl ScadaCore {
 
     /// Retire un tag de toutes les structures temps réel (sans toucher à la base).
     fn forget_tag(&self, tag_id: &str) -> Option<RegisteredTag> {
+        self.freshness_seen.remove(tag_id);
         self.flow_runtime.forget_outputs_for_tag(tag_id);
         let removed = self.tags_registry.remove(tag_id).map(|(_, t)| t);
         self.tags_state.remove(tag_id);
@@ -1182,20 +1287,20 @@ impl ScadaCore {
     }
 
     pub async fn delete_tag(&self, actor: &str, tag_id: &str) -> Result<(), ScadaError> {
-        let removed = self
-            .forget_tag(tag_id)
+        let source = self
+            .tags_registry
+            .get(tag_id)
+            .map(|tag| tag.module_source.clone())
             .ok_or_else(|| ScadaError::TagNotFound(tag_id.to_string()))?;
-
         if let Some(pool) = &self.db_pool {
-            log_db_error(
-                "suppression tag",
-                sqlx::query("DELETE FROM tags_catalog WHERE id = ?")
-                    .bind(tag_id)
-                    .execute(pool)
-                    .await,
-            );
+            sqlx::query("DELETE FROM tags_catalog WHERE id = ?")
+                .bind(tag_id)
+                .execute(pool)
+                .await
+                .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
         }
-        self.persist_driver(&removed.module_source).await;
+        self.forget_tag(tag_id);
+        self.persist_driver(&source).await;
         let _ = self.alarm_tx.send(self.get_all_alarms());
         self.record_audit(
             actor,
@@ -1253,6 +1358,10 @@ impl ScadaCore {
 
         if matches!(&incoming.value, TagValue::Float(f) if !f.is_finite()) {
             incoming.quality = Quality::BadDisconnect;
+        }
+        if from_device && incoming.quality == Quality::Good {
+            self.freshness_seen
+                .insert(incoming.tag_id.clone(), Utc::now());
         }
         // Perte de communication : on garde la dernière valeur connue (qualité Bad) au lieu de
         // la valeur de repli du driver (0, false...), comme un SCADA classique.
@@ -2022,7 +2131,7 @@ impl ScadaCore {
 
     /// Envoie une consigne ou une télécommande.
     ///
-    /// - **Variable interne** (aucun driver déclaré sous ce nom) : la valeur est appliquée directement.
+    /// - **Variable interne** (source `internal` ou `interne`) : la valeur est appliquée directement.
     /// - **Variable d'équipement** : la commande est convertie en valeur brute (inverse de la mise à
     ///   l'échelle) puis transmise au driver sans attente. La valeur affichée est mise à jour par la
     ///   relecture de l'équipement, jamais de façon « optimiste ». La commande est refusée si le driver
@@ -2039,8 +2148,16 @@ impl ScadaCore {
                 "Une impulsion exige une variable booléenne".into(),
             ));
         }
-        if self.active_pulses.insert(tag_id.into(), ()).is_some() {
-            return Err(ScadaError::BadRequest("Impulsion déjà en cours".into()));
+        match self.active_pulses.entry(tag_id.into()) {
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(());
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(ScadaError::BadRequest(format!(
+                    "Impulsion déjà en cours pour '{}' : remise à zéro en attente",
+                    tag_id
+                )));
+            }
         }
         let core = Arc::clone(self);
         let id = tag_id.to_string();
@@ -2053,19 +2170,34 @@ impl ScadaCore {
                 tokio::time::sleep(Duration::from_millis(1000)).await;
                 let mut attempts: usize = 0;
                 loop {
-                    match core.write_tag(&id, TagValue::Bool(false)).await {
-                        Ok(_) => break,
+                    let reset = match core.write_tag_impl(&id, TagValue::Bool(false), true).await {
+                        Ok((_, Some(ack))) => {
+                            match tokio::time::timeout(Duration::from_secs(30), ack).await {
+                                Ok(Ok(true)) => Ok(()),
+                                _ => Err(ScadaError::DriverError(format!(
+                                    "Remise à zéro de '{}' refusée ou non confirmée par le driver",
+                                    id
+                                ))),
+                            }
+                        }
+                        Ok((_, None)) => Ok(()),
+                        Err(e) => Err(e),
+                    };
+                    match reset {
+                        Ok(_) => {
+                            core.record_audit(
+                                "Serveur",
+                                "CONSIGNE",
+                                "PULSE_RESET",
+                                &id,
+                                "Remise à zéro de l'impulsion confirmée",
+                            );
+                            break;
+                        }
                         Err(e) => {
                             warn!(
                                 "Remise à zéro de l'impulsion '{}' non confirmée : {}",
                                 id, e
-                            );
-                            core.record_audit(
-                                "Serveur",
-                                "CONSIGNE",
-                                "PULSE_RESET_FAILED",
-                                &id,
-                                &e.to_string(),
                             );
                             if matches!(
                                 e,
@@ -2074,14 +2206,19 @@ impl ScadaCore {
                                 break;
                             }
                             attempts += 1;
-                            if attempts >= 10 {
-                                warn!(
-                                    "Abandon de la remise à zéro de l'impulsion '{}' après 10 tentatives",
-                                    id
+                            if attempts == 3 {
+                                core.record_audit(
+                                    "Serveur",
+                                    "CONSIGNE",
+                                    "PULSE_RESET_FAILED",
+                                    &id,
+                                    &format!("Remise à zéro toujours en échec : {e}"),
                                 );
-                                break;
                             }
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            tokio::time::sleep(Duration::from_secs(
+                                (1_u64 << attempts.min(5)).min(30),
+                            ))
+                            .await;
                         }
                     }
                 }
@@ -2097,6 +2234,17 @@ impl ScadaCore {
         tag_id: &str,
         raw_value: TagValue,
     ) -> Result<TagState, ScadaError> {
+        self.write_tag_impl(tag_id, raw_value, false)
+            .await
+            .map(|(state, _)| state)
+    }
+
+    async fn write_tag_impl(
+        &self,
+        tag_id: &str,
+        raw_value: TagValue,
+        pulse_reset: bool,
+    ) -> Result<(TagState, Option<tokio::sync::oneshot::Receiver<bool>>), ScadaError> {
         let tag_meta = self
             .tags_registry
             .get(tag_id)
@@ -2113,6 +2261,17 @@ impl ScadaCore {
                 return Err(ScadaError::BadRequest(
                     "Valeur numérique invalide".to_string(),
                 ));
+            }
+        }
+        if matches!(coerced_value, TagValue::Float(_) | TagValue::Int(_)) {
+            let value = coerced_value.as_f64().unwrap();
+            if tag_meta.consigne_min.is_some_and(|min| value < min)
+                || tag_meta.consigne_max.is_some_and(|max| value > max)
+            {
+                return Err(ScadaError::BadRequest(format!(
+                    "Consigne hors bornes pour '{}' : {}",
+                    tag_id, value
+                )));
             }
         }
 
@@ -2133,9 +2292,17 @@ impl ScadaCore {
         });
 
         let Some((running, connected, simulated, protocol)) = driver_status else {
+            if !tag_meta.module_source.eq_ignore_ascii_case("internal")
+                && !tag_meta.module_source.eq_ignore_ascii_case("interne")
+            {
+                return Err(ScadaError::BadRequest(format!(
+                    "Source de variable inconnue : '{}'",
+                    tag_meta.module_source
+                )));
+            }
             // Variable interne (mémoire) : pas d'équipement à piloter
             self.ingest_state(requested_state.clone(), false);
-            return Ok(requested_state);
+            return Ok((requested_state, None));
         };
 
         // Mode sûr : aucune commande vers un équipement réel (les drivers simulés restent pilotables)
@@ -2143,6 +2310,18 @@ impl ScadaCore {
             return Err(ScadaError::Forbidden(format!(
                 "Mode sûr actif : aucune commande n'est envoyée à l'équipement '{}'",
                 tag_meta.module_source
+            )));
+        }
+        if !pulse_reset
+            && !tag_meta.ecriture_sans_retour
+            && self
+                .tags_state
+                .get(tag_id)
+                .is_some_and(|state| state.quality == Quality::BadDisconnect)
+        {
+            return Err(ScadaError::BadRequest(format!(
+                "Qualité invalide pour '{}' : commande refusée",
+                tag_id
             )));
         }
 
@@ -2222,10 +2401,17 @@ impl ScadaCore {
                 ))
             })?;
 
+        let (ack_tx, ack_rx) = if pulse_reset {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let cmd = WriteCommand {
             tag_id: tag_meta.id.clone(),
             protocol_address: tag_meta.protocol_address.clone(),
             value: device_value,
+            ack: ack_tx,
         };
         sender.try_send(cmd).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => ScadaError::DriverError(format!(
@@ -2238,7 +2424,7 @@ impl ScadaCore {
             )),
         })?;
 
-        Ok(requested_state)
+        Ok((requested_state, ack_rx))
     }
 
     // ========================================================================
@@ -2996,8 +3182,15 @@ impl ScadaCore {
             }
         }
         // S-20: Restauration des symboles personnalisés et des paramètres système
-        for sym in bundle.symbols {
+        for mut sym in bundle.symbols {
             let id = sym.id.clone();
+            if sym.pack_id.is_none() {
+                if let Some(existing) = self.symbols_library.get(&id) {
+                    sym.pack_id = existing.pack_id.clone();
+                    sym.pack_title = existing.pack_title.clone();
+                    sym.pack_version = existing.pack_version.clone();
+                }
+            }
             let mut imp = Vec::new();
             let mut rej = Vec::new();
             self.store_symbol(sym, &mut imp, &mut rej).await;
@@ -4736,6 +4929,260 @@ impl ScadaCore {
         list
     }
 
+    pub fn installed_symbol_packs(&self) -> Vec<InstalledSymbolPack> {
+        let mut packs: HashMap<String, InstalledSymbolPack> = HashMap::new();
+        for symbol in self.symbols_library.iter() {
+            let Some(id) = &symbol.pack_id else { continue };
+            let pack = packs
+                .entry(id.clone())
+                .or_insert_with(|| InstalledSymbolPack {
+                    id: id.clone(),
+                    titre: symbol.pack_title.clone().unwrap_or_else(|| id.clone()),
+                    version: symbol.pack_version.clone().unwrap_or_default(),
+                    nombre_symboles: 0,
+                });
+            pack.nombre_symboles += 1;
+        }
+        let mut result: Vec<_> = packs.into_values().collect();
+        result.sort_by(|a, b| a.id.cmp(&b.id));
+        result
+    }
+
+    pub async fn uninstall_symbol_pack(
+        &self,
+        actor: &str,
+        pack_id: &str,
+        force: bool,
+    ) -> Result<usize, ScadaError> {
+        let ids: HashSet<String> = self
+            .symbols_library
+            .iter()
+            .filter(|s| s.pack_id.as_deref() == Some(pack_id))
+            .map(|s| s.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return Err(ScadaError::BadRequest(format!(
+                "Module '{}' introuvable",
+                pack_id
+            )));
+        }
+        let mut dashboards: Vec<String> = self
+            .dashboards
+            .iter()
+            .filter(|d| {
+                d.widgets.iter().any(|w| {
+                    w.properties
+                        .get("symbol_id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|id| ids.contains(id))
+                })
+            })
+            .map(|d| d.name.clone())
+            .collect();
+        dashboards.sort();
+        if !force && !dashboards.is_empty() {
+            return Err(ScadaError::Conflict {
+                message: format!("Le module '{}' est utilisé par des synoptiques", pack_id),
+                dashboards,
+            });
+        }
+        for id in &ids {
+            self.symbols_library.remove(id);
+            if let Some(pool) = &self.db_pool {
+                sqlx::query("DELETE FROM symbol_libraries WHERE id = ?")
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+            }
+        }
+        self.record_audit(
+            actor,
+            "BIBLIOTHÈQUE",
+            "UNINSTALL_PACK",
+            pack_id,
+            &format!("Désinstallation de {} symboles (force={force})", ids.len()),
+        );
+        Ok(ids.len())
+    }
+
+    pub async fn import_symbol_pack(
+        &self,
+        actor: &str,
+        raw: &str,
+    ) -> Result<SymbolPackImportResult, ScadaError> {
+        let value: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|e| ScadaError::BadRequest(format!("JSON de module invalide : {e}")))?;
+        let field = |key: &str| -> Result<String, ScadaError> {
+            value
+                .get(key)
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.trim().is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| ScadaError::BadRequest(format!("Champ '{key}' du module manquant")))
+        };
+        if field("format")? != "apex-symboles" {
+            return Err(ScadaError::BadRequest(
+                "Format de module attendu : apex-symboles".into(),
+            ));
+        }
+        let pack_id = field("id")?;
+        security::validate_id("module", &pack_id)?;
+        let title = field("titre")?;
+        let version = field("version")?;
+        let entries = value
+            .get("symbols")
+            .and_then(|v| v.as_array())
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| ScadaError::BadRequest("Le module doit contenir des symboles".into()))?;
+        let mut seen = HashSet::new();
+        let mut pending = Vec::with_capacity(entries.len());
+        let mut rejected = 0;
+        for entry in entries {
+            let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if !id.starts_with(&format!("{pack_id}-")) || id.len() <= pack_id.len() + 1 {
+                return Err(ScadaError::BadRequest(format!(
+                    "L'identifiant de symbole '{id}' doit commencer par '{pack_id}-'"
+                )));
+            }
+            security::validate_id("symbole", id)?;
+            if !seen.insert(id.to_string()) {
+                return Err(ScadaError::BadRequest(format!(
+                    "Identifiant de symbole en double : '{id}'"
+                )));
+            }
+            if self
+                .symbols_library
+                .get(id)
+                .is_some_and(|s| s.pack_id.as_deref() != Some(&pack_id))
+            {
+                return Err(ScadaError::BadRequest(format!(
+                    "Identifiant de symbole déjà utilisé : '{id}'"
+                )));
+            }
+            let mut symbol: SymbolLibraryItem = serde_json::from_value({
+                let mut item = entry.clone();
+                if item.get("created_at").is_none() {
+                    item["created_at"] = serde_json::json!(Utc::now());
+                }
+                item
+            })
+            .map_err(|e| ScadaError::BadRequest(format!("Symbole '{id}' invalide : {e}")))?;
+            match security::sanitize_svg(&symbol.svg_content) {
+                Ok(clean) => symbol.svg_content = clean,
+                Err(_) => {
+                    rejected += 1;
+                    continue;
+                }
+            }
+            symbol.pack_id = Some(pack_id.clone());
+            symbol.pack_title = Some(title.clone());
+            symbol.pack_version = Some(version.clone());
+            pending.push(symbol);
+        }
+        if pending.is_empty() {
+            return Err(ScadaError::BadRequest(
+                "Le module ne contient aucun symbole valide".into(),
+            ));
+        }
+        let mut result = SymbolPackImportResult {
+            pack_id: pack_id.clone(),
+            version: version.clone(),
+            added: 0,
+            updated: 0,
+            rejected,
+            removed: 0,
+            conserves: Vec::new(),
+            symbols: Vec::new(),
+        };
+        let incoming: HashSet<String> = pending.iter().map(|s| s.id.clone()).collect();
+        let previous: Vec<String> = self
+            .symbols_library
+            .iter()
+            .filter(|s| s.pack_id.as_deref() == Some(&pack_id) && !incoming.contains(s.key()))
+            .map(|s| s.key().clone())
+            .collect();
+        let removed: Vec<String> = previous
+            .into_iter()
+            .filter(|id| {
+                let in_use = self.dashboards.iter().any(|dashboard| {
+                    dashboard
+                        .widgets
+                        .iter()
+                        .any(|w| w.properties.get("symbol_id").and_then(|v| v.as_str()) == Some(id))
+                });
+                if in_use {
+                    result.conserves.push(id.clone());
+                }
+                !in_use
+            })
+            .collect();
+        let conserved: Vec<SymbolLibraryItem> = result
+            .conserves
+            .iter()
+            .filter_map(|id| {
+                self.symbols_library.get(id).map(|item| {
+                    let mut item = item.clone();
+                    item.pack_title = Some(title.clone());
+                    item.pack_version = Some(version.clone());
+                    item
+                })
+            })
+            .collect();
+        if let Some(pool) = &self.db_pool {
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+            for id in &removed {
+                sqlx::query("DELETE FROM symbol_libraries WHERE id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+            }
+            for symbol in pending.iter().chain(conserved.iter()) {
+                let json = serde_json::to_string(symbol)
+                    .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+                sqlx::query("INSERT INTO symbol_libraries (id, symbol_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET symbol_json = excluded.symbol_json, updated_at = excluded.updated_at")
+                    .bind(&symbol.id).bind(json).bind(Utc::now().to_rfc3339())
+                    .execute(&mut *tx).await.map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| ScadaError::DatabaseError(e.to_string()))?;
+        }
+        for id in &removed {
+            self.symbols_library.remove(id);
+        }
+        for symbol in conserved {
+            self.symbols_library.insert(symbol.id.clone(), symbol);
+        }
+        result.removed = removed.len();
+        result.conserves.sort();
+        for symbol in pending {
+            if self.symbols_library.contains_key(&symbol.id) {
+                result.updated += 1;
+            } else {
+                result.added += 1;
+            }
+            self.symbols_library
+                .insert(symbol.id.clone(), symbol.clone());
+            result.symbols.push(symbol);
+        }
+        self.record_audit(
+            actor,
+            "BIBLIOTHÈQUE",
+            "INSTALL_PACK",
+            &pack_id,
+            &format!(
+                "Module {pack_id} version {version} : {} ajoutés, {} mis à jour, {} refusés",
+                result.added, result.updated, result.rejected
+            ),
+        );
+        Ok(result)
+    }
+
     pub async fn persist_symbol(&self, sym: &SymbolLibraryItem) {
         if let Some(pool) = &self.db_pool {
             if let Ok(js) = serde_json::to_string(sym) {
@@ -4766,6 +5213,17 @@ impl ScadaCore {
         rejected: &mut Vec<String>,
     ) {
         item.id = security::slugify_id(&item.id);
+        if self
+            .symbols_library
+            .get(&item.id)
+            .is_some_and(|existing| existing.pack_id.is_some() && existing.pack_id != item.pack_id)
+        {
+            rejected.push(format!(
+                "« {} » : identifiant déjà utilisé par un module",
+                item.name
+            ));
+            return;
+        }
         match security::sanitize_svg(&item.svg_content) {
             Ok(clean) => {
                 item.svg_content = clean;
@@ -4850,6 +5308,16 @@ impl ScadaCore {
             ));
         }
 
+        if req.format == "apex_pack"
+            || serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|v| v.get("format").and_then(|f| f.as_str()).map(str::to_string))
+                .as_deref()
+                == Some("apex-symboles")
+        {
+            return Ok(self.import_symbol_pack(actor, raw).await?.symbols);
+        }
+
         let default_cat = if req.category.trim().is_empty() {
             "Bibliothèque Importée".to_string()
         } else {
@@ -4905,6 +5373,9 @@ impl ScadaCore {
                         default_height: 185.0,
                         animate_rotation: req.animate_rotation,
                         colorize_on_state: true,
+                        pack_id: None,
+                        pack_title: None,
+                        pack_version: None,
                         created_at: Utc::now(),
                     };
                     self.store_symbol(item, &mut imported, &mut rejected).await;
@@ -4968,10 +5439,19 @@ impl ScadaCore {
                     category: cat.to_string(),
                     standard: std_name.to_string(),
                     svg_content: svg.to_string(),
-                    default_width: 210.0,
-                    default_height: 185.0,
+                    default_width: entry
+                        .get("default_width")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(210.0),
+                    default_height: entry
+                        .get("default_height")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(185.0),
                     animate_rotation: anim,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: Utc::now(),
                 };
                 self.store_symbol(item, &mut imported, &mut rejected).await;
@@ -5013,6 +5493,9 @@ impl ScadaCore {
                         default_height: 185.0,
                         animate_rotation: req.animate_rotation,
                         colorize_on_state: true,
+                        pack_id: None,
+                        pack_title: None,
+                        pack_version: None,
                         created_at: Utc::now(),
                     };
                     self.store_symbol(item, &mut imported, &mut rejected).await;
@@ -5033,6 +5516,9 @@ impl ScadaCore {
                 default_height: 185.0,
                 animate_rotation: req.animate_rotation,
                 colorize_on_state: true,
+                pack_id: None,
+                pack_title: None,
+                pack_version: None,
                 created_at: Utc::now(),
             };
             self.store_symbol(item, &mut imported, &mut rejected).await;
@@ -5040,6 +5526,28 @@ impl ScadaCore {
             return Err(ScadaError::BadRequest(
                 "Format non reconnu : fournissez un fichier .svg, une planche <symbol>, un fichier Draw.io <mxlibrary> ou un pack .json".to_string(),
             ));
+        }
+
+        if (raw.starts_with('{') || raw.starts_with('[') || req.format == "scada_json")
+            && !imported.is_empty()
+        {
+            let import_slug = if req.library_name.trim().is_empty() {
+                Utc::now().timestamp_millis().to_string()
+            } else {
+                security::slugify_id(&req.library_name.trim().to_lowercase())
+            };
+            let import_id = format!("import-{import_slug}");
+            for item in &mut imported {
+                item.pack_id = Some(import_id.clone());
+                item.pack_title = Some(if req.library_name.trim().is_empty() {
+                    "Import libre".to_string()
+                } else {
+                    req.library_name.trim().to_string()
+                });
+                item.pack_version = Some("1.0.0".to_string());
+                self.symbols_library.insert(item.id.clone(), item.clone());
+                self.persist_symbol(item).await;
+            }
         }
 
         if imported.is_empty() && !rejected.is_empty() {
@@ -5079,7 +5587,13 @@ impl ScadaCore {
 
     pub fn builtin_pack_symbols(pack_id: &str) -> Vec<SymbolLibraryItem> {
         let now = Utc::now();
-        match pack_id {
+        let title = match pack_id {
+            "iso_10628_pid" => "ISO 10628 P&ID",
+            "isa_5_1_instr" => "ANSI/ISA-5.1 Instrumentation",
+            "iec_60617_cvc" => "IEC 60617 Énergie & CVC",
+            _ => return vec![],
+        };
+        let mut items = match pack_id {
             "iso_10628_pid" => vec![
                 SymbolLibraryItem {
                     id: "iso10628-agitator-tank".to_string(),
@@ -5091,6 +5605,9 @@ impl ScadaCore {
                     default_height: 190.0,
                     animate_rotation: true,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
                 SymbolLibraryItem {
@@ -5103,6 +5620,9 @@ impl ScadaCore {
                     default_height: 190.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
                 SymbolLibraryItem {
@@ -5115,6 +5635,9 @@ impl ScadaCore {
                     default_height: 185.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
                 SymbolLibraryItem {
@@ -5127,6 +5650,9 @@ impl ScadaCore {
                     default_height: 190.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
             ],
@@ -5141,6 +5667,9 @@ impl ScadaCore {
                     default_height: 185.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
                 SymbolLibraryItem {
@@ -5153,6 +5682,9 @@ impl ScadaCore {
                     default_height: 185.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
                 SymbolLibraryItem {
@@ -5165,6 +5697,9 @@ impl ScadaCore {
                     default_height: 185.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
             ],
@@ -5179,6 +5714,9 @@ impl ScadaCore {
                     default_height: 190.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
                 SymbolLibraryItem {
@@ -5191,6 +5729,9 @@ impl ScadaCore {
                     default_height: 185.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
                 SymbolLibraryItem {
@@ -5203,11 +5744,20 @@ impl ScadaCore {
                     default_height: 185.0,
                     animate_rotation: false,
                     colorize_on_state: true,
+                    pack_id: None,
+                    pack_title: None,
+                    pack_version: None,
                     created_at: now,
                 },
             ],
             _ => vec![],
+        };
+        for item in &mut items {
+            item.pack_id = Some(pack_id.to_string());
+            item.pack_title = Some(title.to_string());
+            item.pack_version = Some("1.0.0".to_string());
         }
+        items
     }
 }
 
@@ -5610,11 +6160,15 @@ mod tests {
         RegisteredTag {
             id: "T".into(),
             label: "T".into(),
-            module_source: "D".into(),
+            module_source: "internal".into(),
             protocol_address: "HR:0".into(),
             data_type: TagDataType::Float,
             unit: None,
             writable: true,
+            consigne_min: None,
+            consigne_max: None,
+            fraicheur_max_s: None,
+            ecriture_sans_retour: false,
             deadband: 0.0,
             scale_factor: scale,
             scale_offset: offset,
@@ -5671,6 +6225,13 @@ mod tests {
         let svg = d.widgets[0].properties["svg_content"].as_str().unwrap();
         assert!(!svg.contains("onload") && !svg.contains("script"));
         assert!(d.widgets[0].bound_tag_id.is_none());
+        d.widgets[0].properties["defaut_tag_id"] = "DEFAUT_MOTEUR".into();
+        d.widgets[0].properties["min"] = 10.into();
+        d.widgets[0].properties["max"] = 90.into();
+        sanitize_dashboard(&mut d).unwrap();
+        assert_eq!(d.widgets[0].properties["defaut_tag_id"], "DEFAUT_MOTEUR");
+        assert_eq!(d.widgets[0].properties["min"], 10);
+        assert_eq!(d.widgets[0].properties["max"], 90);
 
         d.widgets[0].bound_tag_id = Some("x');alert(1)//".into());
         assert!(sanitize_dashboard(&mut d).is_err());
@@ -5706,6 +6267,164 @@ mod tests {
                     sym.svg_content.matches('=').count() + 1,
                     "attribut perdu dans {}",
                     sym.id
+                );
+            }
+        }
+    }
+
+    fn test_module(id: &str) -> String {
+        serde_json::json!({
+            "format": "apex-symboles", "version": "1.0.0", "id": "test_pack",
+            "titre": "Module de test", "symbols": [{
+                "id": id, "name": "Cercle", "category": "Essai", "standard": "Essai",
+                "default_width": 120.0, "default_height": 75.0,
+                "animate_rotation": true, "colorize_on_state": false,
+                "svg_content": "<svg viewBox=\"0 0 100 100\"><circle cx=\"50\" cy=\"50\" r=\"20\"/></svg>"
+            }]
+        }).to_string()
+    }
+
+    #[tokio::test]
+    async fn module_installation_reinstallation_et_desinstallation() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        let raw = test_module("test_pack-cercle");
+        let first = core.import_symbol_pack("admin", &raw).await.unwrap();
+        assert_eq!((first.added, first.updated, first.rejected), (1, 0, 0));
+        let sym = &first.symbols[0];
+        assert_eq!(sym.id, "test_pack-cercle");
+        assert_eq!(sym.pack_id.as_deref(), Some("test_pack"));
+        assert_eq!((sym.default_width, sym.default_height), (120.0, 75.0));
+        assert!(sym.animate_rotation);
+        assert!(!sym.colorize_on_state);
+        let saved = serde_json::to_string(sym).unwrap();
+        let restored: SymbolLibraryItem = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.pack_id.as_deref(), Some("test_pack"));
+        let mut legacy: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        legacy.as_object_mut().unwrap().remove("pack_id");
+        legacy.as_object_mut().unwrap().remove("pack_title");
+        legacy.as_object_mut().unwrap().remove("pack_version");
+        let restored_legacy: SymbolLibraryItem = serde_json::from_value(legacy).unwrap();
+        assert!(restored_legacy.pack_id.is_none());
+        let second = core.import_symbol_pack("admin", &raw).await.unwrap();
+        assert_eq!((second.added, second.updated), (0, 1));
+        assert_eq!(
+            core.installed_symbol_packs()
+                .iter()
+                .find(|pack| pack.id == "test_pack")
+                .unwrap()
+                .nombre_symboles,
+            1
+        );
+        assert_eq!(
+            core.uninstall_symbol_pack("admin", "test_pack", false)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(core
+            .installed_symbol_packs()
+            .iter()
+            .all(|pack| pack.id != "test_pack"));
+    }
+
+    #[tokio::test]
+    async fn module_refuse_identifiant_et_synoptique_utilisateur() {
+        let core = ScadaCore::new(None, &engine_options(false));
+        let bad = core
+            .import_symbol_pack("admin", &test_module("cercle"))
+            .await
+            .unwrap_err();
+        assert_eq!(bad.http_status(), 400);
+        assert!(bad.to_string().contains("test_pack-"));
+        core.import_symbol_pack("admin", &test_module("test_pack-cercle"))
+            .await
+            .unwrap();
+        core.dashboards.insert(
+            "syn-test".into(),
+            DashboardLayout {
+                id: "syn-test".into(),
+                name: "Synoptique de test".into(),
+                category: "Essai".into(),
+                description: String::new(),
+                grid_size: 10,
+                widgets: vec![DashboardWidget {
+                    id: "widget-test".into(),
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                    widget_type: WidgetType::CustomSvgSymbol,
+                    bound_tag_id: None,
+                    title: "Cercle".into(),
+                    properties: serde_json::json!({"symbol_id":"test_pack-cercle"}),
+                }],
+                canvas_width: None,
+                canvas_height: None,
+                updated_at: Utc::now(),
+            },
+        );
+        let conflict = core
+            .uninstall_symbol_pack("admin", "test_pack", false)
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.http_status(), 409);
+        assert!(
+            matches!(conflict, ScadaError::Conflict { dashboards, .. } if dashboards == ["Synoptique de test"])
+        );
+        assert_eq!(
+            core.uninstall_symbol_pack("admin", "test_pack", true)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn modules_du_depot_survivent_assainissement() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        assert!(dir.is_dir(), "dossier packs/ absent : {}", dir.display());
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        assert!(
+            !files.is_empty(),
+            "aucun fichier packs/*.json dans {}",
+            dir.display()
+        );
+        let mut ids = std::collections::HashSet::new();
+        for file in files {
+            let raw = std::fs::read_to_string(file.path()).unwrap();
+            let pack: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(pack["format"], "apex-symboles", "{}", file.path().display());
+            // Version du module au format MAJEUR.MINEUR.CORRECTIF
+            let version = pack["version"].as_str().unwrap_or_default();
+            assert!(
+                version.split('.').count() == 3
+                    && version.split('.').all(|n| n.parse::<u32>().is_ok()),
+                "{} : version « {version} » invalide",
+                file.path().display()
+            );
+            let prefix = format!("{}-", pack["id"].as_str().unwrap());
+            let symbols = pack["symbols"].as_array().unwrap();
+            assert!(!symbols.is_empty(), "{} est vide", file.path().display());
+            for sym in symbols {
+                let id = sym["id"].as_str().unwrap();
+                assert!(id.starts_with(&prefix), "id mal préfixé : {id}");
+                assert!(ids.insert(id.to_string()), "id en double : {id}");
+                let svg = sym["svg_content"].as_str().unwrap();
+                let clean = security::sanitize_svg(svg).unwrap_or_else(|e| panic!("{id} : {e}"));
+                assert_eq!(
+                    clean.matches('<').count(),
+                    svg.matches('<').count(),
+                    "élément perdu : {id}"
+                );
+                let added_xmlns = usize::from(!svg.contains("xmlns="));
+                assert_eq!(
+                    clean.matches('=').count(),
+                    svg.matches('=').count() + added_xmlns,
+                    "attribut perdu : {id}"
                 );
             }
         }
@@ -6543,6 +7262,9 @@ mod tests {
             default_height: 50.0,
             animate_rotation: false,
             colorize_on_state: true,
+            pack_id: None,
+            pack_title: None,
+            pack_version: None,
             created_at: Utc::now(),
         };
         let mut imp = Vec::new();
@@ -6751,4 +7473,5 @@ mod tests {
     }
     include!("core_vague2_tests.rs");
     include!("core_vague3_tests.rs");
+    include!("core_audit4_tests.rs");
 }

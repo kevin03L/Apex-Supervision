@@ -21,6 +21,125 @@ const MODBUS_SETPOINT: &str = "MODBUS.GF01.Consigne_Eau_Glacee";
 /// Tag inscriptible du simulateur GTB (driver simulé, pilotable en mode sûr).
 const SIMULATED_SETPOINT: &str = "GTB.CTA01.Consigne_Temp";
 
+#[test]
+fn module_symboles_installation_liste_et_desinstallation() {
+    let mut srv = Server::start("module-symboles");
+    let token = srv.login(ADMIN);
+    let module = json!({
+        "format": "apex-symboles", "version": "1.0.0", "id": "test_pack",
+        "titre": "Module de test", "symbols": [{
+            "id": "test_pack-cercle", "name": "Cercle", "category": "Essai",
+            "standard": "Essai", "default_width": 100, "default_height": 100,
+            "svg_content": "<svg viewBox=\"0 0 100 100\"><circle cx=\"50\" cy=\"50\" r=\"20\"/></svg>"
+        }]
+    });
+    let r = srv.call(
+        "POST",
+        "/api/symbols/import",
+        Some(&token),
+        Some(&json!({
+            "format": "auto", "raw_content": module.to_string()
+        })),
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json()["added"], 1);
+    let r = srv.call("GET", "/api/symbols/packs", Some(&token), None);
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(r
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["id"] == "test_pack" && p["nombre_symboles"] == 1));
+    srv.restart();
+    let token = srv.login(ADMIN);
+    let r = srv.call("GET", "/api/symbols/packs", Some(&token), None);
+    assert!(r
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["id"] == "test_pack" && p["version"] == "1.0.0" && p["nombre_symboles"] == 1));
+    let r = srv.call("DELETE", "/api/symbols/packs/test_pack", Some(&token), None);
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json()["deleted"], 1);
+    let r = srv.call("GET", "/api/symbols/packs", Some(&token), None);
+    assert!(!r
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["id"] == "test_pack"));
+}
+
+#[test]
+fn api_refuse_une_consigne_hors_bornes() {
+    let srv = Server::start("audit4-bornes");
+    let admin = srv.login(ADMIN);
+    let tag = json!({
+        "id": "AUDIT4.LIMIT", "label": "Consigne limitée", "module_source": "internal",
+        "protocol_address": "", "data_type": "Float", "unit": null, "writable": true,
+        "consigne_min": 10.0, "consigne_max": 20.0
+    });
+    let created = srv.call("POST", "/api/tags", Some(&admin), Some(&tag));
+    assert_eq!(created.status, 200, "{}", created.text());
+    let refused = srv.call(
+        "POST",
+        "/api/tags/AUDIT4.LIMIT/write",
+        Some(&admin),
+        Some(&json!({ "value": 21.0 })),
+    );
+    assert_eq!(refused.status, 400, "{}", refused.text());
+    assert!(refused.text().contains("hors bornes"));
+    let transmitted = srv.call(
+        "POST",
+        "/api/tags/AUDIT4.LIMIT/write",
+        Some(&admin),
+        Some(&json!({ "value": 15.0 })),
+    );
+    assert_eq!(transmitted.status, 200, "{}", transmitted.text());
+    assert_eq!(transmitted.json()["statut"], "transmise");
+    assert_eq!(transmitted.json()["tag_id"], "AUDIT4.LIMIT");
+}
+
+#[test]
+fn modules_reserves_a_administrateur_import_libre_superviseur() {
+    let srv = Server::start("audit4-droits-modules");
+    let supervisor = srv.login(("superviseur", "super123"));
+    let module = json!({ "format": "apex-symboles", "id": "essai", "titre": "Essai",
+        "version": "1.0.0", "symbols": [{"id":"essai-un", "name":"Un",
+        "category":"Essai", "standard":"Essai", "svg_content":"<svg/>"}] });
+    let refused = srv.call(
+        "POST",
+        "/api/symbols/import",
+        Some(&supervisor),
+        Some(&json!({"format":"auto", "raw_content":module.to_string()})),
+    );
+    assert_eq!(refused.status, 403, "{}", refused.text());
+    let refused = srv.call(
+        "POST",
+        "/api/symbols/import",
+        Some(&supervisor),
+        Some(&json!({"format":"scada_json", "raw_content":module.to_string()})),
+    );
+    assert_eq!(refused.status, 403, "{}", refused.text());
+    let refused = srv.call(
+        "POST",
+        "/api/symbols/install-pack/iso_10628_pid",
+        Some(&supervisor),
+        None,
+    );
+    assert_eq!(refused.status, 403, "{}", refused.text());
+    let free = srv.call(
+        "POST",
+        "/api/symbols/import",
+        Some(&supervisor),
+        Some(&json!({"format":"scada_json", "library_name":"Libre",
+            "raw_content":"[{\"id\":\"un\",\"name\":\"Un\",\"svg_content\":\"<svg/>\"}]"})),
+    );
+    assert_eq!(free.status, 200, "{}", free.text());
+}
+
 // ============================================================================
 // SANTÉ
 // ============================================================================

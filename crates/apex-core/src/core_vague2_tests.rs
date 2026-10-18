@@ -198,6 +198,7 @@ async fn vague2_mode_sur_defense_en_profondeur_driver() {
         tag_id: "TAG1".into(),
         protocol_address: "HR:0".into(),
         value: TagValue::Float(10.0),
+        ack: None,
     };
 
     if core.safe_mode {

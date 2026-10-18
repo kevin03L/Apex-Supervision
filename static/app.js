@@ -795,12 +795,15 @@ function connectRealtimeSocket() {
       scheduleRender();
     } else if (msg.event === 'AlarmUpdate') {
       state.alarms = msg.data;
+      updateAlarmWidgetsInPlace();
       renderAlarmBanner();
       renderAlarmsTable();
     } else if (msg.event === 'DriverListUpdate') {
       state.drivers = msg.data;
       updateHeaderChips();
       if (state.activeTab === 'tagdb') renderDriversCardsOnly();
+    } else if (msg.event === 'WriteRejected') {
+      notify(`Commande refusée pour ${msg.data.tag_id} : ${msg.data.reason}`, 'error');
     } else if (msg.event === 'SettingsUpdate') {
       state.systemStatus = Object.assign({}, state.systemStatus || {}, { settings: msg.data });
       renderSettingsForm();
@@ -1943,6 +1946,10 @@ function openNewTagModal() {
   document.getElementById('tagFormUnit').value = '';
   document.getElementById('tagFormRw').value = 'true';
   document.getElementById('tagFormScale').value = '1.0';
+  document.getElementById('tagFormConsigneMin').value = '';
+  document.getElementById('tagFormConsigneMax').value = '';
+  document.getElementById('tagFormFreshness').value = '';
+  document.getElementById('tagFormWriteWithoutFeedback').value = 'false';
   document.getElementById('tagFormLow').value = '';
   document.getElementById('tagFormHigh').value = '';
   if (document.getElementById('tagFormBoolAlarm')) document.getElementById('tagFormBoolAlarm').value = '';
@@ -1960,6 +1967,22 @@ async function saveTagFromForm() {
   const unit = document.getElementById('tagFormUnit').value.trim() || null;
   const writable = document.getElementById('tagFormRw').value === 'true';
   const scale_factor = parseFloat(document.getElementById('tagFormScale').value || '1.0');
+  const minRaw = document.getElementById('tagFormConsigneMin').value.trim();
+  const maxRaw = document.getElementById('tagFormConsigneMax').value.trim();
+  const freshnessRaw = document.getElementById('tagFormFreshness').value.trim();
+  const consigne_min = minRaw === '' ? null : Number(minRaw);
+  const consigne_max = maxRaw === '' ? null : Number(maxRaw);
+  const fraicheur_max_s = freshnessRaw === '' ? null : Number(freshnessRaw);
+  if ((consigne_min !== null && !Number.isFinite(consigne_min)) ||
+      (consigne_max !== null && !Number.isFinite(consigne_max)) ||
+      (consigne_min !== null && consigne_max !== null && consigne_min > consigne_max)) {
+    notify('Bornes de consigne invalides : saisissez des nombres finis avec un minimum inférieur ou égal au maximum.', 'error');
+    return;
+  }
+  if (fraicheur_max_s !== null && (!Number.isInteger(fraicheur_max_s) || fraicheur_max_s < 1)) {
+    notify('La fraîcheur maximale doit être un nombre entier de secondes positif.', 'error');
+    return;
+  }
   const lowRaw = document.getElementById('tagFormLow').value;
   const highRaw = document.getElementById('tagFormHigh').value;
 
@@ -1983,6 +2006,10 @@ async function saveTagFromForm() {
     data_type,
     unit,
     writable,
+    consigne_min,
+    consigne_max,
+    fraicheur_max_s,
+    ecriture_sans_retour: document.getElementById('tagFormWriteWithoutFeedback').value === 'true',
     deadband: existing ? existing.deadband : 0.05,
     scale_factor,
     scale_offset: existing ? existing.scale_offset : 0.0,
@@ -2030,6 +2057,10 @@ function editTagInForm(tagId) {
   document.getElementById('tagFormUnit').value = t.unit || '';
   document.getElementById('tagFormRw').value = String(t.writable);
   document.getElementById('tagFormScale').value = t.scale_factor || 1.0;
+  document.getElementById('tagFormConsigneMin').value = t.consigne_min ?? '';
+  document.getElementById('tagFormConsigneMax').value = t.consigne_max ?? '';
+  document.getElementById('tagFormFreshness').value = t.fraicheur_max_s ?? '';
+  document.getElementById('tagFormWriteWithoutFeedback').value = String(!!t.ecriture_sans_retour);
   document.getElementById('tagFormLow').value = (t.alarm_config && t.alarm_config.low) ?? '';
   document.getElementById('tagFormHigh').value = (t.alarm_config && t.alarm_config.high) ?? '';
   if (document.getElementById('tagFormBoolAlarm')) {
@@ -2548,7 +2579,7 @@ async function importProjectBackup(event) {
 // ============================================================================
 
 /** Envoie une consigne ; renvoie vrai si le serveur l'a acceptée. */
-async function sendWriteTag(tagId, value) {
+async function sendWriteTag(tagId, value, notifySuccess = true) {
   if (!tagId) return false;
   if (!canWrite()) {
     notify('Votre profil ne permet pas l\'envoi de consignes.', 'error');
@@ -2561,6 +2592,8 @@ async function sendWriteTag(tagId, value) {
   });
   if (!res.ok) {
     notify(`Refus d'écriture : ${await apiError(res)}`, 'error');
+  } else if (notifySuccess) {
+    notify(`Commande transmise : ${tagId}`);
   }
   return res.ok;
 }
@@ -2979,13 +3012,74 @@ function renderCustomSymbolsPalette() {
          title="${esc(sym.name)} (${esc(sym.standard)})"
          style="display:flex;align-items:center;justify-content:space-between;gap:4px;">
       <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(sym.name)}</span>
-      <span style="font-size:9px;color:#38bdf8;cursor:pointer;" onclick="event.stopPropagation();deleteCustomSymbol(${jsArg(sym.id)})" title="Supprimer">×</span>
+      ${!sym.pack_id ? `<span style="font-size:9px;color:#38bdf8;cursor:pointer;" onclick="event.stopPropagation();deleteCustomSymbol(${jsArg(sym.id)})" title="Supprimer">×</span>` : ''}
     </div>
   `).join('');
 }
 
 function openSymbolLibraryModal() {
   document.getElementById('symbolLibraryModal').style.display = 'flex';
+  document.getElementById('installSymbolModuleButton').style.display = isAdmin() ? '' : 'none';
+  document.getElementById('builtinSymbolPacks').style.display = isAdmin() ? '' : 'none';
+  refreshInstalledSymbolPacks();
+}
+
+async function refreshInstalledSymbolPacks() {
+  const container = document.getElementById('installedSymbolPacks');
+  const packs = await getJson('/api/symbols/packs', []);
+  container.innerHTML = packs.length ? packs.map(pack => `
+    <div class="symbol-module-row">
+      <span><strong>${esc(pack.titre)}</strong> · ${esc(pack.version)} · ${esc(pack.nombre_symboles)} symbole(s)</span>
+      ${isAdmin() ? `<button class="btn" onclick="uninstallSymbolModule(${jsArg(pack.id)})">Désinstaller</button>` : ''}
+    </div>`).join('') : '<p>Aucun module complémentaire installé.</p>';
+}
+
+async function installSymbolModule(event) {
+  if (!isAdmin()) return;
+  const file = event.target.files[0];
+  event.target.value = '';
+  if (!file) return;
+  if (file.size > SYMBOL_IMPORT_MAX_BYTES / 2) {
+    notify('Fichier de module trop volumineux.', 'error');
+    return;
+  }
+  const raw_content = await file.text();
+  const body = JSON.stringify({ format: 'apex_pack', raw_content });
+  if (new Blob([body]).size > SYMBOL_IMPORT_MAX_BYTES) {
+    notify('Fichier de module trop volumineux.', 'error');
+    return;
+  }
+  const res = await fetch('/api/symbols/import', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body
+  });
+  if (!res.ok) {
+    notify(await apiError(res), 'error');
+    return;
+  }
+  const result = await res.json();
+  state.symbols = await getJson('/api/symbols', state.symbols);
+  renderCustomSymbolsPalette();
+  await refreshInstalledSymbolPacks();
+  notify(`Module installé : ${result.added} ajouté(s), ${result.updated} mis à jour, ${result.removed} retiré(s), ${result.rejected} refusé(s).${result.conserves?.length ? ` Conservés car utilisés : ${result.conserves.join(', ')}.` : ''}`);
+}
+
+async function uninstallSymbolModule(id) {
+  if (!isAdmin()) return;
+  const confirmed = await confirmDialog('Désinstaller le module ?', `Supprimer les symboles du module ${id} ?`, 'Désinstaller');
+  if (!confirmed) return;
+  let res = await fetch(`/api/symbols/packs/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  if (res.status === 409) {
+    const conflict = await res.json();
+    const names = (conflict.dashboards || []).join(', ');
+    const force = await confirmDialog('Module utilisé', `Synoptiques concernés : ${names}. Forcer la désinstallation ?`, 'Forcer');
+    if (!force) return;
+    res = await fetch(`/api/symbols/packs/${encodeURIComponent(id)}?force=true`, { method: 'DELETE' });
+  }
+  if (!res.ok) { notify(await apiError(res), 'error'); return; }
+  state.symbols = await getJson('/api/symbols', state.symbols);
+  renderCustomSymbolsPalette();
+  await refreshInstalledSymbolPacks();
+  notify('Module désinstallé.');
 }
 
 function closeSymbolLibraryModal() {
@@ -2993,6 +3087,7 @@ function closeSymbolLibraryModal() {
 }
 
 async function installBuiltinPack(packId) {
+  if (!isAdmin()) return;
   const res = await fetch(`/api/symbols/install-pack/${encodeURIComponent(packId)}`, {
     method: 'POST'
   });
@@ -3042,7 +3137,11 @@ async function submitSymbolImport() {
     state.symbols = await getJson('/api/symbols', state.symbols);
     renderCustomSymbolsPalette();
     closeSymbolLibraryModal();
-    notify(`${imported.length} symbole(s) industriel(s) importé(s) dans la palette Studio`);
+    if (Array.isArray(imported)) notify(`${imported.length} symbole(s) industriel(s) importé(s) dans la palette Studio`);
+    else {
+      await refreshInstalledSymbolPacks();
+      notify(`Module installé : ${imported.added} ajouté(s), ${imported.updated} mis à jour, ${imported.rejected} refusé(s).`);
+    }
   } else {
     notify(`Erreur d'import : ${await apiError(res, SYMBOL_IMPORT_MAX_BYTES)}`, 'error');
   }

@@ -82,6 +82,10 @@ impl IntoResponse for ApiError {
         let body = serde_json::json!({
             "error": true,
             "message": self.0.to_string(),
+            "dashboards": match &self.0 {
+                ScadaError::Conflict { dashboards, .. } => dashboards.clone(),
+                _ => Vec::new(),
+            },
         });
         (status, Json(body)).into_response()
     }
@@ -115,6 +119,11 @@ pub fn router(state: AppState, web_dir: &FsPath) -> Router {
         .route("/api/users/:username", delete(api_delete_user))
         // --- BIBLIOTHÈQUES DE SYMBOLES ---
         .route("/api/symbols", get(api_get_symbols))
+        .route("/api/symbols/packs", get(api_get_symbol_packs))
+        .route(
+            "/api/symbols/packs/:pack_id",
+            delete(api_delete_symbol_pack),
+        )
         .route(
             "/api/symbols/import",
             post(api_import_symbols)
@@ -484,17 +493,54 @@ async fn api_get_symbols(State(state): State<AppState>) -> Json<Vec<SymbolLibrar
     Json(state.core.get_all_symbols())
 }
 
+async fn api_get_symbol_packs(
+    State(state): State<AppState>,
+) -> Json<Vec<apex_core::core::InstalledSymbolPack>> {
+    Json(state.core.installed_symbol_packs())
+}
+
+async fn api_delete_symbol_pack(
+    Path(pack_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&user)?;
+    let force = params.get("force").is_some_and(|v| v == "true");
+    let deleted = state
+        .core
+        .uninstall_symbol_pack(&user.0.username, &pack_id, force)
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "deleted": deleted, "pack_id": pack_id }),
+    ))
+}
+
 async fn api_import_symbols(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
     Json(req): Json<ImportSymbolLibraryRequest>,
-) -> Result<Json<Vec<SymbolLibraryItem>>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     require_supervisor(&user)?;
+    let is_pack = req.format == "apex_pack"
+        || serde_json::from_str::<serde_json::Value>(&req.raw_content)
+            .ok()
+            .and_then(|v| v.get("format").and_then(|f| f.as_str()).map(str::to_string))
+            .as_deref()
+            == Some("apex-symboles");
+    if is_pack {
+        require_admin(&user)?;
+        let result = state
+            .core
+            .import_symbol_pack(&user.0.username, &req.raw_content)
+            .await?;
+        return Ok(Json(serde_json::to_value(result).unwrap_or_default()));
+    }
     let imported = state
         .core
         .import_symbol_library(&user.0.username, req)
         .await?;
-    Ok(Json(imported))
+    Ok(Json(serde_json::json!(imported)))
 }
 
 async fn api_install_symbol_pack(
@@ -502,7 +548,7 @@ async fn api_install_symbol_pack(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<Vec<SymbolLibraryItem>>, ApiError> {
-    require_supervisor(&user)?;
+    require_admin(&user)?;
     let items = state
         .core
         .install_builtin_symbol_pack(&user.0.username, &pack_id)
@@ -516,6 +562,17 @@ async fn api_delete_symbol(
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_supervisor(&user)?;
+    if state
+        .core
+        .symbols_library
+        .get(&id)
+        .is_some_and(|s| s.pack_id.is_some())
+    {
+        return Err(ScadaError::BadRequest(
+            "Ce symbole appartient à un module : désinstallez le module entier".into(),
+        )
+        .into());
+    }
     state.core.delete_symbol(&user.0.username, &id).await?;
     Ok(Json(serde_json::json!({ "deleted": id })))
 }
@@ -686,7 +743,7 @@ async fn api_pulse_tag(
     Path(tag_id): Path<String>,
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
-) -> Result<Json<TagState>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     require_supervisor(&user)?;
     let updated = state.core.pulse_tag(&tag_id).await?;
     state.core.record_audit(
@@ -696,7 +753,9 @@ async fn api_pulse_tag(
         &tag_id,
         "Impulsion de 1 seconde, extinction côté serveur",
     );
-    Ok(Json(updated))
+    let mut reply = serde_json::to_value(updated).unwrap_or_default();
+    reply["statut"] = serde_json::json!("transmise");
+    Ok(Json(reply))
 }
 
 async fn api_write_tag(
@@ -704,7 +763,7 @@ async fn api_write_tag(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
     Json(payload): Json<WriteTagRequest>,
-) -> Result<Json<TagState>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     require_supervisor(&user)?;
     let val_str = serde_json::to_string(&payload.value).unwrap_or_default();
     let updated = state.core.write_tag(&tag_id, payload.value).await?;
@@ -721,7 +780,9 @@ async fn api_write_tag(
         &tag_id,
         &format!("Nouvelle valeur commandée : {}{}", val_str, note),
     );
-    Ok(Json(updated))
+    let mut reply = serde_json::to_value(updated).unwrap_or_default();
+    reply["statut"] = serde_json::json!("transmise");
+    Ok(Json(reply))
 }
 
 async fn api_get_drivers(
@@ -1202,6 +1263,7 @@ async fn handle_realtime_socket(
     let mut cov_rx = state.core.subscribe_cov();
     let mut alarm_rx = state.core.subscribe_alarms();
     let mut drv_rx = state.core.subscribe_drivers();
+    let mut rejected_rx = state.core.subscribe_write_rejected();
     let mut trace_rx = state.core.subscribe_flow_traces();
     let mut settings_rx = state.core.subscribe_settings();
     let mut revoke_rx = state.core.subscribe_session_revocation();
@@ -1274,6 +1336,17 @@ async fn handle_realtime_socket(
                             break;
                         }
                     }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            rejected = rejected_rx.recv() => {
+                match rejected {
+                    Ok((tag_id, reason)) => {
+                        if !send_ws(&mut socket, &WsServerMessage::WriteRejected { tag_id, reason }).await {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {}
                     Err(RecvError::Closed) => break,
                 }
             }

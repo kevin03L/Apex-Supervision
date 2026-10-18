@@ -10,6 +10,7 @@ Plateforme de supervision industrielle **GTC / SCADA / GTB** écrite en Rust : u
 - **Communications** : cinq protocoles industriels réels opérationnels — Modbus TCP maître (lecture par blocs de registres), MQTT, Siemens S7 (S7-300/400/1200/1500), OPC-UA et BACnet/IP (avec auto-découverte réelle des objets). Paramètres de communication modifiables à chaud.
 - **Simulation** (option) : simulateur physique GTB (CVC / CTA, chaufferie, TGBT) et automate Modbus TCP embarqué, pour tester sans matériel ni risque physique.
 - **Synoptiques** : studio glisser-déposer, 28 types de widgets, import de symboles SVG / Draw.io / JSON.
+- **Modules complémentaires de symboles** : fichiers JSON téléchargés et installés séparément depuis la bibliothèque ; voir [packs/README.md](packs/README.md).
 - **Flux logiques** : seuil, hystérésis, PID, portes logiques, temporisation TON, formule, script Rhai.
 - **Alarmes ISA-18.2** à 4 états : journal, état conservé au redémarrage, bande morte anti-bagotement, mise en sommeil désactivable.
 - **Planificateur horaire hebdomadaire**, historique SQLite avec export CSV, journal d'audit.
